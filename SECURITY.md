@@ -2,9 +2,9 @@
 
 ## Reporting a Vulnerability
 
-Report security vulnerabilities **privately** by email to:
+Report security vulnerabilities using GitHub's private vulnerability reporting:
 
-**security@clagentic.ai**
+**[Report a vulnerability](https://github.com/clagentic/clagentic-router/security/advisories/new)**
 
 Do not open a public issue. We will acknowledge your report within **3 business days**
 and work with you to assess and address the issue before any public disclosure.
@@ -24,7 +24,7 @@ The following are in scope for security reports:
 The following are **out of scope**:
 
 - Vulnerabilities in the upstream LLM providers (Anthropic, OpenAI, etc.)
-- The `claude` or `codex` CLI binaries and their OAuth sessions
+- The `claude`, `codex`, or `gemini` CLI binaries and their OAuth sessions
 - Issues requiring physical access to the host
 
 ## What to Include in a Report
