@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 112 112" width="112" height="112">
+  <defs>
+    <linearGradient id="grad" gradientUnits="userSpaceOnUse" x1="8" y1="8" x2="104" y2="104">
+      <stop offset="0%"   stop-color="#00CFFF"/>
+      <stop offset="45%"  stop-color="#4A7FE8"/>
+      <stop offset="100%" stop-color="#7B3FE4"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Standard terminal frame -->
+  <rect x="8" y="8" width="96" height="96" rx="8" ry="8"
+        fill="none" stroke="url(#grad)" stroke-width="4.5"/>
+
+  <!-- Input node: left side — solid filled circle (the request entering the router) -->
+  <circle cx="26" cy="56" r="6"
+          fill="url(#grad)" stroke="none"/>
+
+  <!-- Spine: horizontal line from input node to fork point -->
+  <line x1="32" y1="56" x2="52" y2="56"
+        stroke="url(#grad)" stroke-width="2.5" stroke-linecap="round"/>
+
+  <!-- Fork point: small filled diamond (routing decision node) -->
+  <!-- Diamond: rotated square at 52,56 -->
+  <rect x="48" y="52" width="8" height="8" rx="1" ry="1"
+        fill="url(#grad)" stroke="none"
+        transform="rotate(45 52 56)"/>
+
+  <!-- Branch 1 (top): fork point → top-right output node -->
+  <line x1="57" y1="52" x2="78" y2="30"
+        stroke="url(#grad)" stroke-width="2.5" stroke-linecap="round"/>
+  <!-- Top output node: open circle (tier 1 / flagship model) -->
+  <circle cx="82" cy="26" r="6"
+          fill="none" stroke="url(#grad)" stroke-width="2.5"/>
+
+  <!-- Branch 2 (middle): fork point → middle-right output node (primary/selected path, slightly bolder) -->
+  <line x1="60" y1="56" x2="80" y2="56"
+        stroke="url(#grad)" stroke-width="3" stroke-linecap="round"/>
+  <!-- Middle output node: open circle (tier 2 / mid model) -->
+  <circle cx="86" cy="56" r="6"
+          fill="none" stroke="url(#grad)" stroke-width="2.5"/>
+
+  <!-- Branch 3 (bottom): fork point → bottom-right output node (fallback path, dimmed) -->
+  <line x1="57" y1="60" x2="78" y2="82"
+        stroke="url(#grad)" stroke-width="2.5" stroke-linecap="round" opacity="0.5"/>
+  <!-- Bottom output node: open circle (tier 3 / fallback model), dimmed -->
+  <circle cx="82" cy="86" r="6"
+          fill="none" stroke="url(#grad)" stroke-width="2.5" opacity="0.5"/>
+
+  <!-- Fallback arc: curved arrow from top node back toward middle, suggesting retry/fallback logic -->
+  <path d="M 82 32 A 18 18 0 0 1 87 50"
+        fill="none" stroke="url(#grad)" stroke-width="1.5" stroke-linecap="round" opacity="0.4"/>
+
+</svg>

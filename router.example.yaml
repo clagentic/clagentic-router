@@ -1,0 +1,207 @@
+# router.example.yaml — clagentic-router configuration example.
+#
+# Copy this to router.yaml (or ~/.config/clagentic-router/router.yaml) and edit.
+# All api_key / token values support "env:VAR_NAME" to read from environment.
+#
+# Model versioning:
+#   Pin to a specific version:  model: claude-sonnet-4-6
+#   Use latest in a family:     model: claude-sonnet  (resolves to current default)
+#   Codex follows the same pattern via the codex CLI --model flag.
+#   Update model strings here when you want to roll forward to a newer version.
+
+# --- Backends ---
+# Each backend is one LLM invocation path.
+# Adapter types: claude_cli | codex_cli | codex_subagent | gemini_cli | ollama_http | anthropic_api | openai_api
+
+backends:
+
+  # --- Local ---
+  # llama.cpp on localhost:8080 — phi4-mini, GPU, ~15 tok/s, free.
+  # Good for: summarization, classification, short Q&A, triage.
+  # Not suitable for: complex reasoning, code, long-form generation.
+  local-phi4:
+    adapter: ollama_http
+    url: http://localhost:8080
+    model: phi4-mini
+    cost_weight: 2.0
+    timeout_seconds: 60
+
+  # --- Claude CLI (low / mid / high) ---
+  # Requires `claude` binary on PATH with active OAuth session on this host.
+
+  claude-low:
+    adapter: claude_cli
+    model: claude-haiku-4-5     # pin: claude-haiku-4-5 | latest alias: claude-haiku
+    cost_weight: 1.5
+    timeout_seconds: 120
+
+  claude-mid:
+    adapter: claude_cli
+    model: claude-sonnet-4-6    # pin: claude-sonnet-4-6 | latest alias: claude-sonnet
+    cost_weight: 0.8
+    timeout_seconds: 240
+
+  claude-high:
+    adapter: claude_cli
+    model: claude-opus-4-7      # pin: claude-opus-4-7 | latest alias: claude-opus
+    cost_weight: 0.3
+    timeout_seconds: 300
+
+  # --- Codex CLI (low / mid / high) ---
+  # Requires `codex` binary on PATH with active OAuth session on this host.
+  # Model names are ChatGPT Plus account model strings — verify against your
+  # account at chatgpt.com/codex before enabling. Quota resets May 31 2026.
+  #
+  # Model alias note: the codex CLI passes the --model value through to the
+  # ChatGPT Plus backend without router-level transformation. Unlike Claude CLI
+  # which resolves family aliases (claude-sonnet → current Sonnet), OpenAI/Codex
+  # does not expose a family-alias scheme — use pinned model strings (o4-mini,
+  # o3, o3-pro) and update them explicitly when you want to roll forward.
+  #
+  # codex-low:
+  #   adapter: codex_cli
+  #   model: o4-mini              # pinned; no family alias scheme for Codex models
+  #   cost_weight: 1.2
+  #   timeout_seconds: 180
+  #   rate_window_seconds: 10800
+  #   rate_window_max_messages: 50
+  #
+  # codex-mid:
+  #   adapter: codex_cli
+  #   model: o3                   # pinned; verify name against chatgpt.com/codex
+  #   cost_weight: 0.7
+  #   timeout_seconds: 300
+  #   rate_window_seconds: 10800
+  #   rate_window_max_messages: 20
+  #
+  # codex-high:
+  #   adapter: codex_cli
+  #   model: o3-pro               # pinned; verify name against chatgpt.com/codex
+  #   cost_weight: 0.2
+  #   timeout_seconds: 600
+  #   rate_window_seconds: 10800
+  #   rate_window_max_messages: 10
+
+  # --- Gemini CLI (flash / pro) ---
+  # Requires `gemini` binary on PATH with active OAuth session on this host.
+  # Authenticate with: gemini auth login
+  # Override binary path with: GEMINI_BIN=/path/to/gemini
+  #
+  # Model strings are passed directly to the -m flag without transformation.
+  # Short aliases (flash, pro, flash-lite) and full names
+  # (gemini-2.5-flash, gemini-2.5-pro) are both accepted by the CLI.
+  #
+  # Note: the gemini CLI always emits keychain noise on stderr. This is normal
+  # and does not indicate failure — only the exit code is authoritative.
+  #
+  # gemini-flash:
+  #   adapter: gemini_cli
+  #   model: gemini-2.5-flash     # free tier, generous quota, fast
+  #   cost_weight: 1.8
+  #   timeout_seconds: 120
+  #
+  # gemini-pro:
+  #   adapter: gemini_cli
+  #   model: gemini-2.5-pro       # higher quality, lower quota on free tier
+  #   cost_weight: 0.6
+  #   timeout_seconds: 300
+
+  # --- API backends (optional, key-based, no OAuth dependency) ---
+  # anthropic-low:
+  #   adapter: anthropic_api
+  #   model: claude-haiku-4-5
+  #   api_key: env:ANTHROPIC_API_KEY
+  #   cost_weight: 1.3
+  #   timeout_seconds: 120
+  #
+  # openai-low:
+  #   adapter: openai_api
+  #   model: gpt-4o-mini
+  #   api_key: env:OPENAI_API_KEY
+  #   cost_weight: 1.1
+  #   timeout_seconds: 120
+
+# --- Tiers ---
+# A tier is a named group of backends at the same capability level.
+# The router scores all backends in a tier and picks the best available one.
+# Add codex-low/mid/high to these tiers once Codex model names are verified.
+
+tiers:
+  local:  [local-phi4]
+  low:    [claude-low]            # add codex-low once verified
+  mid:    [claude-mid]            # add codex-mid once verified
+  high:   [claude-high]           # add codex-high once verified
+
+# --- Chains ---
+# Named chains are ordered lists of tiers tried in sequence on failure/exhaustion.
+# Chain name reflects the capability ceiling, not the task type.
+# Reference with model field "role:<chain-name>".
+
+chains:
+  # Full stack — local (free) → low → mid → high
+  # Maximum redundancy. Use for general work.
+  default:  [local, low, mid, high]
+
+  # Cloud full stack — skip local, full cloud escalation
+  # When local quality is not acceptable but full redundancy still wanted.
+  cloud:    [low, mid, high]
+
+  # Local with cheap cloud fallback
+  # Free first; if local is down, cheap cloud covers it. Nothing higher.
+  local:    [local, low]
+
+  # Low ceiling — cheap cloud only, no escalation
+  low:      [low]
+
+  # Mid ceiling — low first, mid fallback
+  mid:      [low, mid]
+
+  # High ceiling — mid first, high fallback
+  high:     [mid, high]
+
+  # Max — high only, no fallback, fail fast
+  max:      [high]
+
+  # Triage — local only, no cloud spend
+  triage:   [local]
+
+# --- Routing ---
+routing:
+  strategy: scored
+
+  degraded_failure_threshold: 3
+  offline_failure_threshold:  6
+
+  health_probe_interval_seconds: 120
+  quota_poll_interval_seconds: 300
+  quota_warning_threshold: 0.20
+
+  # Latency EMA penalty threshold (ms). 0 = disabled.
+  latency_penalty_threshold_ms: 15000
+
+  # rate_limit_tokens_warning_threshold: 1000  # soft penalty when tokens-remaining drops below this; 0 = disabled
+
+  active_probe_enabled: false
+  active_probe_timeout_seconds: 30
+
+# --- Proxy ---
+proxy:
+  host: 127.0.0.1        # 0.0.0.0 for network access from other hosts
+  port: 8765
+  token: env:CLAGENTIC_ROUTER_TOKEN
+
+# --- Storage ---
+storage:
+  db_path: ""   # default: $XDG_STATE_HOME/clagentic-router/state.db
+
+# --- Alerts ---
+alerts:
+  webhooks: []
+  # - url: https://hooks.example.com/clagentic
+  #   events: [backend_offline, quota_exhausted, chain_exhausted, auth_failure]
+  #   secret: env:WEBHOOK_SECRET
+
+# --- Logging ---
+log:
+  # level: info     # debug|info|warn|error  (override: CLAGENTIC_ROUTER_LOG_LEVEL)
+  # format: text    # text|json              (override: CLAGENTIC_ROUTER_LOG_FORMAT)

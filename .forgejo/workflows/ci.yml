@@ -1,0 +1,40 @@
+# CI workflow for clagentic-router.
+#
+# Runs on every push to main and feature/fix/chore branches, and on PRs.
+# Single job: build binary + run all unit tests.
+#
+# Runner: clagentic-router (repo-scoped).
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+      - "fix/**"
+      - "chore/**"
+      - "docs/**"
+      - "refactor/**"
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-test:
+    name: Build + test
+    runs-on: clagentic-router
+    steps:
+      - name: Checkout
+        uses: https://code.forgejo.org/actions/checkout@v3
+
+      - name: Build + test
+        # Inline Go env — per-job env: blocks don't propagate reliably in host-mode runners.
+        run: |
+          set -eux
+          export GOPATH="${HOME}/go"
+          export GOMODCACHE="${HOME}/go/pkg/mod"
+          export GOCACHE="${HOME}/.cache/go"
+          mkdir -p "$GOPATH" "$GOCACHE"
+          go version
+          go mod download
+          go build -o /tmp/clagentic-router ./cmd/clagentic-router/
+          go test ./... -timeout 120s -v
