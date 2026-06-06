@@ -101,6 +101,11 @@ type BackendState struct {
 	TotalCostUSDEst   float64
 	SessionCostUSDEst float64
 
+	// LastQuotaSnapshot is the most recent rate_limit_event summary received from
+	// the claude CLI. nil until the first event arrives. Ephemeral — not persisted
+	// to SQLite (repopulated on the next live request after restart).
+	LastQuotaSnapshot *QuotaSnapshot
+
 	UpdatedAt time.Time
 }
 
@@ -153,6 +158,10 @@ type Snapshot struct {
 	TotalCostUSDEst   float64
 	SessionCostUSDEst float64
 
+	// LastQuotaSnapshot is the most recent rate_limit_event summary. Ephemeral —
+	// not persisted to SQLite; repopulated on the next live request after restart.
+	LastQuotaSnapshot *QuotaSnapshot
+
 	UpdatedAt time.Time
 }
 
@@ -202,6 +211,7 @@ func (s *BackendState) Snapshot() Snapshot {
 		TotalTokensEst:       s.TotalTokensEst,
 		TotalCostUSDEst:      s.TotalCostUSDEst,
 		SessionCostUSDEst:    s.SessionCostUSDEst,
+		LastQuotaSnapshot:    s.LastQuotaSnapshot,
 		UpdatedAt:            s.UpdatedAt,
 	}
 }

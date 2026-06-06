@@ -65,6 +65,10 @@ type Response struct {
 	// RateLimitInfo carries per-minute rate-limit window data harvested from
 	// provider response headers. Zero value means no data (headers absent).
 	RateLimitInfo RateLimitInfo
+	// RateLimitEvent carries quota utilization data parsed from a claude CLI
+	// rate_limit_event stream-json line. nil when the CLI did not emit one
+	// (below threshold or not a claude_cli adapter).
+	RateLimitEvent *RateLimitEvent
 }
 
 // ErrorType classifies why an invocation failed.

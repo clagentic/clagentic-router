@@ -250,6 +250,7 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 		if err == nil {
 			// Success
 			r.recordSuccess(bid, resp, latencyMS)
+			r.applyRateLimitEvent(ctx, bid, resp)
 
 			meta := &RouteMeta{
 				BackendID:     bid,
@@ -621,6 +622,59 @@ func (r *Router) recordSuccess(bid string, resp *backend.Response, latencyMS int
 			})
 		}
 	}
+}
+
+// applyRateLimitEvent processes a rate_limit_event embedded in a successful response.
+// It persists a quota snapshot to the store, updates BackendState quota fields,
+// and logs the event. Called after every successful invoke that returns a Response.
+func (r *Router) applyRateLimitEvent(ctx context.Context, bid string, resp *backend.Response) {
+	e := resp.RateLimitEvent
+	if e == nil {
+		return
+	}
+
+	// Persist to quota_snapshots table.
+	if r.store != nil {
+		if err := r.store.InsertQuotaSnapshot(ctx, bid, e); err != nil {
+			// Already logged by the store; don't block routing on storage errors.
+			_ = err
+		}
+	}
+
+	// Update in-memory state.
+	bs := r.getState(bid)
+	if bs == nil {
+		return
+	}
+
+	// Build the quota snapshot for the /v1/capacity endpoint.
+	snap := &state.QuotaSnapshot{
+		Status:        e.Status,
+		RateLimitType: e.RateLimitType,
+		Utilization:   e.Utilization,
+		ResetsAt:      e.ResetsAt,
+		ObservedAt:    time.Now().UTC(),
+	}
+
+	bs.UpdateFromRateLimitEvent(state.RateLimitEventData{
+		Status:            e.Status,
+		RateLimitType:     e.RateLimitType,
+		ResetsAt:          e.ResetsAt,
+		Utilization:       e.Utilization,
+		LastQuotaSnapshot: snap,
+	})
+
+	utilizationLog := "below-threshold"
+	if e.Utilization != nil {
+		utilizationLog = fmt.Sprintf("%.4f", *e.Utilization)
+	}
+	slog.Info("rate_limit_event",
+		"backend_id", bid,
+		"rate_limit_type", e.RateLimitType,
+		"status", e.Status,
+		"utilization", utilizationLog,
+		"resets_at", e.ResetsAt,
+	)
 }
 
 func (r *Router) recordFailure(bid string, errType state.ErrorType, errRaw string, resetAt time.Time, latencyMS int64) state.StatusChange {

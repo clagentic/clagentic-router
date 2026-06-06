@@ -262,6 +262,46 @@ func (h *Handler) quota(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+// capacity handles GET /v1/capacity — per-backend capacity and last quota snapshot.
+//
+// last_quota_snapshot is null if no rate_limit_event has been received since
+// daemon start for that backend (ephemeral; not restored from SQLite on restart).
+func (h *Handler) capacity(w http.ResponseWriter, r *http.Request) {
+	snaps := h.router.AllSnapshots()
+	type backendCapacity struct {
+		BackendID         string      `json:"backend_id"`
+		Status            string      `json:"status"`
+		QuotaExhausted    bool        `json:"quota_exhausted"`
+		QuotaResetAt      interface{} `json:"quota_reset_at"`
+		TotalCalls        int64       `json:"total_calls"`
+		SessionCostUSD    float64     `json:"session_cost_usd"`
+		LastQuotaSnapshot interface{} `json:"last_quota_snapshot"`
+	}
+	entries := make([]backendCapacity, 0, len(snaps))
+	for id, snap := range snaps {
+		var lastSnap interface{} = nil
+		if snap.LastQuotaSnapshot != nil {
+			lastSnap = map[string]interface{}{
+				"status":          snap.LastQuotaSnapshot.Status,
+				"rate_limit_type": snap.LastQuotaSnapshot.RateLimitType,
+				"utilization":     snap.LastQuotaSnapshot.Utilization,
+				"resets_at":       snap.LastQuotaSnapshot.ResetsAt.UTC().Format(time.RFC3339),
+				"observed_at":     snap.LastQuotaSnapshot.ObservedAt.UTC().Format(time.RFC3339),
+			}
+		}
+		entries = append(entries, backendCapacity{
+			BackendID:         id,
+			Status:            string(snap.Status),
+			QuotaExhausted:    snap.QuotaExhausted,
+			QuotaResetAt:      timeOrNull(snap.QuotaResetAt),
+			TotalCalls:        snap.TotalCalls,
+			SessionCostUSD:    snap.SessionCostUSDEst,
+			LastQuotaSnapshot: lastSnap,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"backends": entries})
+}
+
 // metrics handles GET /metrics — Prometheus text format.
 func (h *Handler) metrics(w http.ResponseWriter, r *http.Request) {
 	snaps := h.router.AllSnapshots()

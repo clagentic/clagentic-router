@@ -86,6 +86,10 @@ func Open(dbPath string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store: init schema: %w", err)
 	}
+	if _, err := db.Exec(quotaSnapshotsSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: init quota_snapshots schema: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 

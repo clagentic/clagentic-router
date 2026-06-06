@@ -40,6 +40,7 @@ func New(addr, token string, r *router.Router, st *store.Store) *Server {
 	mux.HandleFunc("GET /health", h.auth(h.health))
 	mux.HandleFunc("GET /doctor", h.auth(h.doctor))
 	mux.HandleFunc("GET /quota", h.auth(h.quota))
+	mux.HandleFunc("GET /v1/capacity", h.auth(h.capacity))
 	mux.HandleFunc("GET /metrics", h.auth(h.metrics))
 	mux.HandleFunc("GET /logs", h.auth(h.logs))
 	mux.HandleFunc("GET /stats", h.auth(h.stats))
