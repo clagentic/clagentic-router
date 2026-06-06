@@ -67,20 +67,6 @@ when EMA exceeds `routing.latency_penalty_threshold_ms` (default 15 000 ms).
 threshold crossing, not on every request. `QuotaLowAlerted bool` in state tracks the edge.
 Clear fires when quota recovers above threshold.
 
-## Phase tracking
-
-- **Phase 1** ✅ — core daemon: CLI/HTTP adapters, state machine, routing, HTTP API, SQLite
-- **Phase 2** ✅ — `openai_api` adapter, latency EMA scoring, jitter tie-breaking,
-  differentiated alert events (`quota_exhausted`, `auth_failure`, `backend_offline`),
-  OpenAI usage API polling (`UsagePoller`), active probe loop, `QuotaLowAlerted` edge-trigger
-- **Phase 3** ✅ — webhook HTTP delivery (Slice A ✅), `/logs` date-range filtering + `/stats`
-  (Slice B ✅), SSE streaming for `/v1/chat/completions` (Slice C ✅)
-- **Phase 4** — Python client library, relay integration, third-party integrations
-- **Phase 6** — quota intelligence: `rate_limit_event` parsing + persistence, idle probe loop,
-  early reset notifications, web UI, parity for other backends
-
-Do not implement a later-phase feature without a task ID. Cross-phase imports are a hard error.
-
 ## Testing
 
 Unit tests go in `_test.go` files next to the code they test.
