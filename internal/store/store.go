@@ -52,11 +52,20 @@ CREATE TABLE IF NOT EXISTS call_log (
     prompt_tokens_est     INTEGER NOT NULL DEFAULT 0,
     completion_tokens_est INTEGER NOT NULL DEFAULT 0,
     latency_ms            INTEGER NOT NULL DEFAULT 0,
-    cost_usd_est          REAL NOT NULL DEFAULT 0
+    cost_usd_est          REAL NOT NULL DEFAULT 0,
+    -- Routing intelligence fields (added Phase 6 Slice A)
+    model                 TEXT NOT NULL DEFAULT '',     -- model string used for this request
+    score                 REAL NOT NULL DEFAULT 0,      -- router score assigned to this backend
+    request_id            TEXT NOT NULL DEFAULT '',     -- HTTP request_id for correlation
+    rate_limit_type       TEXT NOT NULL DEFAULT '',     -- active bucket at routing time (seven_day, five_hour, etc.)
+    utilization           REAL,                         -- utilization at routing time; NULL if unknown
+    fallback_count        INTEGER NOT NULL DEFAULT 0    -- number of backends tried before this one
 );
 
-CREATE INDEX IF NOT EXISTS call_log_ts       ON call_log(ts);
-CREATE INDEX IF NOT EXISTS call_log_backend  ON call_log(backend_id, ts);
+CREATE INDEX IF NOT EXISTS call_log_ts            ON call_log(ts);
+CREATE INDEX IF NOT EXISTS call_log_backend       ON call_log(backend_id, ts);
+CREATE INDEX IF NOT EXISTS call_log_request_id    ON call_log(request_id);
+CREATE INDEX IF NOT EXISTS call_log_model         ON call_log(model, ts);
 
 CREATE TABLE IF NOT EXISTS webhooks (
     id         TEXT PRIMARY KEY,
@@ -176,15 +185,39 @@ func (s *Store) LoadState(backendID string) (state.Snapshot, error) {
 	return snap, nil
 }
 
+// CallLogInput carries all fields for one call_log row.
+// Using a struct avoids a long positional argument list and makes adding fields
+// non-breaking (callers set only the fields they have).
+type CallLogInput struct {
+	BackendID           string
+	TierAlias           string
+	ChainPosition       int
+	Outcome             string
+	ErrorType           string
+	PromptTokensEst     int
+	CompletionTokensEst int
+	LatencyMS           int
+	CostUSD             float64
+	// Routing intelligence fields (Phase 6 Slice A)
+	Model         string   // model string used for this request
+	Score         float64  // router score assigned at selection time
+	RequestID     string   // HTTP request_id for cross-row correlation
+	RateLimitType string   // active quota bucket at routing time
+	Utilization   *float64 // utilization at routing time; nil if unknown
+	FallbackCount int      // backends tried before this one succeeded/failed
+}
+
 // LogCall appends one row to the call log.
-func (s *Store) LogCall(backendID, tierAlias string, chainPosition int, outcome, errorType string, promptTokens, completionTokens, latencyMS int, costUSD float64) {
+func (s *Store) LogCall(in CallLogInput) {
 	_, err := s.db.Exec(`
 		INSERT INTO call_log (ts, backend_id, tier_alias, chain_position, outcome, error_type,
-		                      prompt_tokens_est, completion_tokens_est, latency_ms, cost_usd_est)
-		VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		                      prompt_tokens_est, completion_tokens_est, latency_ms, cost_usd_est,
+		                      model, score, request_id, rate_limit_type, utilization, fallback_count)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		time.Now().UTC().Format(time.RFC3339),
-		backendID, tierAlias, chainPosition, outcome, errorType,
-		promptTokens, completionTokens, latencyMS, costUSD,
+		in.BackendID, in.TierAlias, in.ChainPosition, in.Outcome, in.ErrorType,
+		in.PromptTokensEst, in.CompletionTokensEst, in.LatencyMS, in.CostUSD,
+		in.Model, in.Score, in.RequestID, in.RateLimitType, in.Utilization, in.FallbackCount,
 	)
 	if err != nil {
 		slog.Warn("store: log_call failed", "err", err)
@@ -213,7 +246,8 @@ func (s *Store) RecentCalls(f CallLogFilter) ([]CallLogRow, error) {
 	}
 
 	q := `SELECT ts, backend_id, tier_alias, chain_position, outcome, error_type,
-	             prompt_tokens_est, completion_tokens_est, latency_ms, cost_usd_est
+	             prompt_tokens_est, completion_tokens_est, latency_ms, cost_usd_est,
+	             model, score, request_id, rate_limit_type, utilization, fallback_count
 	      FROM call_log`
 	args := []interface{}{}
 	var where []string
@@ -245,9 +279,12 @@ func (s *Store) RecentCalls(f CallLogFilter) ([]CallLogRow, error) {
 	var result []CallLogRow
 	for rows.Next() {
 		var r CallLogRow
-		if err := rows.Scan(&r.TS, &r.BackendID, &r.TierAlias, &r.ChainPosition,
+		if err := rows.Scan(
+			&r.TS, &r.BackendID, &r.TierAlias, &r.ChainPosition,
 			&r.Outcome, &r.ErrorType, &r.PromptTokensEst, &r.CompletionTokensEst,
-			&r.LatencyMS, &r.CostUSD); err != nil {
+			&r.LatencyMS, &r.CostUSD,
+			&r.Model, &r.Score, &r.RequestID, &r.RateLimitType, &r.Utilization, &r.FallbackCount,
+		); err != nil {
 			continue
 		}
 		result = append(result, r)
@@ -357,6 +394,13 @@ type CallLogRow struct {
 	CompletionTokensEst int
 	LatencyMS           int
 	CostUSD             float64
+	// Routing intelligence fields (Phase 6 Slice A)
+	Model         string
+	Score         float64
+	RequestID     string
+	RateLimitType string
+	Utilization   *float64
+	FallbackCount int
 }
 
 // SaveWebhook upserts a webhook registration.

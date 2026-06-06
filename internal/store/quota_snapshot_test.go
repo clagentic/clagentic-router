@@ -5,13 +5,11 @@ import (
 	"context"
 	"testing"
 	"time"
-
-	"github.com/clagentic/clagentic-router/internal/backend"
 )
 
 func float64Ptr(v float64) *float64 { return &v }
 func stringPtr(v string) *string    { return &v }
-func timePtr(v time.Time) *time.Time { return &v }
+func int64Ptr(v int64) *int64       { return &v }
 
 // TestInsertQuotaSnapshot_FullEvent inserts a fully-populated event and
 // verifies the row round-trips through the database correctly.
@@ -19,21 +17,21 @@ func TestInsertQuotaSnapshot_FullEvent(t *testing.T) {
 	s := tempStore(t)
 	ctx := context.Background()
 
-	resetsAt := time.Unix(1780963200, 0).UTC()
-	overageResetsAt := time.Unix(1780966800, 0).UTC()
+	resetsAtUnix := int64(1780963200)
+	overageResetsAtUnix := int64(1780966800)
 	u := 0.78
 	surp := 0.75
 
-	e := &backend.RateLimitEvent{
+	e := QuotaSnapshotInput{
 		Status:                "allowed_warning",
 		RateLimitType:         "seven_day",
-		ResetsAt:              resetsAt,
+		ResetsAt:              &resetsAtUnix,
 		Utilization:           &u,
 		SurpassedThreshold:    &surp,
 		IsUsingOverage:        false,
 		OverageStatus:         stringPtr("enabled"),
 		OverageDisabledReason: nil,
-		OverageResetsAt:       &overageResetsAt,
+		OverageResetsAt:       &overageResetsAtUnix,
 		RawJSON:               `{"status":"allowed_warning","rateLimitType":"seven_day"}`,
 	}
 
@@ -53,16 +51,16 @@ func TestInsertQuotaSnapshot_FullEvent(t *testing.T) {
 
 	var backendID, status, rateLimitType, rawJSON string
 	var utilization, surpassedThreshold *float64
-	var resetsAtUnix *int64
-	var overageResetsAtUnix *int64
+	var resetsAt *int64
+	var overageResetsAt *int64
 	var isUsingOverage int
 	var overageStatus, overageDisabledReason *string
 
 	err := row.Scan(
 		&backendID, &status, &rateLimitType,
-		&utilization, &resetsAtUnix, &surpassedThreshold,
+		&utilization, &resetsAt, &surpassedThreshold,
 		&isUsingOverage, &overageStatus, &overageDisabledReason,
-		&overageResetsAtUnix, &rawJSON,
+		&overageResetsAt, &rawJSON,
 	)
 	if err != nil {
 		t.Fatalf("scan: %v", err)
@@ -92,27 +90,30 @@ func TestInsertQuotaSnapshot_FullEvent(t *testing.T) {
 	if overageDisabledReason != nil {
 		t.Errorf("overage_disabled_reason = %v, want nil", overageDisabledReason)
 	}
-	if overageResetsAtUnix == nil || *overageResetsAtUnix != overageResetsAt.Unix() {
-		t.Errorf("overage_resets_at = %v, want %d", overageResetsAtUnix, overageResetsAt.Unix())
+	if overageResetsAt == nil || *overageResetsAt != overageResetsAtUnix {
+		t.Errorf("overage_resets_at = %v, want %d", overageResetsAt, overageResetsAtUnix)
+	}
+	if resetsAt == nil || *resetsAt != resetsAtUnix {
+		t.Errorf("resets_at = %v, want %d", resetsAt, resetsAtUnix)
 	}
 	if rawJSON == "" {
 		t.Error("raw_json is empty")
 	}
-	_ = resetsAtUnix // verified via resetsAt.Unix() implicitly
 }
 
 // TestInsertQuotaSnapshot_NullFields verifies that a status=allowed event
 // stores NULL for utilization, surpassed_threshold, and optional overage fields.
+// Absence of utilization is not an error — it means below-threshold (status=allowed).
 func TestInsertQuotaSnapshot_NullFields(t *testing.T) {
 	s := tempStore(t)
 	ctx := context.Background()
 
-	e := &backend.RateLimitEvent{
+	resetsAt := int64(1780945600)
+	e := QuotaSnapshotInput{
 		Status:        "allowed",
 		RateLimitType: "five_hour",
-		ResetsAt:      time.Unix(1780945600, 0).UTC(),
-		Utilization:   nil, // absent when status=allowed
-		SurpassedThreshold: nil,
+		ResetsAt:      &resetsAt,
+		Utilization:   nil, // legitimately absent when status=allowed
 		IsUsingOverage: false,
 		RawJSON:       `{"status":"allowed"}`,
 	}
@@ -136,7 +137,7 @@ func TestInsertQuotaSnapshot_NullFields(t *testing.T) {
 	}
 
 	if utilization != nil {
-		t.Errorf("utilization = %v, want NULL", *utilization)
+		t.Errorf("utilization = %v, want NULL (below-threshold)", *utilization)
 	}
 	if surpassedThreshold != nil {
 		t.Errorf("surpassed_threshold = %v, want NULL", *surpassedThreshold)
@@ -149,18 +150,19 @@ func TestInsertQuotaSnapshot_NullFields(t *testing.T) {
 	}
 }
 
-// TestInsertQuotaSnapshot_IndexedByBackend verifies that two events for
-// different backends are stored independently and the index covers both.
+// TestInsertQuotaSnapshot_MultipleBackends verifies that two events for
+// different backends are stored independently.
 func TestInsertQuotaSnapshot_MultipleBackends(t *testing.T) {
 	s := tempStore(t)
 	ctx := context.Background()
 
+	resetsAt := int64(1780963200)
 	u := 0.5
 	for _, bid := range []string{"backend-x", "backend-y"} {
-		e := &backend.RateLimitEvent{
+		e := QuotaSnapshotInput{
 			Status:        "allowed_warning",
 			RateLimitType: "seven_day",
-			ResetsAt:      time.Unix(1780963200, 0).UTC(),
+			ResetsAt:      &resetsAt,
 			Utilization:   &u,
 			RawJSON:       `{"status":"allowed_warning"}`,
 		}
@@ -175,5 +177,31 @@ func TestInsertQuotaSnapshot_MultipleBackends(t *testing.T) {
 	}
 	if count != 2 {
 		t.Errorf("row count = %d, want 2", count)
+	}
+}
+
+// TestInsertQuotaSnapshot_ObservedAtMonotonic verifies that observed_at is
+// populated and is a reasonable Unix nanosecond timestamp.
+func TestInsertQuotaSnapshot_ObservedAtMonotonic(t *testing.T) {
+	s := tempStore(t)
+	ctx := context.Background()
+
+	before := time.Now().UTC().UnixNano()
+	resetsAt := int64(1780963200)
+	e := QuotaSnapshotInput{
+		Status: "allowed", RateLimitType: "seven_day",
+		ResetsAt: &resetsAt, RawJSON: `{}`,
+	}
+	if err := s.InsertQuotaSnapshot(ctx, "b", e); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	after := time.Now().UTC().UnixNano()
+
+	var observedAt int64
+	if err := s.db.QueryRow(`SELECT observed_at FROM quota_snapshots LIMIT 1`).Scan(&observedAt); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if observedAt < before || observedAt > after {
+		t.Errorf("observed_at %d outside [%d, %d]", observedAt, before, after)
 	}
 }
