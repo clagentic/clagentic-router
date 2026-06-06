@@ -23,10 +23,10 @@ import (
 )
 
 const (
-	probeDefaultInterval   = 30 * time.Minute
-	probeDefaultModel      = "claude-haiku-4-5"
-	probeInvokeTimeout     = 30 * time.Second
-	probeRejectedBackoff   = 5 * time.Minute
+	probeDefaultInterval = 30 * time.Minute
+	probeDefaultModel    = "claude-haiku-4-5"
+	probeInvokeTimeout   = 30 * time.Second
+	probeRejectedBackoff = 5 * time.Minute
 )
 
 // QuotaProber fires cheap Adapter pings on a configurable interval when no organic
@@ -146,8 +146,9 @@ func (p *QuotaProber) Start(ctx context.Context, onEvent func(resp *Response)) {
 					continue
 				}
 
-				// Record that we received a probe response, resetting the idle clock.
-				p.lastEventAt.Store(time.Now().UnixNano())
+				// NOTE: do NOT update lastEventAt here. lastEventAt tracks organic
+				// traffic via NotifyEvent. Updating it on probe responses would suppress
+				// the next probe for a full interval, causing 2× effective cadence.
 
 				// Check for rejected status → enter short backoff.
 				if resp.RateLimitEvent != nil && resp.RateLimitEvent.Status == "rejected" {
