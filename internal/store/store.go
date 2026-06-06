@@ -63,10 +63,10 @@ CREATE TABLE IF NOT EXISTS call_log (
     fallback_count        INTEGER NOT NULL DEFAULT 0    -- number of backends tried before this one
 );
 
-CREATE INDEX IF NOT EXISTS call_log_ts            ON call_log(ts);
-CREATE INDEX IF NOT EXISTS call_log_backend       ON call_log(backend_id, ts);
-CREATE INDEX IF NOT EXISTS call_log_request_id    ON call_log(request_id);
-CREATE INDEX IF NOT EXISTS call_log_model         ON call_log(model, ts);
+CREATE INDEX IF NOT EXISTS call_log_ts      ON call_log(ts);
+CREATE INDEX IF NOT EXISTS call_log_backend ON call_log(backend_id, ts);
+-- call_log_request_id and call_log_model are created in migrateCallLog
+-- after the new columns are guaranteed to exist.
 
 CREATE TABLE IF NOT EXISTS webhooks (
     id         TEXT PRIMARY KEY,
