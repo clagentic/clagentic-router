@@ -11,7 +11,7 @@
   <a href="https://ko-fi.com/clagentic"><img src="https://img.shields.io/badge/Support-Ko--fi-FF5E5B?logo=ko-fi&logoColor=white" alt="Support on Ko-fi" /></a>
 </p>
 
-A self-hosted LLM routing daemon with fallback chains, quota tracking, and an OpenAI-compatible HTTP API. Route requests across Claude, Codex, Gemini, Ollama, and API backends — with automatic failover when any of them degrades, rate-limits, or exhausts quota.
+A self-hosted LLM routing daemon with fallback chains, live quota intelligence, and an OpenAI-compatible HTTP API. Route requests across Claude, Codex, Gemini, Ollama, and API backends — with automatic failover, utilization-aware scoring, and persistent quota history across your full provider fleet.
 
 ## What it does
 
