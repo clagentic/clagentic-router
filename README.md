@@ -19,6 +19,7 @@ A self-hosted LLM routing daemon with fallback chains, quota tracking, and an Op
 - Walks a fallback chain when backends are unavailable or rate-limited
 - Scores backends by health, quota pressure, latency EMA, and cost weight; near-ties broken by jitter
 - Tracks quota/rate-limit state persistently in SQLite; auto-recovers when windows reset
+- Parses `rate_limit_event` from the Claude CLI stream — captures live utilization, reset time, and bucket type on every response; persists to `quota_snapshots` table for historical analysis
 - Exposes an OpenAI-compatible `/v1/chat/completions` endpoint — any OpenAI SDK works without changes
 - Delivers webhook alerts (HMAC-signed, exponential retry) on backend state changes
 - Runs as a daemon on any Linux host; CLI adapters (`claude_cli`, `codex_cli`) require OAuth sessions on that host; API adapters work anywhere
@@ -105,11 +106,13 @@ graph LR
 |---|---|---|
 | POST | /v1/chat/completions | OpenAI-compatible inference |
 | GET | /v1/models | List all backends with status |
+| GET | /v1/capacity | Per-backend capacity snapshot (utilization, reset time, score) |
 | GET | /health | Aggregated health (cached) |
 | GET | /doctor | Live probe of all backends |
 | GET | /quota | Per-backend quota and rate state |
 | GET | /metrics | Prometheus text format |
 | GET | /logs | Recent call log (`?from=RFC3339&to=RFC3339`) |
+| GET | /stats | Aggregated call statistics |
 | POST | /backends/{id}/reset | Clear error state, re-probe |
 | POST | /backends/{id}/disable | Force backend offline |
 | POST | /backends/{id}/enable | Re-enable a disabled backend |
@@ -144,7 +147,7 @@ X-Router-Fallback-Reason: rate_limit   # only when chain was advanced
 
 | Type | Auth | Notes |
 |---|---|---|
-| `claude_cli` | OAuth (keychain) | Requires `claude` binary on PATH |
+| `claude_cli` | OAuth (keychain) | Requires `claude` binary on PATH; emits `rate_limit_event` with live utilization on every response — captured and persisted automatically |
 | `codex_cli` | OAuth (keychain) | Requires `codex` binary on PATH |
 | `codex_subagent` | OAuth (via Claude) | Requires Claude with codex agent installed |
 | `gemini_cli` | OAuth (keychain) or `GEMINI_API_KEY` | Requires `gemini` binary on PATH; run `gemini auth login` |
@@ -177,6 +180,10 @@ Delivery uses exponential backoff (default: 5 retries, initial 500 ms). Failed d
 ## Logging
 
 Every HTTP request is logged at `Info` level with `method`, `path`, `status`, `latency_ms`, and `request_id`. 5xx responses are logged at `Warn`. Backend state changes are logged at `Warn`. Verbose adapter traces are at `Debug`.
+
+Every routed call is persisted to the `call_log` SQLite table with: `backend_id`, `model`, `outcome`, `prompt_tokens_est`, `completion_tokens_est`, `latency_ms`, `cost_usd_est`, `score` (router score at selection time), `request_id` (correlates to HTTP logs), `rate_limit_type` (active quota bucket), `utilization` (account utilization at routing time, if known), and `fallback_count` (backends tried before this hop). Query via `GET /logs`.
+
+Quota events from `claude_cli` are additionally persisted to `quota_snapshots` with full `rate_limit_info` payload including `status`, `utilization`, `resets_at`, `surpassed_threshold`, and raw JSON for forward compatibility.
 
 Configure log level and format in `router.yaml`:
 
