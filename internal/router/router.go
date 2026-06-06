@@ -71,6 +71,10 @@ type Router struct {
 	// Registered via RegisterLlamaCppPoller / RegisterOllamaPoller.
 	localPollers []localPoller
 
+	// quotaProbers runs idle-quota probe loops for claude_cli backends that have
+	// quota_probe.enabled=true. Keyed by backend ID.
+	quotaProbers map[string]*backend.QuotaProber
+
 	mu sync.RWMutex
 
 	// Background goroutine management
@@ -94,13 +98,31 @@ func New(cfg *config.Config, adapters map[string]backend.Adapter, st *store.Stor
 		}
 		states[id] = state.New(id)
 	}
+	// Build quota probers for claude_cli backends that have quota_probe.enabled.
+	probers := make(map[string]*backend.QuotaProber)
+	for id, bcfg := range cfg.Backends {
+		if !bcfg.QuotaProbe.Enabled {
+			continue
+		}
+		adp, ok := adapters[id]
+		if !ok {
+			continue
+		}
+		// Only create probers for ClaudeCLIAdapter; other adapters do not emit
+		// rate_limit_event lines so the probe would produce no useful data.
+		if _, isClaude := adp.(*backend.ClaudeCLIAdapter); !isClaude {
+			continue
+		}
+		probers[id] = backend.NewQuotaProber(id, bcfg.QuotaProbe, adp)
+	}
 	return &Router{
-		cfg:       cfg,
-		states:    states,
-		adapters:  adapters,
-		store:     st,
-		alertHook: hook,
-		stopCh:    make(chan struct{}),
+		cfg:          cfg,
+		states:       states,
+		adapters:     adapters,
+		store:        st,
+		alertHook:    hook,
+		stopCh:       make(chan struct{}),
+		quotaProbers: probers,
 	}
 }
 
@@ -209,6 +231,27 @@ func (r *Router) RegisterOllamaPoller(p *backend.OllamaPoller) {
 func (r *Router) Start() {
 	r.wg.Add(1)
 	go r.backgroundLoop()
+}
+
+// startQuotaProbers launches all registered quota probe loops.
+// Called from backgroundLoop so they share the same context lifetime.
+func (r *Router) startQuotaProbers(ctx context.Context) {
+	for bid, p := range r.quotaProbers {
+		// Capture loop variables.
+		probeBid := bid
+		prober := p
+		prober.Start(ctx, func(resp *backend.Response) {
+			r.applyRateLimitEvent(ctx, probeBid, resp)
+		})
+		slog.Info("quota_probe: started probe loop", "backend", probeBid)
+	}
+}
+
+// stopQuotaProbers shuts down all running quota probe loops.
+func (r *Router) stopQuotaProbers() {
+	for _, p := range r.quotaProbers {
+		p.Stop()
+	}
 }
 
 // Stop shuts down background goroutines gracefully.
@@ -748,6 +791,12 @@ func (r *Router) applyRateLimitEvent(ctx context.Context, bid string, resp *back
 		"utilization", utilizationLog,
 		"resets_at", e.ResetsAt,
 	)
+
+	// Notify the quota prober (if any) so it resets its idle timer.
+	// This prevents a probe from firing when organic data just arrived.
+	if p, ok := r.quotaProbers[bid]; ok {
+		p.NotifyEvent()
+	}
 }
 
 func (r *Router) recordFailure(bid string, errType state.ErrorType, errRaw string, resetAt time.Time, latencyMS int64) state.StatusChange {
@@ -792,9 +841,10 @@ func stateChangeEvent(to state.Status, errType state.ErrorType) string {
 func (r *Router) backgroundLoop() {
 	defer r.wg.Done()
 
-	// Start usage pollers with a context tied to stopCh.
+	// Start usage pollers, local pollers, and quota probers with a context tied to stopCh.
 	pollerCtx, pollerCancel := context.WithCancel(context.Background())
 	defer pollerCancel()
+	defer r.stopQuotaProbers()
 
 	for _, p := range r.usagePollers {
 		p.Start(pollerCtx)
@@ -802,6 +852,7 @@ func (r *Router) backgroundLoop() {
 	for _, p := range r.localPollers {
 		go p.Start(pollerCtx)
 	}
+	r.startQuotaProbers(pollerCtx)
 
 	probeTicker := time.NewTicker(time.Duration(r.cfg.Routing.HealthProbeIntervalSeconds) * time.Second)
 	flushTicker := time.NewTicker(30 * time.Second)
