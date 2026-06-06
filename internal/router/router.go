@@ -236,10 +236,21 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 			continue
 		}
 
-		bid := r.selectBest(candidates, req)
+		bid, bidScore := r.selectBest(candidates, req)
 		if bid == "" {
 			slog.Debug("router: all backends in tier unavailable", "entry", entry, "request_id", reqID)
 			continue
+		}
+
+		// Snapshot quota state at routing time for the log row.
+		var routingUtilization *float64
+		var routingRateLimitType string
+		if bs := r.getState(bid); bs != nil {
+			snap := bs.Snapshot()
+			if snap.LastQuotaSnapshot != nil {
+				routingRateLimitType = snap.LastQuotaSnapshot.RateLimitType
+				routingUtilization = snap.LastQuotaSnapshot.Utilization
+			}
 		}
 
 		tried = append(tried, bid)
@@ -250,6 +261,7 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 		if err == nil {
 			// Success
 			r.recordSuccess(bid, resp, latencyMS)
+			r.applyRateLimitEvent(ctx, bid, resp)
 
 			meta := &RouteMeta{
 				BackendID:     bid,
@@ -264,7 +276,22 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 			}
 
 			if r.store != nil {
-				r.store.LogCall(bid, entry, i, "pass", "", resp.PromptTokensEst, resp.CompletionTokensEst, int(latencyMS), resp.CostUSD)
+				r.store.LogCall(store.CallLogInput{
+					BackendID:           bid,
+					TierAlias:           entry,
+					ChainPosition:       i,
+					Outcome:             "pass",
+					PromptTokensEst:     resp.PromptTokensEst,
+					CompletionTokensEst: resp.CompletionTokensEst,
+					LatencyMS:           int(latencyMS),
+					CostUSD:             resp.CostUSD,
+					Model:               r.cfg.Backends[bid].Model,
+					Score:               bidScore,
+					RequestID:           reqID,
+					RateLimitType:       routingRateLimitType,
+					Utilization:         routingUtilization,
+					FallbackCount:       i,
+				})
 			}
 
 			return resp, meta, nil
@@ -282,7 +309,20 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 		change := r.recordFailure(bid, errType, errRaw, backend.ParseResetTime(errRaw), latencyMS)
 
 		if r.store != nil {
-			r.store.LogCall(bid, entry, i, "fallback", string(errType), 0, 0, int(latencyMS), 0)
+			r.store.LogCall(store.CallLogInput{
+				BackendID:     bid,
+				TierAlias:     entry,
+				ChainPosition: i,
+				Outcome:       "fallback",
+				ErrorType:     string(errType),
+				LatencyMS:     int(latencyMS),
+				Model:         r.cfg.Backends[bid].Model,
+				Score:         bidScore,
+				RequestID:     reqID,
+				RateLimitType: routingRateLimitType,
+				Utilization:   routingUtilization,
+				FallbackCount: i,
+			})
 		}
 
 		// Fire alert on state change
@@ -304,7 +344,16 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 
 	if r.store != nil {
 		for _, bid := range tried {
-			r.store.LogCall(bid, strings.Join(chain, ","), len(chain)-1, "degraded", "all_failed", 0, 0, 0, 0)
+			r.store.LogCall(store.CallLogInput{
+				BackendID:     bid,
+				TierAlias:     strings.Join(chain, ","),
+				ChainPosition: len(chain) - 1,
+				Outcome:       "degraded",
+				ErrorType:     "all_failed",
+				Model:         r.cfg.Backends[bid].Model,
+				RequestID:     reqID,
+				FallbackCount: len(tried),
+			})
 			break // one degraded row for the whole call
 		}
 	}
@@ -518,22 +567,22 @@ func (r *Router) resolveChainEntry(entry string) []string {
 // considered tied and subject to random selection. 0.05 = within 5% of the best.
 const nearTieEpsilon = 0.05
 
-// selectBest scores all candidates and returns the best backend ID.
+// selectBest scores all candidates and returns the best backend ID and its score.
 // When multiple backends fall within nearTieEpsilon of the top score, one is
 // chosen uniformly at random — this spreads load and prevents thundering-herd
-// routing without masking real score differences. Returns "" if all score 0.
-func (r *Router) selectBest(candidates []string, req *backend.Request) string {
+// routing without masking real score differences. Returns ("", 0) if all score 0.
+func (r *Router) selectBest(candidates []string, req *backend.Request) (string, float64) {
 	if r.cfg.Routing.Strategy == "ordered" {
 		// Ordered strategy: return first non-offline candidate, no scoring
 		for _, bid := range candidates {
 			if bs, ok := r.states[bid]; ok {
 				snap := bs.Snapshot()
 				if snap.Status != state.StatusOffline && !snap.QuotaExhausted {
-					return bid
+					return bid, 1.0 // score=1.0 sentinel for ordered strategy
 				}
 			}
 		}
-		return ""
+		return "", 0
 	}
 
 	// Scored strategy: collect scores, then randomly pick among near-ties
@@ -563,22 +612,27 @@ func (r *Router) selectBest(candidates []string, req *backend.Request) string {
 		}
 	}
 	if bestScore == 0 {
-		return ""
+		return "", 0
 	}
 
 	// Collect backends within nearTieEpsilon of the best score
 	threshold := bestScore * (1.0 - nearTieEpsilon)
-	var tied []string
+	type tiedEntry struct {
+		id    string
+		score float64
+	}
+	var tied []tiedEntry
 	for _, sc := range scores {
 		if sc.score >= threshold {
-			tied = append(tied, sc.id)
+			tied = append(tied, tiedEntry{sc.id, sc.score})
 		}
 	}
 	if len(tied) == 1 {
-		return tied[0]
+		return tied[0].id, tied[0].score
 	}
 	// Randomly pick among near-ties to spread load
-	return tied[rand.IntN(len(tied))]
+	pick := tied[rand.IntN(len(tied))]
+	return pick.id, pick.score
 }
 
 func (r *Router) getState(backendID string) *state.BackendState {
@@ -621,6 +675,79 @@ func (r *Router) recordSuccess(bid string, resp *backend.Response, latencyMS int
 			})
 		}
 	}
+}
+
+// applyRateLimitEvent processes a rate_limit_event embedded in a successful response.
+// It persists a quota snapshot to the store, updates BackendState quota fields,
+// and logs the event. Called after every successful invoke that returns a Response.
+func (r *Router) applyRateLimitEvent(ctx context.Context, bid string, resp *backend.Response) {
+	e := resp.RateLimitEvent
+	if e == nil {
+		return
+	}
+
+	// Persist to quota_snapshots table.
+	// Translate backend.RateLimitEvent → store.QuotaSnapshotInput to keep
+	// store free of backend imports (import graph: store → state only).
+	if r.store != nil {
+		inp := store.QuotaSnapshotInput{
+			Status:                e.Status,
+			RateLimitType:         e.RateLimitType,
+			Utilization:           e.Utilization,
+			SurpassedThreshold:    e.SurpassedThreshold,
+			IsUsingOverage:        e.IsUsingOverage,
+			OverageStatus:         e.OverageStatus,
+			OverageDisabledReason: e.OverageDisabledReason,
+			RawJSON:               e.RawJSON,
+		}
+		if !e.ResetsAt.IsZero() {
+			v := e.ResetsAt.Unix()
+			inp.ResetsAt = &v
+		}
+		if e.OverageResetsAt != nil {
+			v := e.OverageResetsAt.Unix()
+			inp.OverageResetsAt = &v
+		}
+		if err := r.store.InsertQuotaSnapshot(ctx, bid, inp); err != nil {
+			// Already logged by the store; don't block routing on storage errors.
+			_ = err
+		}
+	}
+
+	// Update in-memory state.
+	bs := r.getState(bid)
+	if bs == nil {
+		return
+	}
+
+	// Build the quota snapshot for the /v1/capacity endpoint.
+	snap := &state.QuotaSnapshot{
+		Status:        e.Status,
+		RateLimitType: e.RateLimitType,
+		Utilization:   e.Utilization,
+		ResetsAt:      e.ResetsAt,
+		ObservedAt:    time.Now().UTC(),
+	}
+
+	bs.UpdateFromRateLimitEvent(state.RateLimitEventData{
+		Status:            e.Status,
+		RateLimitType:     e.RateLimitType,
+		ResetsAt:          e.ResetsAt,
+		Utilization:       e.Utilization,
+		LastQuotaSnapshot: snap,
+	})
+
+	utilizationLog := "below-threshold"
+	if e.Utilization != nil {
+		utilizationLog = fmt.Sprintf("%.4f", *e.Utilization)
+	}
+	slog.Info("rate_limit_event",
+		"backend_id", bid,
+		"rate_limit_type", e.RateLimitType,
+		"status", e.Status,
+		"utilization", utilizationLog,
+		"resets_at", e.ResetsAt,
+	)
 }
 
 func (r *Router) recordFailure(bid string, errType state.ErrorType, errRaw string, resetAt time.Time, latencyMS int64) state.StatusChange {

@@ -1,8 +1,10 @@
 // internal/backend/claude_cli.go — adapter for the claude CLI (OAuth auth).
 //
-// Invokes: claude --print --model <model> --output-format json [--system-prompt <s>]
+// Invokes: claude --print --model <model> --output-format stream-json [--system-prompt <s>]
 // Input: user prompt via stdin.
-// Output: JSON {"result": "...", "cost_usd": ...}
+// Output: newline-delimited JSON stream. The final "result" line carries the
+// response text and cost. Intermediate lines include rate_limit_event lines
+// which are parsed and attached to the Response.
 //
 // The CLI must be installed and authenticated via OAuth (claude auth login)
 // before this adapter can be used. No API key is required or supported here —
@@ -21,6 +23,7 @@
 package backend
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -32,7 +35,10 @@ import (
 	"sync"
 )
 
-// claudeOutput is the JSON shape of claude --output-format json stdout.
+// claudeOutput is the JSON shape of one line in claude --output-format stream-json stdout,
+// and also of the single JSON object from --output-format json (used by codex_subagent).
+// The "result" type carries the final response; "error" carries failure details.
+// Other event types (e.g. rate_limit_event) are handled separately in ratelimit.go.
 type claudeOutput struct {
 	Type    string  `json:"type"`
 	Subtype string  `json:"subtype"`
@@ -108,7 +114,7 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 
 	args := []string{
 		"--print",
-		"--output-format", "json",
+		"--output-format", "stream-json",
 		"--max-turns", "1",
 	}
 	if a.model != "" {
@@ -162,11 +168,58 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 		return nil, ie
 	}
 
-	// Parse JSON output
-	var out claudeOutput
-	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
-		// Non-JSON output — try treating stdout as plain text
-		content := strings.TrimSpace(stdout.String())
+	// Parse stream-json output: scan line by line.
+	// The stream emits one JSON object per line. We look for the "result" line
+	// (carries the final response) and rate_limit_event lines (quota telemetry).
+	// All other line types are silently ignored for forward compatibility.
+	return parseStreamJSON(stdout.Bytes(), req, a.id)
+}
+
+// parseStreamJSON scans the stream-json output lines, extracts the result and any
+// rate_limit_event, and returns a populated Response. Exported for testing.
+func parseStreamJSON(data []byte, req *Request, backendID string) (*Response, error) {
+	var (
+		resultLine   *claudeOutput
+		rateLimitEvt *RateLimitEvent
+	)
+
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+
+		// Try rate_limit_event first — these lines have a distinctive type field.
+		if evt := parseRateLimitEvent(line); evt != nil {
+			rateLimitEvt = evt
+			continue
+		}
+
+		// Decode the line to check its type field.
+		var sl claudeOutput
+		if err := json.Unmarshal(line, &sl); err != nil {
+			// Ignore unparseable lines — forward-compat with new event types.
+			continue
+		}
+
+		switch sl.Type {
+		case "result":
+			resultLine = &sl
+		case "error":
+			raw := sl.Error
+			if raw == "" {
+				raw = sl.Message
+			}
+			errType := ClassifyError(raw, 0)
+			return nil, &InvokeError{Type: errType, Raw: truncate(raw, 500)}
+		}
+		// All other event types are ignored.
+	}
+
+	if resultLine == nil {
+		// No result line found — fall back to treating stdout as plain text if non-empty.
+		content := strings.TrimSpace(string(data))
 		if content == "" {
 			return nil, &InvokeError{Type: ErrTypeSchema, Raw: "empty output from claude CLI"}
 		}
@@ -174,34 +227,43 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 			Content:             content,
 			PromptTokensEst:     EstimateTokens(req.Messages),
 			CompletionTokensEst: len(content) / 4,
+			RateLimitEvent:      rateLimitEvt,
 		}, nil
 	}
 
-	// Handle error type in JSON response
-	if out.Type == "error" || out.Error != "" {
-		raw := out.Error
+	// Handle error type carried in the result line itself
+	if resultLine.Type == "error" || resultLine.Error != "" {
+		raw := resultLine.Error
 		if raw == "" {
-			raw = out.Message
+			raw = resultLine.Message
 		}
 		errType := ClassifyError(raw, 0)
 		return nil, &InvokeError{Type: errType, Raw: truncate(raw, 500)}
 	}
 
-	content := strings.TrimSpace(out.Result)
+	content := strings.TrimSpace(resultLine.Result)
 	if content == "" {
-		return nil, &InvokeError{Type: ErrTypeSchema, Raw: fmt.Sprintf("empty result in claude output: %s", truncate(stdout.String(), 200))}
+		return nil, &InvokeError{
+			Type: ErrTypeSchema,
+			Raw:  fmt.Sprintf("empty result in claude output: %s", truncate(string(data), 200)),
+		}
 	}
 
 	promptEst := EstimateTokens(req.Messages)
 	completionEst := len(content) / 4
 
-	slog.Debug("claude_cli invoke ok", "backend", a.id, "content_len", len(content), "cost_usd", out.CostUSD,
-		"request_id", RequestIDFromCtx(ctx))
+	slog.Debug("claude_cli invoke ok",
+		"backend", backendID,
+		"content_len", len(content),
+		"cost_usd", resultLine.CostUSD,
+		"has_rate_limit_event", rateLimitEvt != nil,
+	)
 
 	return &Response{
 		Content:             content,
 		PromptTokensEst:     promptEst,
 		CompletionTokensEst: completionEst,
-		CostUSD:             out.CostUSD,
+		CostUSD:             resultLine.CostUSD,
+		RateLimitEvent:      rateLimitEvt,
 	}, nil
 }
