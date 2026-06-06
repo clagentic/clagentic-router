@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver
@@ -99,7 +100,50 @@ func Open(dbPath string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store: init quota_snapshots schema: %w", err)
 	}
+	if err := migrateCallLog(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: migrate call_log: %w", err)
+	}
 	return &Store{db: db}, nil
+}
+
+// migrateCallLog adds columns introduced in Phase 6 Slice A to an existing
+// call_log table. SQLite does not support IF NOT EXISTS on ALTER TABLE ADD COLUMN,
+// so we attempt each column and ignore "duplicate column name" errors — those
+// mean the column already exists (fresh DB or already migrated).
+func migrateCallLog(db *sql.DB) error {
+	migrations := []string{
+		`ALTER TABLE call_log ADD COLUMN model TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE call_log ADD COLUMN score REAL NOT NULL DEFAULT 0`,
+		`ALTER TABLE call_log ADD COLUMN request_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE call_log ADD COLUMN rate_limit_type TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE call_log ADD COLUMN utilization REAL`,
+		`ALTER TABLE call_log ADD COLUMN fallback_count INTEGER NOT NULL DEFAULT 0`,
+	}
+	for _, m := range migrations {
+		if _, err := db.Exec(m); err != nil {
+			// "duplicate column name" means the column already exists — safe to ignore.
+			if !isDuplicateColumnErr(err) {
+				return fmt.Errorf("%s: %w", m, err)
+			}
+		}
+	}
+	// Add new indexes (CREATE INDEX IF NOT EXISTS is idempotent).
+	indexes := []string{
+		`CREATE INDEX IF NOT EXISTS call_log_request_id ON call_log(request_id)`,
+		`CREATE INDEX IF NOT EXISTS call_log_model ON call_log(model, ts)`,
+	}
+	for _, idx := range indexes {
+		if _, err := db.Exec(idx); err != nil {
+			return fmt.Errorf("%s: %w", idx, err)
+		}
+	}
+	return nil
+}
+
+// isDuplicateColumnErr reports whether err is a SQLite "duplicate column name" error.
+func isDuplicateColumnErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "duplicate column name")
 }
 
 // Close closes the database.
