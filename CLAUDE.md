@@ -76,9 +76,8 @@ Clear fires when quota recovers above threshold.
 - **Phase 3** ✅ — webhook HTTP delivery (Slice A ✅), `/logs` date-range filtering + `/stats`
   (Slice B ✅), SSE streaming for `/v1/chat/completions` (Slice C ✅)
 - **Phase 4** — Python client library, relay integration, third-party integrations
-- **Phase 6** (in progress) — quota intelligence: `rate_limit_event` parsing + persistence
-  (Slice A ✅ lr-fe3b), idle probe loop (Slice B lr-bc82), early reset notifications
-  (Slice C lr-2413), web UI (Slice D lr-b02b), parity for other backends (Slice E lr-c98c)
+- **Phase 6** — quota intelligence: `rate_limit_event` parsing + persistence, idle probe loop,
+  early reset notifications, web UI, parity for other backends
 
 Do not implement a later-phase feature without a task ID. Cross-phase imports are a hard error.
 
