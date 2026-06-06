@@ -147,7 +147,7 @@ X-Router-Fallback-Reason: rate_limit   # only when chain was advanced
 
 | Type | Auth | Notes |
 |---|---|---|
-| `claude_cli` | OAuth (keychain) | Requires `claude` binary on PATH; emits `rate_limit_event` with live utilization on every response — captured and persisted automatically |
+| `claude_cli` | OAuth (keychain) | Requires `claude` binary on PATH; emits `rate_limit_event` with live utilization on every response — captured and persisted automatically; supports `quota_probe` config block to poll utilization on a configurable interval when idle |
 | `codex_cli` | OAuth (keychain) | Requires `codex` binary on PATH |
 | `codex_subagent` | OAuth (via Claude) | Requires Claude with codex agent installed |
 | `gemini_cli` | OAuth (keychain) or `GEMINI_API_KEY` | Requires `gemini` binary on PATH; run `gemini auth login` |
@@ -207,6 +207,33 @@ Key concepts:
 - **Backends**: one LLM invocation path each
 - **Tiers**: named groups of backends at the same capability level (scored, pick best)
 - **Chains**: ordered list of tiers to try in sequence on failure
+
+### quota_probe (claude_cli backends)
+
+When the router is idle, quota utilization and reset times for `claude_cli` backends go
+stale. The `quota_probe` block activates a background loop that fires a minimal claude
+CLI call when no organic `rate_limit_event` has been received within the configured window.
+
+```yaml
+backends:
+  claude-low:
+    adapter: claude_cli
+    model: claude-haiku-4-5
+    quota_probe:
+      enabled: true       # false by default; must opt in
+      interval: 30m       # probe if no organic data in this window (default: 30m)
+      model: claude-haiku-4-5  # model to use for the probe ping (default: claude-haiku-4-5)
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `false` | Activate the probe loop |
+| `interval` | duration string | `30m` | How long to wait without organic data before probing |
+| `model` | string | `claude-haiku-4-5` | Model to use for the probe call (use the cheapest available) |
+
+Probe calls are not recorded in `/logs` or `/stats` — they are maintenance traffic, not
+routed requests. On a `rejected` status (quota exhausted), the prober backs off to a
+5-minute retry interval until it receives a non-rejected response.
 
 ## Deployment
 

@@ -34,6 +34,10 @@ backends:
     model: claude-haiku-4-5     # pin: claude-haiku-4-5 | latest alias: claude-haiku
     cost_weight: 1.5
     timeout_seconds: 120
+    # quota_probe:
+    #   enabled: true
+    #   interval: 30m          # probe if no organic data in this window
+    #   model: claude-haiku-4-5  # cheapest model for the ping
 
   claude-mid:
     adapter: claude_cli

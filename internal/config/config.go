@@ -28,6 +28,46 @@ const (
 	AdapterGeminiCLI      AdapterType = "gemini_cli"
 )
 
+// Duration is a time.Duration that unmarshals from a YAML string (e.g. "30m", "1h").
+// When the field is not present or is zero, callers should apply their own defaults.
+type Duration time.Duration
+
+// UnmarshalYAML implements yaml.Unmarshaler so Duration fields in config structs
+// can be written as human-readable strings ("30m", "2h", "15s") instead of raw
+// integer nanoseconds. An empty string unmarshals to 0 (caller applies default).
+func (d *Duration) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var s string
+	if err := unmarshal(&s); err != nil {
+		return err
+	}
+	if s == "" {
+		*d = 0
+		return nil
+	}
+	dur, err := time.ParseDuration(s)
+	if err != nil {
+		return fmt.Errorf("invalid duration %q: %w", s, err)
+	}
+	*d = Duration(dur)
+	return nil
+}
+
+// QuotaProbeConfig configures the idle-quota probe loop for a backend.
+// Only meaningful for claude_cli backends; ignored on all other adapter types.
+type QuotaProbeConfig struct {
+	// Enabled activates the probe loop. Default false.
+	Enabled bool `yaml:"enabled"`
+
+	// Interval is how long to wait without an organic rate_limit_event before
+	// firing a probe. Parsed from a duration string (e.g. "30m", "1h").
+	// Default: 30 minutes.
+	Interval Duration `yaml:"interval"`
+
+	// Model is the cheapest model to use for the probe ping.
+	// Default: "claude-haiku-4-5".
+	Model string `yaml:"model"`
+}
+
 // BackendConfig is the configuration for one LLM backend.
 type BackendConfig struct {
 	// Adapter is the adapter type (required).
@@ -102,6 +142,10 @@ type BackendConfig struct {
 	// CapacityPolling configures a capacity poller for local backends (llama.cpp, Ollama).
 	// Leave empty for cloud API backends.
 	CapacityPolling CapacityPollingConfig `yaml:"capacity_polling"`
+
+	// QuotaProbe configures the idle-quota probe loop.
+	// Only active for claude_cli backends with Enabled=true.
+	QuotaProbe QuotaProbeConfig `yaml:"quota_probe"`
 }
 
 // CapacityPollingConfig configures a capacity poller for local backends (llama.cpp, Ollama).
