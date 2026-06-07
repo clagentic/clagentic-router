@@ -85,13 +85,34 @@ func run(args []string) error {
 
 // --- serve ---
 
+// serveFlags holds parsed flags for the serve subcommand.
+type serveFlags struct {
+	cfg          *config.Config
+	unsafeNoAuth bool
+}
+
 func cmdServe(args []string) error {
-	cfg, err := parseServeFlags(args)
+	sf, err := parseServeFlags(args)
 	if err != nil {
 		return err
 	}
+	cfg := sf.cfg
 
 	setupLogging(cfg)
+
+	// Startup gate: refuse to start without authentication unless --unsafe-no-auth
+	// is explicitly passed. This prevents accidental open deployments. (lr-c7ac)
+	token := cfg.Proxy.ResolvedToken()
+	if token == "" {
+		if !sf.unsafeNoAuth {
+			return fmt.Errorf("proxy.token is not set — refusing to start without authentication. " +
+				"Set proxy.token in config (e.g. \"env:CLAGENTIC_ROUTER_TOKEN\") or pass " +
+				"--unsafe-no-auth for development only")
+		}
+		slog.Warn("clagentic-router: running WITHOUT authentication (--unsafe-no-auth)")
+	}
+
+	adminToken := cfg.Proxy.ResolvedAdminToken()
 
 	// Open store
 	var st *store.Store
@@ -138,8 +159,7 @@ func cmdServe(args []string) error {
 
 	// Build and start HTTP server
 	addr := cfg.Proxy.Address()
-	token := cfg.Proxy.ResolvedToken()
-	srv := server.New(addr, token, r, st)
+	srv := server.New(addr, token, adminToken, r, st)
 
 	// Graceful shutdown on SIGINT/SIGTERM
 	sigCh := make(chan os.Signal, 1)
@@ -155,6 +175,7 @@ func cmdServe(args []string) error {
 		"addr", addr,
 		"backends", len(adapters),
 		"auth", token != "",
+		"admin_token_separate", adminToken != token,
 	)
 
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -163,26 +184,29 @@ func cmdServe(args []string) error {
 	return nil
 }
 
-func parseServeFlags(args []string) (*config.Config, error) {
+func parseServeFlags(args []string) (serveFlags, error) {
 	configPath := defaultConfigPath()
 	logLevel := "info"
+	unsafeNoAuth := false
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--config", "-c":
 			if i+1 >= len(args) {
-				return nil, fmt.Errorf("--config requires a value")
+				return serveFlags{}, fmt.Errorf("--config requires a value")
 			}
 			i++
 			configPath = args[i]
 		case "--log-level":
 			if i+1 >= len(args) {
-				return nil, fmt.Errorf("--log-level requires a value")
+				return serveFlags{}, fmt.Errorf("--log-level requires a value")
 			}
 			i++
 			logLevel = args[i]
+		case "--unsafe-no-auth":
+			unsafeNoAuth = true
 		default:
-			return nil, fmt.Errorf("unknown flag %q", args[i])
+			return serveFlags{}, fmt.Errorf("unknown flag %q", args[i])
 		}
 	}
 
@@ -191,9 +215,9 @@ func parseServeFlags(args []string) (*config.Config, error) {
 
 	cfg, err := config.Load(configPath)
 	if err != nil {
-		return nil, fmt.Errorf("load config %s: %w", configPath, err)
+		return serveFlags{}, fmt.Errorf("load config %s: %w", configPath, err)
 	}
-	return cfg, nil
+	return serveFlags{cfg: cfg, unsafeNoAuth: unsafeNoAuth}, nil
 }
 
 func setupLogging(cfg *config.Config) {
@@ -753,7 +777,7 @@ func printUsage() {
 	fmt.Print(`clagentic-router ` + version + ` — LLM routing daemon
 
 Usage:
-  clagentic-router serve [--config PATH] [--log-level debug|info|warn|error]
+  clagentic-router serve [--config PATH] [--log-level debug|info|warn|error] [--unsafe-no-auth]
   clagentic-router health  [--server URL] [--token TOKEN]
   clagentic-router doctor  [--server URL] [--token TOKEN]
   clagentic-router quota   [--server URL] [--token TOKEN]
@@ -763,12 +787,16 @@ Usage:
   clagentic-router backend reset|disable|enable ID [--server URL] [--token TOKEN]
   clagentic-router version
 
+Serve flags:
+  --unsafe-no-auth  Start without authentication (development only — never use in production)
+
 Environment variables:
-  CLAGENTIC_ROUTER_CONFIG     Config file path (default: ./router.yaml)
-  CLAGENTIC_ROUTER_URL        Daemon URL for client commands (default: http://localhost:8765)
-  CLAGENTIC_ROUTER_TOKEN      Bearer token for client commands
-  CLAGENTIC_ROUTER_LOG_LEVEL  Log level for serve (debug|info|warn|error)
-  CLAGENTIC_ROUTER_LOG_FORMAT Log format for serve (text|json)
+  CLAGENTIC_ROUTER_CONFIG       Config file path (default: ./router.yaml)
+  CLAGENTIC_ROUTER_URL          Daemon URL for client commands (default: http://localhost:8765)
+  CLAGENTIC_ROUTER_TOKEN        Bearer token for inference endpoints and client commands
+  CLAGENTIC_ROUTER_ADMIN_TOKEN  Admin bearer token (defaults to CLAGENTIC_ROUTER_TOKEN if unset)
+  CLAGENTIC_ROUTER_LOG_LEVEL    Log level for serve (debug|info|warn|error)
+  CLAGENTIC_ROUTER_LOG_FORMAT   Log format for serve (text|json)
 
 Config file search order:
   $CLAGENTIC_ROUTER_CONFIG

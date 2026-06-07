@@ -24,9 +24,10 @@ import (
 
 // Handler holds the shared dependencies for all HTTP handlers.
 type Handler struct {
-	router *router.Router
-	store  *store.Store
-	token  string
+	router     *router.Router
+	store      *store.Store
+	token      string // inference token
+	adminToken string // admin token (may equal token if not separately configured)
 }
 
 // --- OpenAI-compatible types ---
@@ -90,6 +91,10 @@ type chunkDelta struct {
 //   - "role:summarizer"                named chain from config
 //   - "backend:backend-id"             direct backend (no scoring)
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+	// Hard limits defend against oversized requests. Values are conservative defaults;
+	// make them configurable in a follow-up. (TODO(lr-c7ac): expose via config)
+	r.Body = http.MaxBytesReader(w, r.Body, 4*1024*1024) // 4 MB
+
 	var req chatCompletionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", fmt.Sprintf("decode body: %v", err))
@@ -99,8 +104,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "model is required")
 		return
 	}
+	if len(req.Model) > 200 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "model field too long")
+		return
+	}
 	if len(req.Messages) == 0 {
 		writeError(w, http.StatusBadRequest, "invalid_request", "messages is required")
+		return
+	}
+	if len(req.Messages) > 200 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "too many messages (max 200)")
+		return
+	}
+	for _, msg := range req.Messages {
+		if len(msg.Content) > 512*1024 {
+			writeError(w, http.StatusBadRequest, "invalid_request", "message content too large (max 512KB)")
+			return
+		}
+	}
+	if req.MaxTokens > 32000 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "max_tokens exceeds limit (max 32000)")
 		return
 	}
 	chain := h.router.ResolveModel(req.Model)

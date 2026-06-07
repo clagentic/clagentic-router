@@ -29,7 +29,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -124,7 +123,9 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 		args = append(args, "--system-prompt", system)
 	}
 	// Prevent recursive hook firing when called from within a Claude session.
-	env := append(os.Environ(), "CLAGENTIC_DISABLE_RECALL=1")
+	// buildCLIEnv filters the daemon environment to the allowlist — router tokens
+	// and API keys are not passed to the subprocess. (lr-c7ac)
+	env := buildCLIEnv([]string{"CLAGENTIC_DISABLE_RECALL=1"})
 
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Stdin = strings.NewReader(prompt)
