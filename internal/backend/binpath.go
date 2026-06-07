@@ -13,7 +13,9 @@ import (
 
 // ResolveBinPath resolves a CLI binary to its absolute path at construction time.
 // If configured is non-empty it is used directly (no PATH search). Otherwise
-// ResolveBinary searches known candidate dirs and PATH.
+// ResolveBinary is called with envVar so that env overrides (e.g. CLAUDE_BIN)
+// are honoured at construction time — matching the behaviour of the invoke-time
+// resolveBin/refreshBin path.
 //
 // The resolved path is logged at Info. A warning is emitted if the binary's
 // parent directory is world-writable (indicates a supply-chain risk).
@@ -21,12 +23,12 @@ import (
 // Returns the resolved absolute path, or an empty string when the binary is not
 // found. An empty return does NOT block construction — adapters fall back to bare
 // name resolution at invoke time, which produces a clear ErrTypeNotFound error.
-func ResolveBinPath(name, configured string) string {
+func ResolveBinPath(name, configured, envVar string) string {
 	var resolved string
 	if configured != "" {
 		resolved = configured
 	} else {
-		resolved = ResolveBinary(name, "")
+		resolved = ResolveBinary(name, envVar)
 	}
 
 	if resolved == "" {

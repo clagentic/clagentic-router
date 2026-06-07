@@ -128,7 +128,7 @@ func cmdServe(args []string) error {
 		// Warn if DB file permissions are broader than 0600 (store.Open sets 0600,
 		// but the file may have been created by a previous version or another process).
 		if info, err := os.Stat(dbPath); err == nil {
-			if info.Mode().Perm() > 0600 {
+			if info.Mode().Perm()&0o077 != 0 {
 				slog.Warn("store: DB file permissions are broader than 0600",
 					"path", dbPath, "mode", info.Mode().Perm())
 			}

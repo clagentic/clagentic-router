@@ -529,6 +529,9 @@ func (h *Handler) webhookCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Validate that all requested event names are known.
+	// An empty events list is intentionally accepted — it registers the endpoint
+	// to receive all event types. The deliverer does not filter by events when the
+	// list is empty, so the webhook fires on every state change.
 	for _, ev := range body.Events {
 		if _, ok := knownWebhookEvents[ev]; !ok {
 			writeError(w, http.StatusBadRequest, "invalid_event", fmt.Sprintf("unknown event type %q", ev))

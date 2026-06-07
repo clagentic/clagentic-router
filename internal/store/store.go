@@ -91,15 +91,16 @@ func Open(dbPath string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", dbPath, err)
 	}
-	// Restrict the DB file to owner-only. Chmod after open so the file exists
-	// even when sql.Open creates it on first use.
-	if err := os.Chmod(dbPath, 0600); err != nil {
-		slog.Warn("store: could not set DB file permissions", "path", dbPath, "err", err)
-	}
 	db.SetMaxOpenConns(1) // SQLite is single-writer
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("store: init schema: %w", err)
+	}
+	// Restrict the DB file to owner-only. Chmod after the first Exec so the file
+	// is guaranteed to exist (modernc.org/sqlite creates it lazily on first use,
+	// not at sql.Open time).
+	if err := os.Chmod(dbPath, 0600); err != nil {
+		slog.Warn("store: could not set DB file permissions", "path", dbPath, "err", err)
 	}
 	if _, err := db.Exec(quotaSnapshotsSchema); err != nil {
 		db.Close()

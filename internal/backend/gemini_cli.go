@@ -76,7 +76,7 @@ func NewGeminiCLIAdapter(id, model, binPathOverride string) *GeminiCLIAdapter {
 	a := &GeminiCLIAdapter{id: id, model: model}
 	// Resolve and log the binary path at construction time so misconfigurations
 	// surface in the startup log rather than silently at first invoke.
-	a.binPath = ResolveBinPath("gemini", binPathOverride)
+	a.binPath = ResolveBinPath("gemini", binPathOverride, "GEMINI_BIN")
 	return a
 }
 

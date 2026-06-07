@@ -36,7 +36,7 @@ func NewCodexSubagentAdapter(id, tier, binPathOverride string) *CodexSubagentAda
 	// Resolve and log the binary path at construction time so misconfigurations
 	// surface in the startup log rather than silently at first invoke.
 	// codex_subagent invokes the claude CLI (not codex directly).
-	a.binPath = ResolveBinPath("claude", binPathOverride)
+	a.binPath = ResolveBinPath("claude", binPathOverride, "CLAUDE_BIN")
 	return a
 }
 
