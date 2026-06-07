@@ -1,17 +1,18 @@
 <p align="center">
-  <img src="media/logo/router-lockup-256.png" alt="Clagentic: Router" width="260" />
+  <img src="media/logo/router-lockup-256.png" alt="clagentic:router" width="260" />
 </p>
 
 <h4 align="center">LLM routing. Built for builders.</h4>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-FSL--1.1--MIT-blue.svg" alt="License: FSL-1.1-MIT" /></a>
-  <img src="https://img.shields.io/badge/Go-1.25+-00ADD8.svg" alt="Go 1.25+" />
-  <img src="https://img.shields.io/badge/API-OpenAI--compatible-412991.svg" alt="OpenAI-compatible API" />
-  <a href="https://ko-fi.com/clagentic"><img src="https://img.shields.io/badge/Support-Ko--fi-FF5E5B?logo=ko-fi&logoColor=white" alt="Support on Ko-fi" /></a>
+  <a href="https://clagentic.ai"><img src="https://img.shields.io/badge/-clagentic.ai-00CFFF?style=flat&logoColor=white" alt="clagentic.ai" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-FSL--1.1--MIT-blue?style=flat" alt="License: FSL-1.1-MIT" /></a>
+  <img src="https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat&logo=go&logoColor=white" alt="Go 1.25+" />
+  <img src="https://img.shields.io/badge/API-OpenAI--compatible-412991?style=flat" alt="OpenAI-compatible API" />
+  <a href="https://ko-fi.com/clagentic"><img src="https://img.shields.io/badge/Ko--fi-FF5E5B?style=flat&logo=ko-fi&logoColor=white&label=support" alt="Support on Ko-fi" /></a>
 </p>
 
-A self-hosted LLM routing daemon with fallback chains, live quota intelligence, and an OpenAI-compatible HTTP API. Route requests across Claude, Codex, Gemini, Ollama, and API backends — with automatic failover, utilization-aware scoring, and persistent quota history across your full provider fleet.
+A self-hosted LLM routing daemon with fallback chains, live quota intelligence, and an OpenAI-compatible HTTP API. Part of the [clagentic](https://clagentic.ai) suite.
 
 ## What it does
 
@@ -274,6 +275,20 @@ make test     # go test ./...
 make docker   # builds Docker image
 ```
 
+## Support
+
+If clagentic:router is useful to you: [ko-fi.com/clagentic](https://ko-fi.com/clagentic)
+
 ## Disclaimer
 
-Not affiliated with Anthropic or OpenAI. Claude is a trademark of Anthropic. Codex is a trademark of OpenAI. Provided "as is" without warranty. Users are responsible for complying with their AI provider's terms of service.
+Not affiliated with Anthropic or OpenAI. Claude is a trademark of Anthropic. Codex is a
+trademark of OpenAI. Provided "as is" without warranty. Users are responsible for
+complying with their AI provider's terms of service.
+
+## License
+
+[FSL-1.1-MIT](LICENSE) — Functional Source License 1.1, with MIT as the Change License.
+
+Free for personal, internal-business, evaluation, research, and non-commercial use.
+Not free for offering this tool (or a substantial fork) as a competing commercial product.
+Each release auto-converts to MIT on its second anniversary.
