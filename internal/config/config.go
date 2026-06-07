@@ -272,7 +272,7 @@ type ProxyConfig struct {
 	// Port is the HTTP listen port. Default 8765.
 	Port int `yaml:"port"`
 
-	// Host is the HTTP listen address. Default 0.0.0.0.
+	// Host is the HTTP listen address. Default 127.0.0.1.
 	Host string `yaml:"host"`
 
 	// Token is the bearer token for authentication. Use "env:VAR_NAME" to read from env.
@@ -305,7 +305,7 @@ func (p *ProxyConfig) ResolvedAdminToken() string {
 func (p *ProxyConfig) Address() string {
 	host := p.Host
 	if host == "" {
-		host = "0.0.0.0"
+		host = "127.0.0.1"
 	}
 	port := p.Port
 	if port == 0 {

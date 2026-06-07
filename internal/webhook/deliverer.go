@@ -281,6 +281,9 @@ func (d *Deliverer) deliver(job *deliveryJob) error {
 	ctx, cancel := context.WithTimeout(context.Background(), d.cfg.timeout())
 	defer cancel()
 
+	// TODO(lr-5619): re-validate webhook URL at delivery time to defend against
+	// DNS rebinding attacks. Registration-time validation (validateWebhookURL) is
+	// insufficient if the DNS record changes after registration.
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, job.url, bytes.NewReader(job.body))
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)

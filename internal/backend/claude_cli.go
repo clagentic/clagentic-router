@@ -65,9 +65,9 @@ type ClaudeCLIAdapter struct {
 // effort and thinkingMode are noted at construction; see Invoke for current support status.
 func NewClaudeCLIAdapter(id, model, binPathOverride string, effort EffortLevel, thinkingMode ThinkingMode) *ClaudeCLIAdapter {
 	a := &ClaudeCLIAdapter{id: id, model: model, effort: effort, thinkingMode: thinkingMode}
-	if binPathOverride != "" {
-		a.binPath = binPathOverride
-	}
+	// Resolve and log the binary path at construction time so misconfigurations
+	// surface in the startup log rather than silently at first invoke.
+	a.binPath = ResolveBinPath("claude", binPathOverride)
 	// TODO(lr-7d2f): wire effort and thinkingMode to claude CLI flags once the CLI
 	// exposes --effort / --thinking flags. At time of writing (2026-05-28) the claude
 	// CLI has no stable --effort flag. effort/thinkingMode config values on claude_cli

@@ -33,9 +33,10 @@ type CodexSubagentAdapter struct {
 // tier should be one of: flagship, mini, spark.
 func NewCodexSubagentAdapter(id, tier, binPathOverride string) *CodexSubagentAdapter {
 	a := &CodexSubagentAdapter{id: id, tier: tier}
-	if binPathOverride != "" {
-		a.binPath = binPathOverride
-	}
+	// Resolve and log the binary path at construction time so misconfigurations
+	// surface in the startup log rather than silently at first invoke.
+	// codex_subagent invokes the claude CLI (not codex directly).
+	a.binPath = ResolveBinPath("claude", binPathOverride)
 	return a
 }
 

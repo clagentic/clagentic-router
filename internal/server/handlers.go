@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
@@ -145,7 +146,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				"no available backends in chain")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		// Log the raw error server-side; do not include it in the client response
+		// to avoid leaking internal backend error details to inference callers.
+		slog.Error("chat: backend error", "err", err, "request_id", RequestID(r.Context()))
+		writeError(w, http.StatusBadGateway, "backend_error", "upstream backend failed")
 		return
 	}
 
