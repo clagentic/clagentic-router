@@ -519,6 +519,18 @@ func (h *Handler) webhookCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "url is required")
 		return
 	}
+	// Validate URL — block SSRF targets.
+	if err := validateWebhookURL(body.URL, false); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_url", err.Error())
+		return
+	}
+	// Validate that all requested event names are known.
+	for _, ev := range body.Events {
+		if _, ok := knownWebhookEvents[ev]; !ok {
+			writeError(w, http.StatusBadRequest, "invalid_event", fmt.Sprintf("unknown event type %q", ev))
+			return
+		}
+	}
 	id := uuid.NewString()
 	eventsJSON, _ := json.Marshal(body.Events)
 	h.store.SaveWebhook(id, body.URL, string(eventsJSON), body.Secret)
@@ -547,7 +559,18 @@ func (h *Handler) webhookList(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"webhooks": rows})
+	// Redact secret — callers learn only whether a secret is set, never its value.
+	items := make([]webhookListItem, 0, len(rows))
+	for _, row := range rows {
+		items = append(items, webhookListItem{
+			ID:        row.ID,
+			URL:       row.URL,
+			Events:    row.Events,
+			HasSecret: row.Secret != "",
+			CreatedAt: row.CreatedAt,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"webhooks": items})
 }
 
 // version handles GET /version.
