@@ -276,12 +276,29 @@ type ProxyConfig struct {
 	Host string `yaml:"host"`
 
 	// Token is the bearer token for authentication. Use "env:VAR_NAME" to read from env.
+	// Env override: CLAGENTIC_ROUTER_TOKEN.
 	Token string `yaml:"token"`
+
+	// AdminToken is the bearer token for admin-only endpoints (backend control,
+	// internal rate-limit, webhook management, logs, stats, quota, doctor).
+	// If empty, falls back to Token. Use "env:VAR_NAME" to read from env.
+	// Env override: CLAGENTIC_ROUTER_ADMIN_TOKEN.
+	AdminToken string `yaml:"admin_token"`
 }
 
 // ResolvedToken returns the bearer token, resolving env: references.
 func (p *ProxyConfig) ResolvedToken() string {
 	return ResolveEnvRef(p.Token)
+}
+
+// ResolvedAdminToken returns the admin token, resolving env: references.
+// Falls back to ResolvedToken() when admin_token is not set.
+func (p *ProxyConfig) ResolvedAdminToken() string {
+	t := ResolveEnvRef(p.AdminToken)
+	if t == "" {
+		return p.ResolvedToken()
+	}
+	return t
 }
 
 // Address returns "host:port".

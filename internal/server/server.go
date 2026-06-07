@@ -1,9 +1,9 @@
 // internal/server/server.go — HTTP server setup and bearer auth middleware.
 //
-// All routes require Authorization: Bearer <token>.
-// The API surface is OpenAI-compatible at /v1/chat/completions with
-// router-specific extensions at /health, /doctor, /quota, /metrics,
-// and /backends/{id}/* control endpoints.
+// Inference routes (/v1/chat/completions, /v1/models) use the inference token.
+// Admin routes (control plane, observability, internal events) use the admin token.
+// When admin_token is not separately configured, it falls back to the inference token,
+// preserving exact backwards compatibility for existing deployments. (lr-c7ac)
 package server
 
 import (
@@ -27,38 +27,41 @@ type Server struct {
 	handler    *Handler
 }
 
-// New creates a new Server. token is the bearer token for authentication.
-func New(addr, token string, r *router.Router, st *store.Store) *Server {
-	h := &Handler{router: r, store: st, token: token}
+// New creates a new Server.
+// token is the inference bearer token; adminToken is the admin bearer token.
+// When adminToken equals token (the default when admin_token is not configured),
+// all routes accept the same credential — identical to previous behaviour.
+func New(addr, token, adminToken string, r *router.Router, st *store.Store) *Server {
+	h := &Handler{router: r, store: st, token: token, adminToken: adminToken}
 	mux := http.NewServeMux()
 
-	// OpenAI-compatible inference
+	// OpenAI-compatible inference — inference token
 	mux.HandleFunc("POST /v1/chat/completions", h.auth(h.chatCompletions))
 	mux.HandleFunc("GET /v1/models", h.auth(h.models))
 
-	// Health and observability
-	mux.HandleFunc("GET /health", h.auth(h.health))
-	mux.HandleFunc("GET /doctor", h.auth(h.doctor))
-	mux.HandleFunc("GET /quota", h.auth(h.quota))
-	mux.HandleFunc("GET /v1/capacity", h.auth(h.capacity))
-	mux.HandleFunc("GET /metrics", h.auth(h.metrics))
-	mux.HandleFunc("GET /logs", h.auth(h.logs))
-	mux.HandleFunc("GET /stats", h.auth(h.stats))
+	// Health/observability — admin token
+	mux.HandleFunc("GET /health", h.adminAuth(h.health))
+	mux.HandleFunc("GET /doctor", h.adminAuth(h.doctor))
+	mux.HandleFunc("GET /quota", h.adminAuth(h.quota))
+	mux.HandleFunc("GET /v1/capacity", h.adminAuth(h.capacity))
+	mux.HandleFunc("GET /metrics", h.adminAuth(h.metrics))
+	mux.HandleFunc("GET /logs", h.adminAuth(h.logs))
+	mux.HandleFunc("GET /stats", h.adminAuth(h.stats))
 
-	// Internal event ingestion (from clagentic-console and other first-party callers)
-	mux.HandleFunc("POST /v1/internal/rate-limit", h.auth(h.rateLimitEvent))
+	// Internal event ingestion — admin token
+	mux.HandleFunc("POST /v1/internal/rate-limit", h.adminAuth(h.rateLimitEvent))
 
-	// Backend control
-	mux.HandleFunc("POST /backends/{id}/reset", h.auth(h.backendReset))
-	mux.HandleFunc("POST /backends/{id}/disable", h.auth(h.backendDisable))
-	mux.HandleFunc("POST /backends/{id}/enable", h.auth(h.backendEnable))
+	// Backend control — admin token
+	mux.HandleFunc("POST /backends/{id}/reset", h.adminAuth(h.backendReset))
+	mux.HandleFunc("POST /backends/{id}/disable", h.adminAuth(h.backendDisable))
+	mux.HandleFunc("POST /backends/{id}/enable", h.adminAuth(h.backendEnable))
 
-	// Webhook management
-	mux.HandleFunc("POST /webhooks", h.auth(h.webhookCreate))
-	mux.HandleFunc("DELETE /webhooks/{id}", h.auth(h.webhookDelete))
-	mux.HandleFunc("GET /webhooks", h.auth(h.webhookList))
+	// Webhook management — admin token
+	mux.HandleFunc("POST /webhooks", h.adminAuth(h.webhookCreate))
+	mux.HandleFunc("DELETE /webhooks/{id}", h.adminAuth(h.webhookDelete))
+	mux.HandleFunc("GET /webhooks", h.adminAuth(h.webhookList))
 
-	// Version (no auth — useful for healthcheck scripts)
+	// Version — no auth (useful for healthcheck scripts)
 	mux.HandleFunc("GET /version", h.version)
 
 	srv := &Server{
@@ -89,13 +92,28 @@ func (s *Server) Close() error {
 	return s.httpServer.Close()
 }
 
-// auth wraps a handler with bearer token authentication.
+// auth wraps a handler requiring the inference bearer token.
 func (h *Handler) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if h.token != "" {
 			hdr := r.Header.Get("Authorization")
 			if !strings.HasPrefix(hdr, "Bearer ") || strings.TrimPrefix(hdr, "Bearer ") != h.token {
 				writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or missing bearer token")
+				return
+			}
+		}
+		next(w, r)
+	}
+}
+
+// adminAuth wraps a handler requiring the admin bearer token.
+// When adminToken is empty no authentication is enforced (dev-only / no-auth mode).
+func (h *Handler) adminAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if h.adminToken != "" {
+			hdr := r.Header.Get("Authorization")
+			if !strings.HasPrefix(hdr, "Bearer ") || strings.TrimPrefix(hdr, "Bearer ") != h.adminToken {
+				writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or missing admin bearer token")
 				return
 			}
 		}

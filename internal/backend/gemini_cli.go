@@ -29,7 +29,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -127,7 +126,9 @@ func (a *GeminiCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 	}
 
 	// NO_COLOR suppresses ANSI escape codes that may appear in some output paths.
-	env := append(os.Environ(), "NO_COLOR=1")
+	// buildCLIEnv filters the daemon environment to the allowlist — router tokens
+	// and API keys are not passed to the subprocess. (lr-c7ac)
+	env := buildCLIEnv([]string{"NO_COLOR=1"})
 
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Env = env
