@@ -43,9 +43,9 @@ type CodexCLIAdapter struct {
 // binPathOverride is the explicit path to the codex binary (empty = auto-resolve).
 func NewCodexCLIAdapter(id, model, reasoningEffort, binPathOverride string) *CodexCLIAdapter {
 	a := &CodexCLIAdapter{id: id, model: model, reasoningEffort: reasoningEffort}
-	if binPathOverride != "" {
-		a.binPath = binPathOverride
-	}
+	// Resolve and log the binary path at construction time so misconfigurations
+	// surface in the startup log rather than silently at first invoke.
+	a.binPath = ResolveBinPath("codex", binPathOverride, "CODEX_BIN")
 	return a
 }
 

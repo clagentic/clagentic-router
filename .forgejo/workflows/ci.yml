@@ -1,7 +1,7 @@
 # CI workflow for clagentic-router.
 #
-# Runs on every push to main and feature/fix/chore branches, and on PRs.
-# Single job: build binary + run all unit tests.
+# Runs on every push to main and feature/fix/chore/security branches, and on PRs.
+# Jobs: build+test, govulncheck.
 #
 # Runner: clagentic-router (repo-scoped).
 
@@ -14,6 +14,7 @@ on:
       - "chore/**"
       - "docs/**"
       - "refactor/**"
+      - "security/**"
   pull_request:
     branches:
       - main
@@ -38,3 +39,20 @@ jobs:
           go mod download
           go build -o /tmp/clagentic-router ./cmd/clagentic-router/
           go test ./... -timeout 120s -v
+
+  govulncheck:
+    name: govulncheck
+    runs-on: clagentic-router
+    steps:
+      - name: Checkout
+        uses: https://code.forgejo.org/actions/checkout@v3
+
+      - name: govulncheck
+        run: |
+          set -eux
+          export GOPATH="${HOME}/go"
+          export GOMODCACHE="${HOME}/go/pkg/mod"
+          export GOCACHE="${HOME}/.cache/go"
+          mkdir -p "$GOPATH" "$GOCACHE"
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "${GOPATH}/bin/govulncheck" ./...

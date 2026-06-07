@@ -2,10 +2,33 @@
 package store
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+// TestOpen_FilePermissions verifies that Open creates the DB file with mode 0600.
+// This guards against the chmod-timing regression where sqlite creates the file
+// after sql.Open (lazily on first use), causing an earlier chmod to no-op.
+func TestOpen_FilePermissions(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "perm_test.db")
+
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.db.Close()
+
+	info, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if got := info.Mode().Perm(); got&0o077 != 0 {
+		t.Errorf("DB file permissions too broad: got %04o, want 0600", got)
+	}
+}
 
 func tempStore(t *testing.T) *Store {
 	t.Helper()

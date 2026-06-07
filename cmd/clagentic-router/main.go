@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -124,6 +125,14 @@ func cmdServe(args []string) error {
 		}
 		defer st.Close()
 		slog.Info("store opened", "path", dbPath)
+		// Warn if DB file permissions are broader than 0600 (store.Open sets 0600,
+		// but the file may have been created by a previous version or another process).
+		if info, err := os.Stat(dbPath); err == nil {
+			if info.Mode().Perm()&0o077 != 0 {
+				slog.Warn("store: DB file permissions are broader than 0600",
+					"path", dbPath, "mode", info.Mode().Perm())
+			}
+		}
 	}
 
 	// Build adapters
@@ -159,6 +168,11 @@ func cmdServe(args []string) error {
 
 	// Build and start HTTP server
 	addr := cfg.Proxy.Address()
+	if bindHost, _, err := net.SplitHostPort(addr); err == nil {
+		if bindHost == "0.0.0.0" || bindHost == "::" {
+			slog.Warn("clagentic-router: binding on all interfaces — ensure a TLS-terminating reverse proxy is in front")
+		}
+	}
 	srv := server.New(addr, token, adminToken, r, st)
 
 	// Graceful shutdown on SIGINT/SIGTERM
