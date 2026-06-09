@@ -280,19 +280,34 @@ func defaultConfigPath() string {
 	// Check common locations in order:
 	// 1. CLAGENTIC_ROUTER_CONFIG env var
 	// 2. ./router.yaml
-	// 3. ~/.config/clagentic-router/router.yaml
-	// 4. /etc/clagentic-router/router.yaml
+	// 3. ~/.config/clagentic/router/router.yaml  (canonical per CLI-NAMING-STANDARD)
+	// 4. ~/.config/clagentic-router/router.yaml  (deprecated — accepted for one release cycle)
+	// 5. /etc/clagentic/router/router.yaml
+	// 6. /etc/clagentic-router/router.yaml        (deprecated)
 	if v := os.Getenv("CLAGENTIC_ROUTER_CONFIG"); v != "" {
 		return v
 	}
-	candidates := []string{
-		"router.yaml",
-		filepath.Join(os.Getenv("HOME"), ".config", "clagentic-router", "router.yaml"),
-		"/etc/clagentic-router/router.yaml",
+	home := os.Getenv("HOME")
+	canonicalUser := filepath.Join(home, ".config", "clagentic", "router", "router.yaml")
+	legacyUser := filepath.Join(home, ".config", "clagentic-router", "router.yaml")
+	candidates := []struct {
+		path       string
+		deprecated bool
+	}{
+		{"router.yaml", false},
+		{canonicalUser, false},
+		{legacyUser, true},
+		{"/etc/clagentic/router/router.yaml", false},
+		{"/etc/clagentic-router/router.yaml", true},
 	}
-	for _, p := range candidates {
-		if _, err := os.Stat(p); err == nil {
-			return p
+	for _, c := range candidates {
+		if _, err := os.Stat(c.path); err == nil {
+			if c.deprecated {
+				slog.Warn("config path is deprecated; move to canonical location",
+					"current", c.path,
+					"canonical", canonicalUser)
+			}
+			return c.path
 		}
 	}
 	return "router.yaml" // fall through; Load will produce a clear error
@@ -815,7 +830,9 @@ Environment variables:
 Config file search order:
   $CLAGENTIC_ROUTER_CONFIG
   ./router.yaml
-  ~/.config/clagentic-router/router.yaml
-  /etc/clagentic-router/router.yaml
+  ~/.config/clagentic/router/router.yaml
+  ~/.config/clagentic-router/router.yaml  (deprecated)
+  /etc/clagentic/router/router.yaml
+  /etc/clagentic-router/router.yaml       (deprecated)
 `)
 }
