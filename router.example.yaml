@@ -1,6 +1,6 @@
 # router.example.yaml — clagentic-router configuration example.
 #
-# Copy this to router.yaml (or ~/.config/clagentic-router/router.yaml) and edit.
+# Copy this to router.yaml (or ~/.config/clagentic/router/router.yaml) and edit.
 # All api_key / token values support "env:VAR_NAME" to read from environment.
 #
 # Model versioning:

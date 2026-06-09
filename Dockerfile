@@ -9,7 +9,7 @@
 #
 # Run:
 #   docker run -p 8765:8765 \
-#     -v /path/to/router.yaml:/etc/clagentic-router/router.yaml:ro \
+#     -v /path/to/router.yaml:/etc/clagentic/router/router.yaml:ro \
 #     -e CLAGENTIC_ROUTER_TOKEN=secret \
 #     -e ANTHROPIC_API_KEY=sk-... \
 #     clagentic-router
@@ -28,6 +28,6 @@ COPY --from=builder /clagentic-router /usr/local/bin/clagentic-router
 EXPOSE 8765
 VOLUME ["/var/lib/clagentic-router"]
 
-ENV CLAGENTIC_ROUTER_CONFIG=/etc/clagentic-router/router.yaml
+ENV CLAGENTIC_ROUTER_CONFIG=/etc/clagentic/router/router.yaml
 
 ENTRYPOINT ["clagentic-router", "serve"]

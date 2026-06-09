@@ -248,7 +248,7 @@ After=network.target
 [Service]
 ExecStart=/usr/local/bin/clagentic-router serve
 Restart=always
-EnvironmentFile=/etc/clagentic-router/env
+EnvironmentFile=/etc/clagentic/router/env
 User=router
 
 [Install]
@@ -259,7 +259,7 @@ WantedBy=multi-user.target
 
 ```bash
 docker run -p 8765:8765 \
-  -v /etc/clagentic-router/router.yaml:/etc/clagentic-router/router.yaml:ro \
+  -v /etc/clagentic/router/router.yaml:/etc/clagentic/router/router.yaml:ro \
   -e CLAGENTIC_ROUTER_TOKEN=secret \
   -e ANTHROPIC_API_KEY=sk-... \
   clagentic-router
