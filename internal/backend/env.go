@@ -37,10 +37,28 @@ var cliEnvAllowlist = []string{
 
 // buildCLIEnv constructs a filtered environment for CLI subprocess adapters.
 // Only variables matching cliEnvAllowlist prefixes are inherited from the daemon.
-// extra is appended unconditionally (adapter-specific overrides).
+// extra is appended last and takes precedence — any key that appears in extra
+// is excluded from the daemon environment to prevent duplicate/shadowed entries.
 func buildCLIEnv(extra []string) []string {
+	// Build set of keys overridden by extra so we can drop them from daemon env.
+	override := make(map[string]struct{}, len(extra))
+	for _, kv := range extra {
+		key := kv
+		if idx := strings.IndexByte(kv, '='); idx >= 0 {
+			key = kv[:idx]
+		}
+		override[key] = struct{}{}
+	}
+
 	var env []string
 	for _, kv := range os.Environ() {
+		key := kv
+		if idx := strings.IndexByte(kv, '='); idx >= 0 {
+			key = kv[:idx]
+		}
+		if _, overridden := override[key]; overridden {
+			continue // extra wins
+		}
 		if cliEnvAllowed(kv) {
 			env = append(env, kv)
 		}

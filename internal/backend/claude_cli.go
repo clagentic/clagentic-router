@@ -29,10 +29,71 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 )
+
+// claudeSubprocessHome is the HOME directory injected into every claude CLI subprocess.
+// It must contain a ~/.claude directory with credentials but NO settings.json hooks —
+// this prevents the operator's SessionStart/UserPromptSubmit hooks from firing inside
+// router-spawned sessions, which would pollute stdout with hook telemetry and cause
+// parseStreamJSON to fail with auth misclassification.
+//
+// Resolution order:
+//  1. CLAGENTIC_ROUTER_SUBPROCESS_HOME env var (operator override)
+//  2. {state_dir}/claude-home — created at package init if absent
+//
+// The credentials must be present at {home}/.claude/.credentials.json.
+// At init time, if the target home lacks credentials but the daemon's own HOME has
+// them, they are copied automatically (convenience bootstrap — not repeated after that).
+var claudeSubprocessHome = func() string {
+	// Operator override takes precedence.
+	if v := os.Getenv("CLAGENTIC_ROUTER_SUBPROCESS_HOME"); v != "" {
+		return v
+	}
+
+	// Default: state dir sibling, which persists across restarts.
+	stateDir := os.Getenv("CLAGENTIC_ROUTER_STATE_DIR")
+	if stateDir == "" {
+		stateDir = "/var/lib/clagentic-router"
+	}
+	home := filepath.Join(stateDir, "claude-home")
+	claudeDir := filepath.Join(home, ".claude")
+
+	if err := os.MkdirAll(claudeDir, 0700); err != nil {
+		slog.Warn("claude_cli: failed to create subprocess home, hooks may fire",
+			"path", home, "err", err)
+		return ""
+	}
+
+	// Bootstrap credentials from the daemon's own HOME if not already present.
+	credsTarget := filepath.Join(claudeDir, ".credentials.json")
+	if _, err := os.Stat(credsTarget); os.IsNotExist(err) {
+		daemonHome := os.Getenv("HOME")
+		credsSrc := filepath.Join(daemonHome, ".claude", ".credentials.json")
+		if data, err2 := os.ReadFile(credsSrc); err2 == nil {
+			if err3 := os.WriteFile(credsTarget, data, 0600); err3 == nil {
+				slog.Info("claude_cli: bootstrapped subprocess credentials",
+					"src", credsSrc, "dst", credsTarget)
+			}
+		}
+	}
+
+	// Write an empty settings.json to suppress hook loading.
+	settingsPath := filepath.Join(claudeDir, "settings.json")
+	if _, err := os.Stat(settingsPath); os.IsNotExist(err) {
+		// Minimal valid settings: empty object — no hooks, no MCP servers.
+		if err2 := os.WriteFile(settingsPath, []byte("{}\n"), 0600); err2 != nil {
+			slog.Warn("claude_cli: failed to write subprocess settings.json, hooks may fire",
+				"path", settingsPath, "err", err2)
+		}
+	}
+
+	return home
+}()
 
 // claudeOutput is the JSON shape of one line in claude --output-format stream-json stdout,
 // and also of the single JSON object from --output-format json (used by codex_subagent).
@@ -129,7 +190,17 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 	// Prevent recursive hook firing when called from within a Claude session.
 	// buildCLIEnv filters the daemon environment to the allowlist — router tokens
 	// and API keys are not passed to the subprocess. (lr-c7ac)
-	env := buildCLIEnv([]string{"CLAGENTIC_DISABLE_RECALL=1"})
+	//
+	// CLAUDE_CONFIG_DIR is set to an empty directory so the subprocess does not
+	// load any hooks, MCP servers, or memory from the operator's ~/.claude config.
+	// Without this, SessionStart hooks (e.g. LORE) fire on every router invocation,
+	// polluting stdout with hook telemetry and occasionally triggering auth
+	// misclassification in parseStreamJSON.
+	extra := []string{"CLAGENTIC_DISABLE_RECALL=1"}
+	if claudeSubprocessHome != "" {
+		extra = append(extra, "HOME="+claudeSubprocessHome)
+	}
+	env := buildCLIEnv(extra)
 
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Stdin = strings.NewReader(prompt)

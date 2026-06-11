@@ -88,6 +88,9 @@ func (a *CodexSubagentAdapter) Invoke(ctx context.Context, req *Request) (*Respo
 	// buildCLIEnv filters the daemon environment to the allowlist — router tokens
 	// and API keys are not passed to the subprocess. (lr-c7ac)
 	extra := []string{"CLAGENTIC_DISABLE_RECALL=1"}
+	if claudeSubprocessHome != "" {
+		extra = append(extra, "HOME="+claudeSubprocessHome)
+	}
 	if a.tier != "" {
 		extra = append(extra, fmt.Sprintf("CLAGENTIC_CODEX_TIER=%s", a.tier))
 	}
