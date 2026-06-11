@@ -205,6 +205,9 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Stdin = strings.NewReader(prompt)
 	cmd.Env = env
+	// Set a neutral working directory so the subprocess does not inherit the
+	// daemon's cwd (which may be a project directory with CLAUDE.md hooks).
+	cmd.Dir = "/"
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
