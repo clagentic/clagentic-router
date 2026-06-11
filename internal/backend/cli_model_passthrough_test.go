@@ -110,6 +110,19 @@ func TestClaudeCLI_ModelPassthrough(t *testing.T) {
 
 			args := readArgs(t, dir, "claude")
 
+			// --verbose must always be present when using --output-format stream-json
+			// with --print (required since claude CLI 2.1.173). (lr-1994)
+			hasVerbose := false
+			for _, a := range args {
+				if a == "--verbose" {
+					hasVerbose = true
+					break
+				}
+			}
+			if !hasVerbose {
+				t.Error("--verbose flag missing; required since claude 2.1.173 for stream-json+print mode")
+			}
+
 			got := findFlag(args, "--model")
 			if tc.model == "" {
 				// --model flag should be absent when model is empty
