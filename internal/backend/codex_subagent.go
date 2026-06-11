@@ -99,6 +99,7 @@ func (a *CodexSubagentAdapter) Invoke(ctx context.Context, req *Request) (*Respo
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Stdin = strings.NewReader(fullPrompt.String())
 	cmd.Env = env
+	cmd.Dir = "/"
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
