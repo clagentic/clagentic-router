@@ -1,6 +1,6 @@
 // internal/backend/claude_cli.go — adapter for the claude CLI (OAuth auth).
 //
-// Invokes: claude --print --model <model> --output-format stream-json [--system-prompt <s>]
+// Invokes: claude --print --verbose --output-format stream-json --model <model> [--system-prompt <s>]
 // Input: user prompt via stdin.
 // Output: newline-delimited JSON stream. The final "result" line carries the
 // response text and cost. Intermediate lines include rate_limit_event lines
@@ -111,8 +111,12 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 		return nil, &InvokeError{Type: ErrTypeSchema, Raw: "empty prompt after message formatting"}
 	}
 
+	// --verbose is required when combining --print with --output-format stream-json;
+	// the claude CLI (>=2.1.173) rejects the combination without it. The flag does
+	// not change the stream-json output format — it only unlocks the mode. (lr-1994)
 	args := []string{
 		"--print",
+		"--verbose",
 		"--output-format", "stream-json",
 		"--max-turns", "1",
 	}
