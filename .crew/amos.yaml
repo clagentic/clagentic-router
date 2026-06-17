@@ -1,0 +1,132 @@
+# .crew/amos.yaml — AMoS per-project configuration template
+#
+# Generated from: examples/starter-amos.yaml (crew-manifest lr-e247)
+# Schema: schemas/crew-config.schema.json
+#
+# DROP THIS FILE AT: <project-root>/.crew/amos.yaml
+# Then customize the sections below for your project.
+#
+# What this file does:
+#   - Controls whether AMoS may merge its own PRs in this project
+#   - Declares which paths in the repo AMoS may write to
+#   - Sets branch-naming conventions for AMoS-opened PRs
+#   - Lists post-merge steps (e.g. install scripts, cache invalidation)
+#
+# What this file does NOT do:
+#   - Control who can dispatch AMoS (that is the relay/dispatcher layer)
+#   - Grant AMoS creds (those come from OpenBao per lr-53f7/lr-8e77)
+#   - Change global AMoS contract rules (AGENT.md governs those)
+#
+# GRACEFUL DEGRADATION (lr-e247): if this file is ABSENT, crew_push.py
+# uses safe defaults: merge_allowed=false, scope=conservative. The tool
+# does NOT fail. Onboarding UPGRADES a repo from safe-defaults to declared
+# policy — it is not a precondition for crew use.
+
+schema_version: 1
+
+# -----------------------------------------------------------------------
+# merge_allowed
+# -----------------------------------------------------------------------
+# DECISION: do you want AMoS to be able to auto-merge its own PRs?
+#
+#   merge_allowed: false  (RECOMMENDED for most projects)
+#     AMoS opens PRs; NAOMI (or a human) reviews and merges.
+#     This is the safe default for any project where you want a second
+#     pair of eyes before landing changes to main.
+#
+#   merge_allowed: true
+#     AMoS may merge immediately after PR creation if --merge is passed.
+#     Only appropriate for low-risk automated repos (e.g. pure doc updates,
+#     or a project with full CI coverage and no production traffic).
+#     NOTE: AMoS AGENT.md operating rule 5 ignores this field — merge is
+#     NAOMI's exclusive capability even when merge_allowed=true here.
+#     (lr-5b95)
+#
+merge_allowed: false
+
+# -----------------------------------------------------------------------
+# branch_conventions
+# -----------------------------------------------------------------------
+# Branch naming policy for PRs that AMoS opens in this project.
+# AMoS will pick a prefix from this list; the default is feat/ + task ID.
+#
+branch_conventions:
+  allowed_prefixes:
+    - feat/
+    - fix/
+    - chore/
+    - docs/
+    - refactor/
+  # include_task_id: true  # Uncomment to enforce lr-XXXX in every branch name
+
+# -----------------------------------------------------------------------
+# scope
+# -----------------------------------------------------------------------
+# File-level write boundaries for AMoS. Enforced by guard-scope.py.
+#
+# OPTION A — allow_all: true (RECOMMENDED for general-purpose builders)
+#   AMoS may write anywhere in the project tree.
+#   Use blocked_paths to protect specific dirs (deny always wins).
+#
+scope:
+  allow_all: true
+  blocked_paths:
+    # Protect sensitive dirs by adding entries here. Examples:
+    # - ".secrets/**"
+    # - "production/**"
+    # - "config/prod.yaml"
+    []
+
+# OPTION B — explicit allowlist (use for projects where only specific
+#   paths should be touched automatically)
+# scope:
+#   allowed_paths:
+#     - "src/**"
+#     - "tests/**"
+#     - "docs/**"
+
+# -----------------------------------------------------------------------
+# focus  (optional — prose hints for the agent)
+# -----------------------------------------------------------------------
+# Bullets AMoS should weight when planning work in this project.
+# Not enforced by dispatch; relies on the agent following the guidance.
+# Keep brief — long lists dilute signal.
+#
+# focus:
+#   - "Prefer editing existing files over new ones (reuse first)"
+#   - "All public APIs need docstrings"
+
+# -----------------------------------------------------------------------
+# avoid  (optional — prose soft-blocks)
+# -----------------------------------------------------------------------
+# Things AMoS should NOT do in this project. Soft guidance only.
+# Hard rules belong in scope.blocked_paths or permissions.bash.block.
+#
+# avoid:
+#   - "Do not touch the legacy auth module (legacy_auth/)"
+#   - "Avoid changing the DB schema without a migration"
+
+# -----------------------------------------------------------------------
+# post_merge_steps  (optional — post-merge automation)
+# -----------------------------------------------------------------------
+# Steps to run in the project root after a successful merge.
+# Only execute when --merge actually merged; skipped on push-only paths.
+#
+# post_merge_steps:
+#   - cmd: "make install"
+#     description: "Refresh local install after merge"
+#     on_failure: warn   # 'warn' (default): log and continue; 'fail': exit
+
+# -----------------------------------------------------------------------
+# permissions.bash  (optional — Bash command policy)
+# -----------------------------------------------------------------------
+# Bash safety policy. Default 'blocklist' mode: anything not matching
+# 'block' patterns runs. Use 'allowlist' mode to restrict to a specific
+# command set (harder to use, safer for high-risk repos).
+#
+# permissions:
+#   bash:
+#     mode: blocklist
+#     block:
+#       - "rm -rf /"
+#       - "git push --force"
