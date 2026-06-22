@@ -188,6 +188,17 @@ routing:
   active_probe_enabled: false
   active_probe_timeout_seconds: 30
 
+  # offline_recovery_probe_interval_seconds: 300
+  # Self-heal OFFLINE backends (including auth failures, soft-failure cascades,
+  # and any offline cause without a known reset time) by issuing a bounded probe
+  # after this many seconds of inactivity. On success the backend enters RECOVERING
+  # and is re-evaluated for traffic without waiting on organic requests.
+  # Quota/rate-limit offlines with a known future reset time are NOT probed here;
+  # TryRecover() already owns those and probing them early would violate the
+  # provider's back-off window.
+  # Default: 300 (5 minutes). Set to 0 to disable (strict manual-intervention
+  # semantics — operator must use /backends/{id}/reset to re-enable).
+
 # --- Proxy ---
 proxy:
   host: 127.0.0.1        # 0.0.0.0 for network access from other hosts

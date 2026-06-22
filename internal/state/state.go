@@ -106,6 +106,11 @@ type BackendState struct {
 	// to SQLite (repopulated on the next live request after restart).
 	LastQuotaSnapshot *QuotaSnapshot
 
+	// LastRecoveryProbeAt is the last time an offline-recovery probe was attempted
+	// for this backend. Zero if no probe has been attempted. Ephemeral — not
+	// persisted to SQLite; a missed probe window at restart is harmless.
+	LastRecoveryProbeAt time.Time
+
 	UpdatedAt time.Time
 }
 
@@ -162,6 +167,10 @@ type Snapshot struct {
 	// not persisted to SQLite; repopulated on the next live request after restart.
 	LastQuotaSnapshot *QuotaSnapshot
 
+	// LastRecoveryProbeAt is the last time an offline-recovery probe was attempted.
+	// Ephemeral — not persisted to SQLite.
+	LastRecoveryProbeAt time.Time
+
 	UpdatedAt time.Time
 }
 
@@ -212,6 +221,7 @@ func (s *BackendState) Snapshot() Snapshot {
 		TotalCostUSDEst:      s.TotalCostUSDEst,
 		SessionCostUSDEst:    s.SessionCostUSDEst,
 		LastQuotaSnapshot:    s.LastQuotaSnapshot,
+		LastRecoveryProbeAt:  s.LastRecoveryProbeAt,
 		UpdatedAt:            s.UpdatedAt,
 	}
 }
@@ -351,6 +361,52 @@ func (s *BackendState) TryRecover() bool {
 	}
 
 	return false
+}
+
+// HasPendingReset returns true when the backend is OFFLINE due to quota or
+// rate-limit exhaustion AND the known reset time has not yet passed.
+// When this returns true the offline-recovery probe should be skipped:
+// TryRecover() already owns these backends and will transition them once the
+// reset time elapses.
+func (s *BackendState) HasPendingReset() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.Status != StatusOffline {
+		return false
+	}
+	now := time.Now().UTC()
+	// Quota offline with a future reset time — TryRecover will handle it.
+	if s.QuotaExhausted && !s.QuotaResetAt.IsZero() && s.QuotaResetAt.After(now) {
+		return true
+	}
+	// Rate-limit offline with a future reset time — TryRecover will handle it.
+	if !s.RateLimitResetAt.IsZero() && s.RateLimitResetAt.After(now) {
+		return true
+	}
+	return false
+}
+
+// MarkRecoveryProbed records the current time as the last offline-recovery probe
+// attempt timestamp. Called by offlineRecoveryProbe after each probe (success or
+// failure) so the interval gate prevents hammering.
+func (s *BackendState) MarkRecoveryProbed() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.LastRecoveryProbeAt = time.Now().UTC()
+}
+
+// RecoveryProbeDue returns true if enough time has passed since the last recovery
+// probe (or no probe has ever been attempted). intervalSeconds == 0 always returns false.
+func (s *BackendState) RecoveryProbeDue(intervalSeconds int) bool {
+	if intervalSeconds <= 0 {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.LastRecoveryProbeAt.IsZero() {
+		return true
+	}
+	return time.Since(s.LastRecoveryProbeAt) >= time.Duration(intervalSeconds)*time.Second
 }
 
 // ForceOffline manually sets the backend offline. Used by /backends/{id}/disable.
