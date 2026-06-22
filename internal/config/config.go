@@ -237,6 +237,31 @@ type RoutingConfig struct {
 	// soft penalty is applied to backends with live rate-limit header data.
 	// 0 (or unset) disables the penalty. Suggested starting value: 1000.
 	RateLimitTokensWarningThreshold int64 `yaml:"rate_limit_tokens_warning_threshold"`
+
+	// OfflineRecoveryProbeIntervalSeconds is how long to wait between bounded
+	// recovery probes on OFFLINE backends that have no pending quota/rate-limit
+	// reset time. Covers all offline causes including auth failures and soft
+	// failure cascades — not just quota/rate-limit (which TryRecover already
+	// handles via reset times).
+	//
+	// Default when absent: 300 seconds (5 minutes). Set to 0 to disable
+	// (preserves strict manual-intervention semantics for operators who prefer it).
+	//
+	// Implemented as a pointer so that nil (field absent from YAML) can be
+	// distinguished from an explicit 0 (operator opt-out). All other RoutingConfig
+	// int fields use the <=0→default sentinel, which conflates "absent" and "0".
+	// This field cannot use that pattern because 0 is a meaningful explicit value.
+	OfflineRecoveryProbeIntervalSeconds *int `yaml:"offline_recovery_probe_interval_seconds"`
+}
+
+// OfflineRecoveryProbeInterval returns the configured offline recovery probe
+// interval in seconds. 0 means disabled. The field is a pointer; this method
+// returns the dereferenced value (safe after validate() has set the default).
+func (r *RoutingConfig) OfflineRecoveryProbeInterval() int {
+	if r.OfflineRecoveryProbeIntervalSeconds == nil {
+		return 300 // matches validate() default; guards callers before validate runs
+	}
+	return *r.OfflineRecoveryProbeIntervalSeconds
 }
 
 // AlertsConfig configures alerting behavior.
@@ -427,6 +452,14 @@ func (c *Config) validate() error {
 	}
 	if c.Routing.ActiveProbeTimeoutSeconds <= 0 {
 		c.Routing.ActiveProbeTimeoutSeconds = 30
+	}
+	// OfflineRecoveryProbeIntervalSeconds is a pointer field: nil = absent from
+	// YAML (apply default 300); non-nil = operator-set (honour as-is, including 0
+	// which means disabled). The pointer is required because 0 is a meaningful
+	// explicit value (disable), not a "not configured" sentinel.
+	if c.Routing.OfflineRecoveryProbeIntervalSeconds == nil {
+		v := 300
+		c.Routing.OfflineRecoveryProbeIntervalSeconds = &v
 	}
 	return nil
 }

@@ -869,6 +869,9 @@ func (r *Router) backgroundLoop() {
 			if r.cfg.Routing.ActiveProbeEnabled {
 				r.activeProbe()
 			}
+			if r.cfg.Routing.OfflineRecoveryProbeInterval() > 0 {
+				r.offlineRecoveryProbe()
+			}
 
 		case <-flushTicker.C:
 			r.flushRateWindows()
@@ -942,6 +945,98 @@ func (r *Router) activeProbe() {
 			}
 		} else {
 			slog.Warn("router: active probe failed", "backend", id, "err", err)
+		}
+	}
+}
+
+// offlineRecoveryProbe runs bounded recovery probes against OFFLINE backends
+// that have been stuck offline without a known quota/rate-limit reset time.
+//
+// Motivation: TryRecover() (called by passiveProbe) only transitions OFFLINE
+// backends that carry a future QuotaResetAt or RateLimitResetAt. Backends that
+// tripped OFFLINE due to auth failures, not-found errors, or soft-failure
+// cascades carry no such reset time and would stay offline indefinitely without
+// organic traffic to test them. This probe fills that gap.
+//
+// Gating rule: skip any backend whose quota or rate-limit reset time is still
+// in the future — those are already owned by TryRecover and must not be forced
+// back into rotation prematurely (QuotaResetAt/RateLimitResetAt are contract
+// times, not suggestions).
+//
+// Rate: at most one probe per backend per OfflineRecoveryProbeIntervalSeconds.
+// On success: transition to RECOVERING via a synthesized zero-token success
+// (mirrors activeProbe) and persist via store. On failure: log a warning and
+// record the attempt timestamp so the interval gate prevents hammering.
+func (r *Router) offlineRecoveryProbe() {
+	intervalSeconds := r.cfg.Routing.OfflineRecoveryProbeInterval()
+	if intervalSeconds <= 0 {
+		return
+	}
+
+	r.mu.RLock()
+	ids := make([]string, 0, len(r.states))
+	for id := range r.states {
+		ids = append(ids, id)
+	}
+	r.mu.RUnlock()
+
+	for _, id := range ids {
+		bs := r.getState(id)
+		if bs == nil {
+			continue
+		}
+
+		snap := bs.Snapshot()
+		if snap.Status != state.StatusOffline {
+			continue
+		}
+
+		// Skip backends where TryRecover already owns recovery via a pending
+		// quota or rate-limit reset time. Probing them early would bypass the
+		// provider's back-off window.
+		if bs.HasPendingReset() {
+			continue
+		}
+
+		// Gate: only probe once per interval.
+		if !bs.RecoveryProbeDue(intervalSeconds) {
+			continue
+		}
+
+		slog.Info("router: offline recovery probe starting", "backend", id,
+			"last_error_type", snap.LastErrorType,
+			"offline_since", snap.LastFailureAt,
+		)
+
+		probeTimeout := time.Duration(r.cfg.Routing.ActiveProbeTimeoutSeconds) * time.Second
+		ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+		latencyMS, err := r.ProbeBackend(ctx, id)
+		cancel()
+
+		// Always record the probe timestamp to gate the next attempt, regardless
+		// of outcome. This prevents a broken backend from being hammered every tick.
+		bs.MarkRecoveryProbed()
+
+		if err == nil {
+			slog.Info("router: offline recovery probe succeeded", "backend", id,
+				"latency_ms", latencyMS,
+			)
+			// Synthesize a zero-token success to advance OFFLINE → RECOVERING.
+			// (A second success from RECOVERING → HEALTHY via RecordSuccess.)
+			bs.RecordSuccess(0, 0, 0, latencyMS,
+				r.cfg.Routing.DegradedFailureThreshold,
+				r.cfg.Routing.OfflineFailureThreshold,
+			)
+			if r.store != nil {
+				r.store.SaveState(bs.Snapshot())
+			}
+		} else {
+			slog.Warn("router: offline recovery probe failed", "backend", id, "err", err)
+			// LastRecoveryProbeAt is in-memory/ephemeral — it is not part of the
+			// SQLite schema and SaveState does not write it. The gate therefore
+			// resets to zero on daemon restart (a missed probe window at restart
+			// is harmless). No store write is needed here: the state/status has
+			// not changed and nothing durable has been updated.
 		}
 	}
 }
