@@ -26,6 +26,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -47,8 +48,8 @@ import (
 //  2. {state_dir}/claude-home — created at package init if absent
 //
 // The credentials must be present at {home}/.claude/.credentials.json.
-// At init time, if the target home lacks credentials but the daemon's own HOME has
-// them, they are copied automatically (convenience bootstrap — not repeated after that).
+// At init time the subprocess home directory and a stub settings.json are created.
+// Credential freshness is maintained by syncSubprocessCreds, called on each Invoke.
 var claudeSubprocessHome = func() string {
 	// Operator override takes precedence.
 	if v := os.Getenv("CLAGENTIC_ROUTER_SUBPROCESS_HOME"); v != "" {
@@ -69,19 +70,6 @@ var claudeSubprocessHome = func() string {
 		return ""
 	}
 
-	// Bootstrap credentials from the daemon's own HOME if not already present.
-	credsTarget := filepath.Join(claudeDir, ".credentials.json")
-	if _, err := os.Stat(credsTarget); os.IsNotExist(err) {
-		daemonHome := os.Getenv("HOME")
-		credsSrc := filepath.Join(daemonHome, ".claude", ".credentials.json")
-		if data, err2 := os.ReadFile(credsSrc); err2 == nil {
-			if err3 := os.WriteFile(credsTarget, data, 0600); err3 == nil {
-				slog.Info("claude_cli: bootstrapped subprocess credentials",
-					"src", credsSrc, "dst", credsTarget)
-			}
-		}
-	}
-
 	// Write an empty settings.json to suppress hook loading.
 	settingsPath := filepath.Join(claudeDir, "settings.json")
 	if _, err := os.Stat(settingsPath); os.IsNotExist(err) {
@@ -94,6 +82,102 @@ var claudeSubprocessHome = func() string {
 
 	return home
 }()
+
+// credsSyncMu guards concurrent credential resync calls from concurrent Invoke calls.
+var credsSyncMu sync.Mutex
+
+// credsSyncLastInfo caches the os.FileInfo of the source credentials file from the
+// most recent successful sync so we can skip the copy when nothing has changed.
+// Guarded by credsSyncMu.
+var credsSyncLastInfo os.FileInfo
+
+// syncSubprocessCreds ensures that the subprocess copy of .credentials.json is
+// current with respect to the daemon's own HOME credentials.  It is called on
+// every Invoke so that OAuth token rotations (which happen on the host, not in
+// the subprocess home) propagate before the next request is dispatched.
+//
+// Algorithm:
+//  1. Stat the source (daemon HOME).  If absent, log and return — do not clobber
+//     a working copy with nothing.
+//  2. Compare source mtime+size against the cached last-sync info.  If unchanged,
+//     return immediately (hot path: a single Stat call per Invoke).
+//  3. Compare SHA-256 of source vs copy.  This guards against clock skew and
+//     filesystem timestamp granularity edge cases.
+//  4. If different, write to a temp file then rename atomically so concurrent
+//     reads of the destination never see a partial write.
+//
+// The function is safe for concurrent callers: credsSyncMu serialises the
+// stat+copy path.  The hot-path stat (step 2) is also inside the lock because
+// credsSyncLastInfo is shared state.
+func syncSubprocessCreds(subprocessHome string) {
+	if subprocessHome == "" {
+		return
+	}
+
+	daemonHome := os.Getenv("HOME")
+	src := filepath.Join(daemonHome, ".claude", ".credentials.json")
+	dst := filepath.Join(subprocessHome, ".claude", ".credentials.json")
+
+	credsSyncMu.Lock()
+	defer credsSyncMu.Unlock()
+
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Source credentials absent — do not clobber an existing subprocess copy.
+			slog.Warn("claude_cli: source credentials not found; subprocess copy unchanged",
+				"src", src)
+		} else {
+			slog.Warn("claude_cli: could not stat source credentials; subprocess copy unchanged",
+				"src", src, "err", err)
+		}
+		return
+	}
+
+	// Fast path: source stat unchanged since last sync.
+	if credsSyncLastInfo != nil &&
+		srcInfo.ModTime().Equal(credsSyncLastInfo.ModTime()) &&
+		srcInfo.Size() == credsSyncLastInfo.Size() {
+		return
+	}
+
+	// Slow path: read both files and compare content to handle clock skew.
+	srcData, err := os.ReadFile(src)
+	if err != nil {
+		slog.Warn("claude_cli: could not read source credentials; subprocess copy unchanged",
+			"src", src, "err", err)
+		return
+	}
+
+	dstData, _ := os.ReadFile(dst) // missing dst is fine — we will create it
+
+	srcHash := sha256.Sum256(srcData)
+	dstHash := sha256.Sum256(dstData)
+
+	if srcHash == dstHash {
+		// Content identical; update cached info so future calls take the fast path.
+		credsSyncLastInfo = srcInfo
+		return
+	}
+
+	// Content differs — write atomically via temp file + rename.
+	tmp := dst + ".tmp"
+	if err := os.WriteFile(tmp, srcData, 0600); err != nil {
+		slog.Warn("claude_cli: could not write temp credentials; subprocess copy unchanged",
+			"tmp", tmp, "err", err)
+		return
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		slog.Warn("claude_cli: could not rename credentials into place; subprocess copy may be stale",
+			"tmp", tmp, "dst", dst, "err", err)
+		_ = os.Remove(tmp)
+		return
+	}
+
+	credsSyncLastInfo = srcInfo
+	slog.Info("claude_cli: refreshed subprocess credentials",
+		"src", src, "dst", dst, "size", srcInfo.Size())
+}
 
 // claudeOutput is the JSON shape of one line in claude --output-format stream-json stdout,
 // and also of the single JSON object from --output-format json (used by codex_subagent).
@@ -162,6 +246,12 @@ func (a *ClaudeCLIAdapter) refreshBin() string {
 
 // Invoke calls the claude CLI with the given request.
 func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response, error) {
+	// Refresh subprocess credentials before each invocation.  The host OAuth token
+	// rotates over time; if the subprocess copy is stale the CLI returns an auth
+	// error and the backend is marked offline.  syncSubprocessCreds is a no-op when
+	// the source is unchanged (mtime+size fast path).
+	syncSubprocessCreds(claudeSubprocessHome)
+
 	bin := a.resolveBin()
 	if bin == "" {
 		return nil, &InvokeError{Type: ErrTypeNotFound, Raw: "claude binary not found on PATH"}
