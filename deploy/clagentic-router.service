@@ -1,0 +1,66 @@
+# deploy/clagentic-router.service — sample systemd unit for clagentic-router.
+#
+# Copy to /etc/systemd/system/ and adjust the values marked [CONFIGURE] for
+# your installation.  Then:
+#
+#   systemctl daemon-reload
+#   systemctl enable --now clagentic-router
+#
+# REQUIRED: HOME must be set to the home directory of the user the service
+# runs as.  The claude_cli adapter resolves the OAuth credential file at
+# $HOME/.claude/.credentials.json.  When HOME is unset (systemd does not
+# set it by default for service units), credential sync fails with an ERROR
+# log and all claude_cli backends are permanently unauthenticated.
+#
+# Set HOME to match the User= value below.  Examples:
+#   User=router  ->  Environment=HOME=/home/router
+#   User=root    ->  Environment=HOME=/root
+#   User=ubuntu  ->  Environment=HOME=/home/ubuntu
+#
+# If you prefer not to set HOME here, run "loginctl enable-linger <user>"
+# for the service user and set CLAGENTIC_ROUTER_SUBPROCESS_HOME explicitly
+# to a directory that contains a .claude/.credentials.json file.
+
+[Unit]
+Description=Clagentic: Router LLM routing daemon
+Documentation=https://github.com/clagentic/clagentic-router
+After=network.target
+# Optionally: After=network-online.target (if backends need internet at start)
+
+[Service]
+Type=simple
+# [CONFIGURE] Replace with the user that owns the Claude OAuth session.
+User=router
+
+# [CONFIGURE] Set HOME to the home directory of the user above.
+# This is required for the claude_cli adapter to locate OAuth credentials.
+# See the note at the top of this file for examples.
+Environment=HOME=/home/router
+
+# [CONFIGURE] Path to the installed binary.
+ExecStart=/usr/local/bin/clagentic-router serve
+
+# [CONFIGURE] Path to the config file.  Create it from router.example.yaml.
+ExecStart=/usr/local/bin/clagentic-router serve --config /etc/clagentic/router/router.yaml
+
+# Load secrets (CLAGENTIC_ROUTER_TOKEN, API keys, etc.) from a separate
+# environment file that is not committed to source control.
+# [CONFIGURE] Create this file with mode 0600 owned by root or the service user.
+EnvironmentFile=/etc/clagentic/router/env
+
+Restart=on-failure
+RestartSec=5s
+
+# State directory — persists OAuth credential caches and SQLite state.
+# Corresponds to the default value of CLAGENTIC_ROUTER_STATE_DIR.
+StateDirectory=clagentic-router
+# [CONFIGURE] Uncomment and set CLAGENTIC_ROUTER_STATE_DIR if you move the state dir.
+# Environment=CLAGENTIC_ROUTER_STATE_DIR=/var/lib/clagentic-router
+
+# Basic hardening — tighten further once your deployment is stable.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/clagentic-router
+
+[Install]
+WantedBy=multi-user.target
