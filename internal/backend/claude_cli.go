@@ -32,6 +32,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -83,6 +84,37 @@ var claudeSubprocessHome = func() string {
 	return home
 }()
 
+// resolveDaemonHomeFunc is the resolver used by syncSubprocessCreds to locate the daemon's
+// home directory. It is a package-level variable so tests can inject a replacement
+// without requiring OS-level env manipulation (e.g. to simulate a missing /etc/passwd).
+// Production code always uses the real resolveDaemonHome implementation.
+var resolveDaemonHomeFunc = resolveDaemonHome
+
+// resolveDaemonHome returns the daemon's home directory for locating source credentials.
+//
+// Resolution order:
+//  1. HOME environment variable (standard POSIX; set by most service managers)
+//  2. os/user.Current().HomeDir (NSS / passwd lookup; works when HOME is unset)
+//
+// Returns an error if neither source yields a non-empty absolute path, so callers can
+// emit a clear diagnostic rather than proceeding with a relative path that silently
+// resolves against the daemon's cwd (typically "/" in a systemd unit).
+func resolveDaemonHome() (string, error) {
+	if h := os.Getenv("HOME"); h != "" {
+		return h, nil
+	}
+	u, err := user.Current()
+	if err != nil {
+		return "", fmt.Errorf("HOME env var is unset and os/user lookup failed: %w; "+
+			"set HOME in the service environment (e.g. Environment=HOME=/home/router in the systemd unit)", err)
+	}
+	if u.HomeDir == "" {
+		return "", fmt.Errorf("HOME env var is unset and os/user returned an empty HomeDir; "+
+			"set HOME in the service environment (e.g. Environment=HOME=/home/router in the systemd unit)")
+	}
+	return u.HomeDir, nil
+}
+
 // credsSyncMu guards concurrent credential resync calls from concurrent Invoke calls.
 var credsSyncMu sync.Mutex
 
@@ -114,22 +146,48 @@ func syncSubprocessCreds(subprocessHome string) {
 		return
 	}
 
-	daemonHome := os.Getenv("HOME")
-	src := filepath.Join(daemonHome, ".claude", ".credentials.json")
-	dst := filepath.Join(subprocessHome, ".claude", ".credentials.json")
-
+	// Acquire the lock before calling resolveDaemonHomeFunc so that test
+	// goroutines swapping the func variable cannot race with a concurrent
+	// Invoke that is mid-resolution.  The resolver only reads env vars and
+	// calls a syscall; holding the mutex across it is fine.
 	credsSyncMu.Lock()
 	defer credsSyncMu.Unlock()
 
-	srcInfo, err := os.Stat(src)
+	daemonHome, err := resolveDaemonHomeFunc()
 	if err != nil {
-		if os.IsNotExist(err) {
+		// Hard misconfiguration: HOME is unresolvable. Log at ERROR so this is
+		// impossible to miss in the service journal, and return without touching
+		// the subprocess copy. All claude_cli backends will fail to authenticate
+		// until the operator sets HOME in the service environment.
+		slog.Error("claude_cli: cannot resolve daemon home directory; credential sync disabled — "+
+			"set HOME in the service environment (e.g. Environment=HOME=/home/router in the systemd unit)",
+			"err", err)
+		return
+	}
+
+	// Guard against a non-absolute home (e.g. empty string from a buggy lookup).
+	// filepath.Join("", ...) collapses to a relative path that resolves against
+	// the daemon's cwd ("/") — never what we want.
+	if !filepath.IsAbs(daemonHome) {
+		slog.Error("claude_cli: resolved home directory is not an absolute path; credential sync disabled",
+			"home", daemonHome)
+		return
+	}
+
+	src := filepath.Join(daemonHome, ".claude", ".credentials.json")
+	dst := filepath.Join(subprocessHome, ".claude", ".credentials.json")
+
+	srcInfo, statErr := os.Stat(src)
+	if statErr != nil {
+		if os.IsNotExist(statErr) {
 			// Source credentials absent — do not clobber an existing subprocess copy.
+			// This is the legitimate case where HOME resolves but the file doesn't exist
+			// (e.g. the operator has not run "claude auth login" yet).
 			slog.Warn("claude_cli: source credentials not found; subprocess copy unchanged",
 				"src", src)
 		} else {
 			slog.Warn("claude_cli: could not stat source credentials; subprocess copy unchanged",
-				"src", src, "err", err)
+				"src", src, "err", statErr)
 		}
 		return
 	}

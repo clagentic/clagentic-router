@@ -240,20 +240,34 @@ routed requests. On a `rejected` status (quota exhausted), the prober backs off 
 
 ### Systemd
 
+A fully annotated sample unit is in [`deploy/clagentic-router.service`](deploy/clagentic-router.service).
+
+**HOME is required.** The `claude_cli` adapter resolves OAuth credentials from
+`$HOME/.claude/.credentials.json`. Systemd does not set `HOME` for service units by
+default. If it is unset, credential sync fails with an ERROR log and all `claude_cli`
+backends are permanently unauthenticated. Set `HOME` to the home directory of the user
+the service runs as:
+
 ```ini
 [Unit]
 Description=Clagentic: Router LLM routing daemon
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/clagentic-router serve
-Restart=always
-EnvironmentFile=/etc/clagentic/router/env
 User=router
+# HOME must match the User above so the claude_cli adapter can locate OAuth credentials.
+# Adjust to /root, /home/ubuntu, etc. depending on which user owns the Claude session.
+Environment=HOME=/home/router
+ExecStart=/usr/local/bin/clagentic-router serve --config /etc/clagentic/router/router.yaml
+Restart=on-failure
+EnvironmentFile=/etc/clagentic/router/env
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+If you use only API-based adapters (`anthropic_api`, `openai_api`) and do not configure
+any `claude_cli` backends, this requirement does not apply.
 
 ### Docker (API-only mode)
 
