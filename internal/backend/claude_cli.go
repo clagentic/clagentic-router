@@ -146,6 +146,13 @@ func syncSubprocessCreds(subprocessHome string) {
 		return
 	}
 
+	// Acquire the lock before calling resolveDaemonHomeFunc so that test
+	// goroutines swapping the func variable cannot race with a concurrent
+	// Invoke that is mid-resolution.  The resolver only reads env vars and
+	// calls a syscall; holding the mutex across it is fine.
+	credsSyncMu.Lock()
+	defer credsSyncMu.Unlock()
+
 	daemonHome, err := resolveDaemonHomeFunc()
 	if err != nil {
 		// Hard misconfiguration: HOME is unresolvable. Log at ERROR so this is
@@ -169,9 +176,6 @@ func syncSubprocessCreds(subprocessHome string) {
 
 	src := filepath.Join(daemonHome, ".claude", ".credentials.json")
 	dst := filepath.Join(subprocessHome, ".claude", ".credentials.json")
-
-	credsSyncMu.Lock()
-	defer credsSyncMu.Unlock()
 
 	srcInfo, statErr := os.Stat(src)
 	if statErr != nil {

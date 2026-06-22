@@ -37,10 +37,8 @@ User=router
 # See the note at the top of this file for examples.
 Environment=HOME=/home/router
 
-# [CONFIGURE] Path to the installed binary.
-ExecStart=/usr/local/bin/clagentic-router serve
-
-# [CONFIGURE] Path to the config file.  Create it from router.example.yaml.
+# [CONFIGURE] Path to the installed binary and config file.
+# Create the config from router.example.yaml.
 ExecStart=/usr/local/bin/clagentic-router serve --config /etc/clagentic/router/router.yaml
 
 # Load secrets (CLAGENTIC_ROUTER_TOKEN, API keys, etc.) from a separate
