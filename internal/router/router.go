@@ -1032,10 +1032,11 @@ func (r *Router) offlineRecoveryProbe() {
 			}
 		} else {
 			slog.Warn("router: offline recovery probe failed", "backend", id, "err", err)
-			// Persist the updated LastRecoveryProbeAt so the gate survives flush.
-			if r.store != nil {
-				r.store.SaveState(bs.Snapshot())
-			}
+			// LastRecoveryProbeAt is in-memory/ephemeral — it is not part of the
+			// SQLite schema and SaveState does not write it. The gate therefore
+			// resets to zero on daemon restart (a missed probe window at restart
+			// is harmless). No store write is needed here: the state/status has
+			// not changed and nothing durable has been updated.
 		}
 	}
 }
