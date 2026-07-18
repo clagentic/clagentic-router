@@ -1,0 +1,65 @@
+# .clagentic/loadout/config.yaml — clagentic-router repo-local loadout config
+#
+# Initialized via /loadout-init (lr-f181b6, fleet migration lr-a645aa
+# instance). Values below are elicited for THIS repo, not copied from
+# another deployment's config (loadout-init rule 1).
+#
+# One sectioned file, one top-level key per verb/feature.
+
+# ---------------------------------------------------------------------------
+# roles: -- which loadout verbs each ROLE may invoke. Role names are
+# vocabulary only (builder/reviewer/security/merger/lead), never an agent
+# identity.
+# ---------------------------------------------------------------------------
+roles:
+  builder:
+    - push
+  reviewer:
+    - git-host-api
+    - review-post
+    - stage-body
+  merger:
+    - merge
+    - push
+    - release-dispatch
+    - release-detect
+  lead:
+    - git-host-api
+
+# ---------------------------------------------------------------------------
+# merge: -- merge-gate declarations. Every key here is repo-tier policy.
+# ---------------------------------------------------------------------------
+merge:
+  merge_requirements:
+    # ci_pass: false -- the repo's only CI definition is
+    # .forgejo/workflows/ci.yml, which is Forgejo-native (uses:
+    # https://code.forgejo.org/actions/checkout@v3, runs-on: the
+    # clagentic-router repo-scoped Forgejo runner). This repo's origin is
+    # GitHub (clagentic/clagentic-router; migrated Forgejo->GitHub
+    # 2026-06-04) with no .github/workflows/ present -- GitHub Actions does
+    # not read .forgejo/ and cannot run this workflow. No CI actually runs
+    # on PRs on the live platform, so ci_pass:true would be a standing false
+    # merge-blocker. Operator-confirmed 2026-07-18 (lr-f181b6): set to
+    # false to match the live-platform reality, not the aspirational one.
+    # Revisit if/when a .github/workflows/ci.yml equivalent is added.
+    ci_pass: false
+    # tests_pass: true -- NAOMI requires a clean `go test ./...` run
+    # regardless of hosted CI; this repo has real, fast unit tests.
+    tests_pass: true
+
+  # required_reviewer_roles: PEACHES reviews every PR in this repo's crew
+  # session today.
+  required_reviewer_roles:
+    - reviewer
+
+  # authorized_roles: NAOMI is the sole merge authority; loadout-merge is
+  # the only entrypoint.
+  authorized_roles:
+    - merger
+
+  # pre_checks: none -- no additional pre-merge validation commands beyond
+  # the reviewer-role and tests_pass gates above.
+
+  # post_merge_steps: none -- .crew/naomi.yaml declares no post_merge_steps
+  # for this repo; ship.py's pull_main/delete_branch are harness actions,
+  # not loadout post_merge_steps, and are not reproduced here.
