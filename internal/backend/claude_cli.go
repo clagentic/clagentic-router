@@ -13,7 +13,8 @@
 // Model alias behavior: the model string from BackendConfig is passed directly
 // to the --model flag without transformation. The claude CLI resolves family
 // aliases at invocation time — "claude-sonnet" resolves to the current default
-// Sonnet version, "claude-haiku" to the current Haiku, etc. This means:
+// Sonnet version, "claude-haiku" to the current Haiku, "fable" to the current
+// Fable (the top tier, above opus), etc. This means:
 //   - Pinned version (claude-sonnet-4-6): always uses that exact release.
 //   - Family alias (claude-sonnet): tracks the CLI's current default, which
 //     updates with CLI upgrades. No restart or config change needed.

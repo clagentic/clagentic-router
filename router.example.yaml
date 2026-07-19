@@ -6,6 +6,8 @@
 # Model versioning:
 #   Pin to a specific version:  model: claude-sonnet-4-6
 #   Use latest in a family:     model: claude-sonnet  (resolves to current default)
+#   Same pattern applies to opus, haiku, and fable (top-tier) families, e.g.
+#   model: claude-fable-5 (pinned) or model: fable (latest alias).
 #   Codex follows the same pattern via the codex CLI --model flag.
 #   Update model strings here when you want to roll forward to a newer version.
 
@@ -44,6 +46,14 @@ backends:
     model: claude-sonnet-4-6    # pin: claude-sonnet-4-6 | latest alias: claude-sonnet
     cost_weight: 0.8
     timeout_seconds: 240
+
+  # claude-fable: highest tier, above opus. Priciest — lowest cost_weight so
+  # the scorer only reaches it when a chain explicitly includes it.
+  claude-fable:
+    adapter: claude_cli
+    model: claude-fable-5       # pin: claude-fable-5 | latest alias: fable
+    cost_weight: 0.2
+    timeout_seconds: 300
 
   claude-high:
     adapter: claude_cli
