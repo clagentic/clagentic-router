@@ -1,0 +1,61 @@
+# CI workflow for clagentic-router.
+#
+# Runs on every push to main and feature/fix/chore/docs/refactor/security
+# branches, and on PRs targeting main.
+# Jobs: build+test, govulncheck.
+#
+# Runner: ubuntu-latest (GitHub-hosted). Ported from .forgejo/workflows/ci.yml
+# (lr-bfbcf2) — same jobs, GitHub-native checkout/setup-go actions.
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+      - "fix/**"
+      - "chore/**"
+      - "docs/**"
+      - "refactor/**"
+      - "security/**"
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-test:
+    name: Build + test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+
+      - name: Build + test
+        run: |
+          set -eux
+          go version
+          go mod download
+          go build -o /tmp/clagentic-router ./cmd/clagentic-router/
+          go test ./... -timeout 120s -v
+
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+
+      - name: govulncheck
+        run: |
+          set -eux
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...

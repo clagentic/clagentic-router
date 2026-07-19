@@ -43,7 +43,11 @@ merge_allowed: true
 #
 merge_requirements:
   tests_pass: true
-  ci_pass: true
+  # ci_pass: false -- matches .clagentic/loadout/config.yaml
+  # merge.merge_requirements.ci_pass (lr-f181b6). No CI runs on GitHub yet;
+  # .github/workflows/ci.yml (lr-bfbcf2) adds it, but the flip to true is a
+  # follow-on migration gated on confirming CI is actually green on PRs.
+  ci_pass: false
   # max_files_changed: 50   # Escalate if a PR touches more than N files
 
 # -----------------------------------------------------------------------
