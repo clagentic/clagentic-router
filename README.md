@@ -106,6 +106,7 @@ graph LR
 | Method | Path | Description |
 |---|---|---|
 | POST | /v1/chat/completions | OpenAI-compatible inference |
+| POST | /v1/messages | Anthropic Messages API — passthrough or `role:*` routed (see below) |
 | GET | /v1/models | List all backends with status |
 | GET | /v1/capacity | Per-backend capacity snapshot (utilization, reset time, score) |
 | GET | /health | Aggregated health (cached) |
@@ -122,7 +123,53 @@ graph LR
 | GET | /webhooks | List webhooks |
 | GET | /version | Version (no auth required) |
 
-All endpoints except `/version` require `Authorization: Bearer <token>`.
+All endpoints except `/version` require `Authorization: Bearer <token>` — with one
+exception: `/v1/messages` in passthrough mode, see below.
+
+## Anthropic Messages API
+
+`POST /v1/messages` lets `ANTHROPIC_BASE_URL`-configurable clients — Claude Code
+among them — point at the router directly. Because `ANTHROPIC_BASE_URL` is
+process-global in Claude Code (the whole session routes through it, orchestrator
+included), the endpoint has two modes, selected by the request's `model` field:
+
+| Model field | Mode | Behavior |
+|---|---|---|
+| Any normal Claude model (`claude-sonnet-4-6`, etc.) | **Passthrough** (default) | Transparent reverse proxy to `anthropic.upstream_url` (default `https://api.anthropic.com`). Request body and streamed SSE are forwarded byte-for-byte — tools, prompt caching, and multimodal content pass through untouched. |
+| `role:<chain>` / `chain:a,b,c` / `backend:<id>` | **Routed** | Translated to the router's internal request format, sent through the same fallback-chain machinery as `/v1/chat/completions`, translated back to Anthropic Messages format (including Anthropic-grammar SSE when `stream: true`). |
+
+### Auth matrix (deliberately asymmetric)
+
+- **Passthrough mode**: the router does **not** check its own inference token.
+  The client's own Anthropic credential (`x-api-key` or `Authorization: Bearer`)
+  travels through to the upstream Anthropic API unchanged — Anthropic
+  authenticates the call, not the router. This is what keeps an interactive
+  Claude Code session fully functional when pointed at the router: the client
+  only ever needs to know its own Anthropic key, not a separate router token.
+  Set `anthropic.upstream_api_key` to instead substitute a router-owned key for
+  every passthrough request, overriding whatever the client sent.
+- **Routed mode**: requires the router's own inference token, presented as
+  `x-api-key: <token>` OR `Authorization: Bearer <token>` — this is a real
+  router-owned invocation (chain selection, metering) and is gated exactly
+  like `/v1/chat/completions`.
+
+### Known limitation — routed mode only
+
+Routed models lose tool-calling and true token streaming: the router's CLI
+adapters are request/response, not streaming, and tool-use content blocks are
+dropped in translation (only `text` blocks survive). This makes routed mode
+suitable for **one-shot review/audit roles** (`role:reviewer-chain`,
+`role:auditor-chain` — see `router.example.yaml`), and **wrong for a
+tool-using builder role**. Passthrough mode has none of these limitations —
+it is a byte-for-byte proxy.
+
+### Config
+
+```yaml
+anthropic:
+  upstream_url: ""        # default: https://api.anthropic.com
+  # upstream_api_key: env:ANTHROPIC_API_KEY   # optional router-owned key override
+```
 
 ### Streaming
 
