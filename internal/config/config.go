@@ -19,13 +19,13 @@ import (
 type AdapterType string
 
 const (
-	AdapterClaudeCLI      AdapterType = "claude_cli"
-	AdapterCodexCLI       AdapterType = "codex_cli"
-	AdapterCodexSubagent  AdapterType = "codex_subagent"
-	AdapterOllamaHTTP     AdapterType = "ollama_http"
-	AdapterAnthropicAPI   AdapterType = "anthropic_api"
-	AdapterOpenAIAPI      AdapterType = "openai_api"
-	AdapterGeminiCLI      AdapterType = "gemini_cli"
+	AdapterClaudeCLI     AdapterType = "claude_cli"
+	AdapterCodexCLI      AdapterType = "codex_cli"
+	AdapterCodexSubagent AdapterType = "codex_subagent"
+	AdapterOllamaHTTP    AdapterType = "ollama_http"
+	AdapterAnthropicAPI  AdapterType = "anthropic_api"
+	AdapterOpenAIAPI     AdapterType = "openai_api"
+	AdapterGeminiCLI     AdapterType = "gemini_cli"
 )
 
 // Duration is a time.Duration that unmarshals from a YAML string (e.g. "30m", "1h").
@@ -311,6 +311,38 @@ type ProxyConfig struct {
 	AdminToken string `yaml:"admin_token"`
 }
 
+// AnthropicConfig controls the inbound POST /v1/messages endpoint — an
+// Anthropic Messages API surface offering transparent passthrough for
+// normal Claude models and role:*/chain:*/backend:* routing through the
+// router's fallback chains (see internal/server/messages.go).
+type AnthropicConfig struct {
+	// UpstreamURL is the passthrough target for non-role:* model requests.
+	// Default: https://api.anthropic.com.
+	UpstreamURL string `yaml:"upstream_url"`
+
+	// UpstreamAPIKey optionally substitutes a configured key for the
+	// upstream request in passthrough mode, overriding whatever credential
+	// the client sent. Use "env:VAR_NAME" to read from env. Empty (default)
+	// means the client's own x-api-key/Authorization header is forwarded
+	// unchanged — the router does not see or need an Anthropic key.
+	UpstreamAPIKey string `yaml:"upstream_api_key"`
+}
+
+// ResolvedUpstreamURL returns the passthrough upstream base URL, defaulting
+// to https://api.anthropic.com when unset.
+func (a *AnthropicConfig) ResolvedUpstreamURL() string {
+	if a.UpstreamURL == "" {
+		return "https://api.anthropic.com"
+	}
+	return strings.TrimRight(a.UpstreamURL, "/")
+}
+
+// ResolvedUpstreamAPIKey returns the upstream API key override, resolving
+// env: references. Empty means "forward the client's own credential".
+func (a *AnthropicConfig) ResolvedUpstreamAPIKey() string {
+	return ResolveEnvRef(a.UpstreamAPIKey)
+}
+
 // ResolvedToken returns the bearer token, resolving env: references.
 func (p *ProxyConfig) ResolvedToken() string {
 	return ResolveEnvRef(p.Token)
@@ -380,11 +412,12 @@ type Config struct {
 	// Use "role:chain-name" in the model field to reference these.
 	Chains map[string][]string `yaml:"chains"`
 
-	Routing RoutingConfig `yaml:"routing"`
-	Alerts  AlertsConfig  `yaml:"alerts"`
-	Proxy   ProxyConfig   `yaml:"proxy"`
-	Storage StorageConfig `yaml:"storage"`
-	Log     LogConfig     `yaml:"log"`
+	Routing   RoutingConfig   `yaml:"routing"`
+	Alerts    AlertsConfig    `yaml:"alerts"`
+	Proxy     ProxyConfig     `yaml:"proxy"`
+	Storage   StorageConfig   `yaml:"storage"`
+	Log       LogConfig       `yaml:"log"`
+	Anthropic AnthropicConfig `yaml:"anthropic"`
 
 	// RegistryPath is the path to the models registry YAML (tier alias definitions).
 	// If empty, only the Tiers map is used for resolution.
