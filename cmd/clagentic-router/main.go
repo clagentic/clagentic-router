@@ -173,7 +173,8 @@ func cmdServe(args []string) error {
 			slog.Warn("clagentic-router: binding on all interfaces — ensure a TLS-terminating reverse proxy is in front")
 		}
 	}
-	srv := server.New(addr, token, adminToken, r, st)
+	srv := server.New(addr, token, adminToken, r, st,
+		cfg.Anthropic.ResolvedUpstreamURL(), cfg.Anthropic.ResolvedUpstreamAPIKey())
 
 	// Graceful shutdown on SIGINT/SIGTERM
 	sigCh := make(chan os.Signal, 1)

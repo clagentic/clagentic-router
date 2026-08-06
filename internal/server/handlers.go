@@ -29,6 +29,14 @@ type Handler struct {
 	store      *store.Store
 	token      string // inference token
 	adminToken string // admin token (may equal token if not separately configured)
+
+	// anthropicUpstreamURL is the passthrough target for POST /v1/messages
+	// requests whose model is not role:/chain:/backend:-prefixed.
+	anthropicUpstreamURL string
+	// anthropicUpstreamAPIKey, when non-empty, overrides the client's own
+	// credential on the upstream passthrough request. Empty means forward
+	// the client's x-api-key/Authorization header unchanged.
+	anthropicUpstreamAPIKey string
 }
 
 // --- OpenAI-compatible types ---
@@ -689,4 +697,3 @@ func boolToInt(b bool) int {
 	}
 	return 0
 }
-

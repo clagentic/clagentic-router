@@ -31,13 +31,29 @@ type Server struct {
 // token is the inference bearer token; adminToken is the admin bearer token.
 // When adminToken equals token (the default when admin_token is not configured),
 // all routes accept the same credential — identical to previous behaviour.
-func New(addr, token, adminToken string, r *router.Router, st *store.Store) *Server {
-	h := &Handler{router: r, store: st, token: token, adminToken: adminToken}
+// anthropicUpstreamURL/anthropicUpstreamAPIKey configure the POST /v1/messages
+// passthrough target; anthropicUpstreamURL is required non-empty (callers pass
+// config.AnthropicConfig.ResolvedUpstreamURL(), which defaults it).
+func New(addr, token, adminToken string, r *router.Router, st *store.Store, anthropicUpstreamURL, anthropicUpstreamAPIKey string) *Server {
+	h := &Handler{
+		router:                  r,
+		store:                   st,
+		token:                   token,
+		adminToken:              adminToken,
+		anthropicUpstreamURL:    anthropicUpstreamURL,
+		anthropicUpstreamAPIKey: anthropicUpstreamAPIKey,
+	}
 	mux := http.NewServeMux()
 
 	// OpenAI-compatible inference — inference token
 	mux.HandleFunc("POST /v1/chat/completions", h.auth(h.chatCompletions))
 	mux.HandleFunc("GET /v1/models", h.auth(h.models))
+
+	// Anthropic Messages API — auth is mode-dependent, checked inside the
+	// handler itself (see messages.go): routed mode requires the router's
+	// own inference token; passthrough mode forwards whatever credential
+	// the client presented and does not gate on the router token.
+	mux.HandleFunc("POST /v1/messages", h.messages)
 
 	// Health/observability — admin token
 	mux.HandleFunc("GET /health", h.adminAuth(h.health))
@@ -104,6 +120,24 @@ func (h *Handler) auth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+// anthropicTokenPresented reports whether r carries the router's inference
+// token via either Anthropic-style (x-api-key) or OpenAI-style
+// (Authorization: Bearer) header. Used by messagesRouted, which — unlike
+// passthrough — always requires the router's own token (see messages.go
+// for the full auth-matrix rationale).
+func (h *Handler) anthropicTokenPresented(r *http.Request) bool {
+	if h.token == "" {
+		return true
+	}
+	if r.Header.Get("x-api-key") == h.token {
+		return true
+	}
+	if hdr := r.Header.Get("Authorization"); strings.HasPrefix(hdr, "Bearer ") {
+		return strings.TrimPrefix(hdr, "Bearer ") == h.token
+	}
+	return false
 }
 
 // adminAuth wraps a handler requiring the admin bearer token.
