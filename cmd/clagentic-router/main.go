@@ -414,6 +414,12 @@ func buildAdapter(id string, b *config.BackendConfig) (backend.Adapter, error) {
 	case config.AdapterGeminiCLI:
 		return backend.NewGeminiCLIAdapter(id, b.Model, b.BinPath), nil
 
+	case config.AdapterBedrockAPI:
+		if b.Region == "" {
+			return nil, fmt.Errorf("bedrock_api requires region")
+		}
+		return backend.NewBedrockAPIAdapter(context.Background(), id, b.Model, b.Region, b.Profile)
+
 	default:
 		return nil, fmt.Errorf("unknown adapter type %q", b.Adapter)
 	}
