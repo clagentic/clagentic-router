@@ -102,18 +102,16 @@ func cmdServe(args []string) error {
 	setupLogging(cfg)
 
 	// Startup gate: refuse to start without authentication unless --unsafe-no-auth
-	// is explicitly passed. This prevents accidental open deployments. (lr-c7ac)
+	// is explicitly passed. This prevents accidental open deployments. (lr-c7ac,
+	// admin-token gate added lr-7a26e0.)
 	token := cfg.Proxy.ResolvedToken()
-	if token == "" {
-		if !sf.unsafeNoAuth {
-			return fmt.Errorf("proxy.token is not set — refusing to start without authentication. " +
-				"Set proxy.token in config (e.g. \"env:CLAGENTIC_ROUTER_TOKEN\") or pass " +
-				"--unsafe-no-auth for development only")
-		}
+	adminToken := cfg.Proxy.ResolvedAdminToken()
+	if err := checkAuthGates(token, adminToken, sf.unsafeNoAuth); err != nil {
+		return err
+	}
+	if sf.unsafeNoAuth {
 		slog.Warn("clagentic-router: running WITHOUT authentication (--unsafe-no-auth)")
 	}
-
-	adminToken := cfg.Proxy.ResolvedAdminToken()
 
 	// Open store
 	var st *store.Store
@@ -173,7 +171,7 @@ func cmdServe(args []string) error {
 			slog.Warn("clagentic-router: binding on all interfaces — ensure a TLS-terminating reverse proxy is in front")
 		}
 	}
-	srv := server.New(addr, token, adminToken, r, st,
+	srv := server.New(addr, token, adminToken, sf.unsafeNoAuth, r, st,
 		cfg.Anthropic.ResolvedUpstreamURL(), cfg.Anthropic.ResolvedUpstreamAPIKey())
 
 	// Graceful shutdown on SIGINT/SIGTERM
@@ -195,6 +193,29 @@ func cmdServe(args []string) error {
 
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("listen: %w", err)
+	}
+	return nil
+}
+
+// checkAuthGates enforces the boot-time refuse-to-start-unauthenticated
+// policy for both the inference token and the admin token. Returns a
+// descriptive error naming the empty token when unsafeNoAuth is false;
+// returns nil (including when unsafeNoAuth is true, which intentionally
+// bypasses both checks). Extracted from cmdServe so the gate logic is
+// unit-testable without standing up a full server. (lr-7a26e0)
+func checkAuthGates(token, adminToken string, unsafeNoAuth bool) error {
+	if unsafeNoAuth {
+		return nil
+	}
+	if token == "" {
+		return fmt.Errorf("proxy.token is not set — refusing to start without authentication. " +
+			"Set proxy.token in config (e.g. \"env:CLAGENTIC_ROUTER_TOKEN\") or pass " +
+			"--unsafe-no-auth for development only")
+	}
+	if adminToken == "" {
+		return fmt.Errorf("proxy.admin_token (or its fallback proxy.token) resolved empty — refusing to start " +
+			"without authentication on the admin/control-plane routes. Set proxy.admin_token or proxy.token " +
+			"in config (e.g. \"env:CLAGENTIC_ROUTER_ADMIN_TOKEN\") or pass --unsafe-no-auth for development only")
 	}
 	return nil
 }
