@@ -179,6 +179,14 @@ chains:
   # Triage — local only, no cloud spend
   triage:   [local]
 
+  # --- POST /v1/messages "role:*" examples ---
+  # Referenced via model: "role:reviewer-chain" / "role:auditor-chain" on the
+  # Anthropic Messages endpoint (see the "Anthropic Messages API" section in
+  # README.md). One-shot review/audit roles are a good fit for routed mode;
+  # tool-using builder roles are NOT — routed mode drops tool-calling.
+  reviewer-chain: [mid, high]
+  auditor-chain:  [low, mid]
+
 # --- Routing ---
 routing:
   strategy: scored
@@ -214,6 +222,16 @@ proxy:
   host: 127.0.0.1        # 0.0.0.0 for network access from other hosts
   port: 8765
   token: env:CLAGENTIC_ROUTER_TOKEN
+
+# --- Anthropic Messages API (POST /v1/messages) ---
+# See the "Anthropic Messages API" section in README.md for the full
+# passthrough-vs-routed design and auth matrix.
+anthropic:
+  upstream_url: ""        # default: https://api.anthropic.com
+  # upstream_api_key: env:ANTHROPIC_API_KEY
+  # ^ optional: substitute a router-owned key for ALL passthrough requests,
+  #   overriding whatever credential the client sent. Leave unset (default)
+  #   to forward each client's own Anthropic key unchanged.
 
 # --- Storage ---
 storage:

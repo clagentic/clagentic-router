@@ -52,7 +52,7 @@ func newTestServer(t *testing.T) (*httptest.Server, func()) {
 	// Bring backend to Healthy so state changes are observable
 	r.AllSnapshots() // noop, just ensure the backend exists
 
-	srv := New(":0", "secret", "secret", r, nil)
+	srv := New(":0", "secret", "secret", r, nil, "https://api.anthropic.com", "")
 	ts := httptest.NewServer(srv.httpServer.Handler)
 	return ts, func() { ts.Close() }
 }
