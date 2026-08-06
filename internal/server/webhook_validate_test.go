@@ -108,7 +108,7 @@ func newTestServerWithStore(t *testing.T) (*httptest.Server, func()) {
 	}
 	r := router.New(cfg, adapters, nil, nil)
 
-	srv := New(":0", "secret", "secret", r, st)
+	srv := New(":0", "secret", "secret", r, st, "https://api.anthropic.com", "")
 	ts := httptest.NewServer(srv.httpServer.Handler)
 	return ts, func() {
 		ts.Close()
