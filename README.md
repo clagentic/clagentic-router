@@ -16,7 +16,7 @@ A self-hosted LLM routing daemon with fallback chains, live quota intelligence, 
 
 ## What it does
 
-- Routes LLM calls across multiple backends (Claude CLI, Codex CLI, Ollama, Anthropic API, OpenAI API)
+- Routes LLM calls across multiple backends (Claude CLI, Codex CLI, Ollama, Anthropic API, OpenAI API, AWS Bedrock)
 - Walks a fallback chain when backends are unavailable or rate-limited
 - Scores backends by health, quota pressure, latency EMA, and cost weight; near-ties broken by jitter
 - Tracks quota/rate-limit state persistently in SQLite; auto-recovers when windows reset
@@ -202,8 +202,74 @@ X-Router-Fallback-Reason: rate_limit   # only when chain was advanced
 | `ollama_http` | None | Local or remote Ollama server |
 | `anthropic_api` | API key | Direct Anthropic Messages API |
 | `openai_api` | API key | OpenAI Chat Completions API; optional `openai_api_key` enables usage polling |
+| `bedrock_api` | AWS SDK credential chain | AWS Bedrock Converse API — see [AWS Bedrock (`bedrock_api`)](#aws-bedrock-bedrock_api) below |
 
 CLI adapters (`claude_cli`, `codex_cli`, `codex_subagent`, `gemini_cli`) must run on the host where the OAuth sessions are stored. They cannot run in a container. For containerized deployment, use only API-based adapters.
+
+### AWS Bedrock (`bedrock_api`)
+
+Calls the [Bedrock Runtime Converse API](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html),
+which is uniform across model families for text-only, non-streaming
+invocation — the same adapter covers both the Anthropic and OpenAI families
+hosted on Bedrock with no model-family-specific config. Image input,
+streaming, and tool-use content blocks are out of scope for this adapter;
+text-only requests/responses only. Non-text response content blocks (tool
+use, reasoning, etc.) are skipped rather than causing an error.
+
+```yaml
+backends:
+  bedrock-claude:
+    adapter: bedrock_api
+    region: us-east-1                      # required — Bedrock has no SDK default region
+    model: anthropic.claude-sonnet-4-6-v1:0  # confirm the exact ID in the Bedrock console
+    # profile: my-aws-profile              # optional named AWS profile
+    timeout_seconds: 180
+```
+
+**Credentials.** Resolved exclusively via the standard AWS SDK credential
+chain (env vars → web identity → shared credentials file → shared config
+file → ECS → IMDS) — the same chain `aws-cli` and every other AWS SDK use.
+There is no `api_key` field for this adapter and router.yaml must never
+carry AWS credentials; set `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (or
+better, a role) in the environment, or use `profile` to select a named
+profile from `~/.aws/config` / `~/.aws/credentials`.
+
+**Region.** Required — Bedrock has no default region in the SDK. An empty
+`region` fails config validation at startup rather than failing on the
+first call.
+
+**Model ID semantics.** Two ID forms exist and they are *not*
+interchangeable:
+- **Bare model IDs** (e.g. `anthropic.claude-sonnet-4-6-v1:0`) are
+  region-specific — the model must be enabled for that exact region in your
+  account.
+- **Region-prefixed inference profile IDs** (e.g. `us.anthropic.claude-...`,
+  `eu.anthropic.claude-...`) enable cross-region routing with failover, and
+  some models are reachable *only* via an inference profile.
+
+Check the Bedrock console for your target model to determine which form it
+requires. The Anthropic family's Bedrock IDs are well-documented; **the
+exact ID strings for the OpenAI family hosted on Bedrock were not confirmed
+during this adapter's development** — do not copy an ID from this README
+for an OpenAI-family model without first verifying it in the console for
+your account/region.
+
+**Error classification.** Bedrock Runtime SDK exceptions are mapped onto
+the router's existing `ErrorType` enum via `errors.As` (never string
+matching): `ThrottlingException`/`ModelNotReadyException` → rate limit,
+`AccessDeniedException` → auth (covers both missing/expired credentials
+*and* a model not enabled for your account — both surface as the same SDK
+exception type), `ValidationException`/`ResourceNotFoundException` →
+schema, `ModelTimeoutException` → timeout, and
+`ModelErrorException`/`InternalServerException`/`ServiceUnavailableException`
+→ network (retriable downstream failure).
+
+**Operator-verifiable, not verified here.** This adapter was built and
+tested entirely against a mocked Bedrock client — no live AWS account was
+available in the build environment. Live end-to-end verification against a
+real Bedrock endpoint (credential resolution, an actual Converse call
+succeeding, and the OpenAI-family model ID question above) is left to the
+operator enabling this backend against their own AWS account.
 
 ## Webhook events
 

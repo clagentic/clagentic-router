@@ -13,7 +13,7 @@
 
 # --- Backends ---
 # Each backend is one LLM invocation path.
-# Adapter types: claude_cli | codex_cli | codex_subagent | gemini_cli | ollama_http | anthropic_api | openai_api
+# Adapter types: claude_cli | codex_cli | codex_subagent | gemini_cli | ollama_http | anthropic_api | openai_api | bedrock_api
 
 backends:
 
@@ -134,6 +134,31 @@ backends:
   #   api_key: env:OPENAI_API_KEY
   #   cost_weight: 1.1
   #   timeout_seconds: 120
+
+  # --- AWS Bedrock (optional, AWS SDK credential chain — no api_key field) ---
+  # Credentials resolve via the standard AWS SDK chain (env vars, shared
+  # config/credentials files, web identity, ECS, IMDS) — never from this file.
+  # region is REQUIRED: Bedrock has no default region.
+  # See the "AWS Bedrock (bedrock_api)" section in README.md for the full
+  # model-ID-form caveat (bare vs. region-prefixed inference profile IDs)
+  # and the known gap around exact OpenAI-family Bedrock model ID strings.
+  #
+  # bedrock-claude:
+  #   adapter: bedrock_api
+  #   region: us-east-1
+  #   model: anthropic.claude-sonnet-4-6-v1:0  # confirmed form; verify in the Bedrock console for your account/region
+  #   # profile: env:AWS_PROFILE               # optional named AWS profile
+  #   cost_weight: 0.8
+  #   timeout_seconds: 180
+  #
+  # bedrock-openai:
+  #   adapter: bedrock_api
+  #   region: us-east-1
+  #   model: REPLACE_WITH_EXACT_BEDROCK_MODEL_ID  # UNCONFIRMED — get the exact
+  #     # invocable ID for your target OpenAI-family model from the Bedrock
+  #     # console before using; do not guess a plausible-looking ID here.
+  #   cost_weight: 0.8
+  #   timeout_seconds: 180
 
 # --- Tiers ---
 # A tier is a named group of backends at the same capability level.

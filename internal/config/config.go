@@ -26,6 +26,7 @@ const (
 	AdapterAnthropicAPI  AdapterType = "anthropic_api"
 	AdapterOpenAIAPI     AdapterType = "openai_api"
 	AdapterGeminiCLI     AdapterType = "gemini_cli"
+	AdapterBedrockAPI    AdapterType = "bedrock_api"
 )
 
 // Duration is a time.Duration that unmarshals from a YAML string (e.g. "30m", "1h").
@@ -115,6 +116,15 @@ type BackendConfig struct {
 
 	// APIKey is the API key for API-based adapters. Use "env:VAR_NAME" to read from env.
 	APIKey string `yaml:"api_key"`
+
+	// Region is the AWS region for the bedrock_api adapter (required — Bedrock
+	// has no SDK default region). Ignored by all other adapter types.
+	Region string `yaml:"region"`
+
+	// Profile is an optional named AWS shared-config/credentials profile for
+	// the bedrock_api adapter. Empty uses the standard SDK credential chain
+	// with no profile override. Ignored by all other adapter types.
+	Profile string `yaml:"profile"`
 
 	// OpenAIAPIKey enables Layer 2 (OpenAI usage API polling) for codex backends.
 	// Use "env:VAR_NAME" to read from env.
@@ -453,12 +463,15 @@ func (c *Config) validate() error {
 		switch b.Adapter {
 		case AdapterClaudeCLI, AdapterCodexCLI, AdapterCodexSubagent,
 			AdapterOllamaHTTP, AdapterAnthropicAPI, AdapterOpenAIAPI,
-			AdapterGeminiCLI:
+			AdapterGeminiCLI, AdapterBedrockAPI:
 		default:
 			return fmt.Errorf("backend %q: unknown adapter %q", id, b.Adapter)
 		}
 		if b.Adapter == AdapterOllamaHTTP && b.URL == "" {
 			return fmt.Errorf("backend %q: ollama_http requires url", id)
+		}
+		if b.Adapter == AdapterBedrockAPI && b.Region == "" {
+			return fmt.Errorf("backend %q: bedrock_api requires region (no SDK default region exists for Bedrock)", id)
 		}
 	}
 	// Fill routing defaults
