@@ -31,15 +31,19 @@ type Server struct {
 // token is the inference bearer token; adminToken is the admin bearer token.
 // When adminToken equals token (the default when admin_token is not configured),
 // all routes accept the same credential — identical to previous behaviour.
+// allowNoAuth must be true ONLY when the operator explicitly asked to run
+// without authentication (--unsafe-no-auth); it is what makes an empty
+// token/adminToken pass through instead of rejecting with 401 (lr-7a26e0).
 // anthropicUpstreamURL/anthropicUpstreamAPIKey configure the POST /v1/messages
 // passthrough target; anthropicUpstreamURL is required non-empty (callers pass
 // config.AnthropicConfig.ResolvedUpstreamURL(), which defaults it).
-func New(addr, token, adminToken string, r *router.Router, st *store.Store, anthropicUpstreamURL, anthropicUpstreamAPIKey string) *Server {
+func New(addr, token, adminToken string, allowNoAuth bool, r *router.Router, st *store.Store, anthropicUpstreamURL, anthropicUpstreamAPIKey string) *Server {
 	h := &Handler{
 		router:                  r,
 		store:                   st,
 		token:                   token,
 		adminToken:              adminToken,
+		allowNoAuth:             allowNoAuth,
 		anthropicUpstreamURL:    anthropicUpstreamURL,
 		anthropicUpstreamAPIKey: anthropicUpstreamAPIKey,
 	}
@@ -109,14 +113,24 @@ func (s *Server) Close() error {
 }
 
 // auth wraps a handler requiring the inference bearer token.
+// An empty token rejects with 401 unless h.allowNoAuth is true (the operator
+// explicitly passed --unsafe-no-auth) — empty-string-means-open is not a
+// valid default; it silently opens the server to anyone who constructs a
+// Handler without threading the startup gate. (lr-7a26e0)
 func (h *Handler) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if h.token != "" {
-			hdr := r.Header.Get("Authorization")
-			if !strings.HasPrefix(hdr, "Bearer ") || strings.TrimPrefix(hdr, "Bearer ") != h.token {
+		if h.token == "" {
+			if !h.allowNoAuth {
 				writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or missing bearer token")
 				return
 			}
+			next(w, r)
+			return
+		}
+		hdr := r.Header.Get("Authorization")
+		if !strings.HasPrefix(hdr, "Bearer ") || strings.TrimPrefix(hdr, "Bearer ") != h.token {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or missing bearer token")
+			return
 		}
 		next(w, r)
 	}
@@ -126,10 +140,11 @@ func (h *Handler) auth(next http.HandlerFunc) http.HandlerFunc {
 // token via either Anthropic-style (x-api-key) or OpenAI-style
 // (Authorization: Bearer) header. Used by messagesRouted, which — unlike
 // passthrough — always requires the router's own token (see messages.go
-// for the full auth-matrix rationale).
+// for the full auth-matrix rationale). An empty token is honored only when
+// h.allowNoAuth is true (lr-7a26e0).
 func (h *Handler) anthropicTokenPresented(r *http.Request) bool {
 	if h.token == "" {
-		return true
+		return h.allowNoAuth
 	}
 	if r.Header.Get("x-api-key") == h.token {
 		return true
@@ -141,15 +156,22 @@ func (h *Handler) anthropicTokenPresented(r *http.Request) bool {
 }
 
 // adminAuth wraps a handler requiring the admin bearer token.
-// When adminToken is empty no authentication is enforced (dev-only / no-auth mode).
+// An empty adminToken rejects with 401 unless h.allowNoAuth is true (the
+// operator explicitly passed --unsafe-no-auth). (lr-7a26e0)
 func (h *Handler) adminAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if h.adminToken != "" {
-			hdr := r.Header.Get("Authorization")
-			if !strings.HasPrefix(hdr, "Bearer ") || strings.TrimPrefix(hdr, "Bearer ") != h.adminToken {
+		if h.adminToken == "" {
+			if !h.allowNoAuth {
 				writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or missing admin bearer token")
 				return
 			}
+			next(w, r)
+			return
+		}
+		hdr := r.Header.Get("Authorization")
+		if !strings.HasPrefix(hdr, "Bearer ") || strings.TrimPrefix(hdr, "Bearer ") != h.adminToken {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or missing admin bearer token")
+			return
 		}
 		next(w, r)
 	}

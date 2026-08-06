@@ -30,6 +30,13 @@ type Handler struct {
 	token      string // inference token
 	adminToken string // admin token (may equal token if not separately configured)
 
+	// allowNoAuth is the explicit, operator-set intent to run without
+	// authentication. Set ONLY by cmdServe when --unsafe-no-auth was
+	// actually passed (see main.go). When false, an empty token/adminToken
+	// causes the corresponding auth middleware to reject with 401 instead
+	// of the old empty-string-means-open behavior. (lr-7a26e0)
+	allowNoAuth bool
+
 	// anthropicUpstreamURL is the passthrough target for POST /v1/messages
 	// requests whose model is not role:/chain:/backend:-prefixed.
 	anthropicUpstreamURL string
