@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/google/uuid"
 
 	"github.com/clagentic/clagentic-router/internal/backend"
@@ -44,6 +45,28 @@ type Handler struct {
 	// credential on the upstream passthrough request. Empty means forward
 	// the client's x-api-key/Authorization header unchanged.
 	anthropicUpstreamAPIKey string
+
+	// bedrockRegion is the AWS region POST /model/{modelId}/invoke[-with-response-stream]
+	// passthrough requests are SigV4-signed and sent to. Empty disables
+	// Bedrock passthrough (routed role:/chain:/backend: model IDs still work).
+	bedrockRegion string
+	// bedrockProfile is an optional named AWS shared-config/credentials
+	// profile used to resolve passthrough signing credentials. Empty uses
+	// the standard SDK credential chain with no profile override.
+	bedrockProfile string
+	// bedrockUpstreamBaseURL overrides the real AWS Bedrock Runtime endpoint
+	// (https://bedrock-runtime.<region>.amazonaws.com) for the passthrough
+	// path. Empty (production default) uses the real endpoint; tests set it
+	// to an httptest server URL to verify request-building and SigV4 signing
+	// deterministically without live AWS credentials.
+	bedrockUpstreamBaseURL string
+
+	// bedrockCredentialsFn resolves AWS credentials for passthrough SigV4
+	// signing. nil (production default) uses resolveBedrockCredentials (the
+	// real AWS SDK credential chain); tests inject a stub so passthrough
+	// request-building/signing is verifiable without live AWS credentials,
+	// IMDS access, or network calls.
+	bedrockCredentialsFn func(ctx context.Context) (aws.Credentials, error)
 }
 
 // --- OpenAI-compatible types ---
