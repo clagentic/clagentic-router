@@ -107,6 +107,8 @@ graph LR
 |---|---|---|
 | POST | /v1/chat/completions | OpenAI-compatible inference |
 | POST | /v1/messages | Anthropic Messages API — passthrough or `role:*` routed (see below) |
+| POST | /model/{modelId}/invoke | AWS Bedrock Runtime InvokeModel — passthrough or `role:*` routed (see below) |
+| POST | /model/{modelId}/invoke-with-response-stream | AWS Bedrock Runtime InvokeModelWithResponseStream — passthrough or `role:*` routed (see below) |
 | GET | /v1/models | List all backends with status |
 | GET | /v1/capacity | Per-backend capacity snapshot (utilization, reset time, score) |
 | GET | /health | Aggregated health (cached) |
@@ -123,8 +125,9 @@ graph LR
 | GET | /webhooks | List webhooks |
 | GET | /version | Version (no auth required) |
 
-All endpoints except `/version` require `Authorization: Bearer <token>` — with one
-exception: `/v1/messages` in passthrough mode, see below.
+All endpoints except `/version` require `Authorization: Bearer <token>` — with two
+exceptions: `/v1/messages` and `/model/{modelId}/invoke[-with-response-stream]` in
+passthrough mode, see below.
 
 ## Anthropic Messages API
 
@@ -170,6 +173,69 @@ anthropic:
   upstream_url: ""        # default: https://api.anthropic.com
   # upstream_api_key: env:ANTHROPIC_API_KEY   # optional router-owned key override
 ```
+
+## AWS Bedrock InvokeModel API
+
+`POST /model/{modelId}/invoke` and `POST /model/{modelId}/invoke-with-response-stream`
+let Bedrock-mode Claude Code (`CLAUDE_CODE_USE_BEDROCK=1`, `ANTHROPIC_BEDROCK_BASE_URL`
+pointed at the router) work the same way `/v1/messages` works for direct-API mode.
+The key difference from `/v1/messages`: **the model identifier is carried entirely by
+the URL path segment, never the request body** — there is no `model` field in a Bedrock
+InvokeModel request. That path segment (`{modelId}`) is the routing key, exactly as with
+`/v1/messages`'s body `model` field:
+
+| `{modelId}` | Mode | Behavior |
+|---|---|---|
+| A real Bedrock model/inference-profile ID (`anthropic.claude-...`, `us.anthropic.claude-...`) | **Passthrough** (default) | SigV4-signed reverse proxy to the real AWS Bedrock Runtime endpoint for `bedrock.region`. Request body and response (including AWS event-stream-framed responses) are forwarded byte-for-byte. |
+| `role:<chain>` / `chain:a,b,c` / `backend:<id>` | **Routed** | Translated to the router's internal request format, sent through the same fallback-chain machinery as `/v1/chat/completions` and `/v1/messages`, translated back into the Bedrock InvokeModel response envelope — which is byte-identical in shape to the direct Anthropic Messages response for Anthropic models on Bedrock. |
+
+### Auth matrix
+
+Same asymmetric shape as `/v1/messages`:
+
+- **Passthrough mode**: the router does **not** check its own inference token — Bedrock
+  passthrough is authenticated by SigV4 signing with AWS credentials the router itself
+  resolves (see Config below), not by any credential the client presents.
+- **Routed mode**: requires the router's own inference token, presented as
+  `x-api-key: <token>` OR `Authorization: Bearer <token>`.
+
+### Config
+
+```yaml
+bedrock:
+  region: us-east-1        # required for passthrough; routed-mode-only deployments may omit
+  # profile: my-aws-profile  # optional named AWS profile for passthrough credential resolution
+```
+
+Credentials for passthrough are resolved via the same standard AWS SDK credential chain
+the `bedrock_api` adapter uses (env vars → web identity → shared credentials file →
+shared config file → ECS → IMDS) — see [AWS Bedrock (`bedrock_api`)](#aws-bedrock-bedrock_api)
+below for the full credential/region discussion. A passthrough request with no
+`bedrock.region` configured fails with `503` rather than attempting to sign with an
+empty region.
+
+### Streaming framing
+
+The streaming variant emits **AWS event-stream framing**
+(`Content-Type: application/vnd.amazon.eventstream`) — a third response-framing scheme
+distinct from both plain SSE (`/v1/chat/completions`) and the Anthropic Messages SSE
+grammar (`/v1/messages` routed mode). Passthrough forwards the upstream event-stream
+bytes unmodified; routed mode constructs event-stream frames itself (via the AWS SDK's
+own `aws/protocol/eventstream` codec, not hand-rolled), one frame per Anthropic-grammar
+event (`message_start`, `content_block_delta`, etc.) — same known routed-mode limitation
+as `/v1/messages`: the full response arrives in one `content_block_delta` frame rather
+than true token-by-token streaming.
+
+### Verification status
+
+The routed-mode path (path extraction, request/response translation, event-stream
+encode/decode) is unit-tested deterministically and requires no AWS account. The
+passthrough path's request-building and SigV4 signing are unit-tested against an
+`httptest` stand-in with injected stub credentials — this verifies the signing call
+shape and header production, but **does not** verify AWS itself accepts the signed
+request end-to-end. No live AWS Bedrock account was available during this endpoint's
+development (same caveat as the `bedrock_api` adapter below); live verification against
+a real Bedrock endpoint is left to the operator enabling Bedrock passthrough.
 
 ### Streaming
 

@@ -258,6 +258,15 @@ anthropic:
   #   overriding whatever credential the client sent. Leave unset (default)
   #   to forward each client's own Anthropic key unchanged.
 
+# --- AWS Bedrock InvokeModel API (POST /model/{modelId}/invoke[-with-response-stream]) ---
+# See the "AWS Bedrock InvokeModel API" section in README.md for the full
+# passthrough-vs-routed design and auth matrix. Only needed for passthrough —
+# a deployment using only role:/chain:/backend: model IDs on this endpoint
+# can omit this block entirely.
+# bedrock:
+#   region: us-east-1        # required for passthrough; Bedrock has no SDK default region
+#   # profile: env:AWS_PROFILE  # optional named AWS profile for passthrough credential resolution
+
 # --- Storage ---
 storage:
   db_path: ""   # default: $XDG_STATE_HOME/clagentic-router/state.db
