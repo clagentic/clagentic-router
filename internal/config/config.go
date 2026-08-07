@@ -353,6 +353,29 @@ func (a *AnthropicConfig) ResolvedUpstreamAPIKey() string {
 	return ResolveEnvRef(a.UpstreamAPIKey)
 }
 
+// BedrockConfig controls the inbound POST /model/{modelId}/invoke[-with-response-stream]
+// endpoints — the AWS Bedrock Runtime InvokeModel wire shape (see
+// internal/server/bedrock_invoke.go). Like AnthropicConfig, it offers
+// transparent SigV4-signed passthrough to real AWS Bedrock for plain model
+// IDs and translated routing for role:*/chain:*/backend:* model IDs.
+type BedrockConfig struct {
+	// Region is the AWS region passthrough requests are signed and sent to
+	// (e.g. "us-east-1"). Required only when a passthrough (non-routed)
+	// request is actually received; routed-mode-only deployments may leave
+	// this empty. Use "env:VAR_NAME" to read from env.
+	Region string `yaml:"region"`
+
+	// Profile is an optional named AWS shared-config/credentials profile
+	// used to resolve credentials for passthrough signing. Empty uses the
+	// standard SDK credential chain with no profile override.
+	Profile string `yaml:"profile"`
+}
+
+// ResolvedRegion returns the Bedrock passthrough region, resolving env: references.
+func (b *BedrockConfig) ResolvedRegion() string {
+	return ResolveEnvRef(b.Region)
+}
+
 // ResolvedToken returns the bearer token, resolving env: references.
 func (p *ProxyConfig) ResolvedToken() string {
 	return ResolveEnvRef(p.Token)
@@ -428,6 +451,7 @@ type Config struct {
 	Storage   StorageConfig   `yaml:"storage"`
 	Log       LogConfig       `yaml:"log"`
 	Anthropic AnthropicConfig `yaml:"anthropic"`
+	Bedrock   BedrockConfig   `yaml:"bedrock"`
 
 	// RegistryPath is the path to the models registry YAML (tier alias definitions).
 	// If empty, only the Tiers map is used for resolution.

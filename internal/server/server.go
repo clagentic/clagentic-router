@@ -37,7 +37,10 @@ type Server struct {
 // anthropicUpstreamURL/anthropicUpstreamAPIKey configure the POST /v1/messages
 // passthrough target; anthropicUpstreamURL is required non-empty (callers pass
 // config.AnthropicConfig.ResolvedUpstreamURL(), which defaults it).
-func New(addr, token, adminToken string, allowNoAuth bool, r *router.Router, st *store.Store, anthropicUpstreamURL, anthropicUpstreamAPIKey string) *Server {
+// bedrockRegion/bedrockProfile configure the POST /model/{modelId}/invoke[-with-response-stream]
+// passthrough target; bedrockRegion empty disables Bedrock passthrough (routed
+// role:/chain:/backend: model IDs still work) — see bedrock_invoke.go.
+func New(addr, token, adminToken string, allowNoAuth bool, r *router.Router, st *store.Store, anthropicUpstreamURL, anthropicUpstreamAPIKey, bedrockRegion, bedrockProfile string) *Server {
 	h := &Handler{
 		router:                  r,
 		store:                   st,
@@ -46,6 +49,8 @@ func New(addr, token, adminToken string, allowNoAuth bool, r *router.Router, st 
 		allowNoAuth:             allowNoAuth,
 		anthropicUpstreamURL:    anthropicUpstreamURL,
 		anthropicUpstreamAPIKey: anthropicUpstreamAPIKey,
+		bedrockRegion:           bedrockRegion,
+		bedrockProfile:          bedrockProfile,
 	}
 	mux := http.NewServeMux()
 
@@ -58,6 +63,15 @@ func New(addr, token, adminToken string, allowNoAuth bool, r *router.Router, st 
 	// own inference token; passthrough mode forwards whatever credential
 	// the client presented and does not gate on the router token.
 	mux.HandleFunc("POST /v1/messages", h.messages)
+
+	// AWS Bedrock Runtime InvokeModel wire shape — what Claude Code speaks
+	// when CLAUDE_CODE_USE_BEDROCK=1 redirects it here via
+	// ANTHROPIC_BEDROCK_BASE_URL. Auth is mode-dependent exactly like
+	// /v1/messages (see bedrock_invoke.go): routed mode requires the
+	// router's own inference token; passthrough mode is SigV4-signed to the
+	// real AWS Bedrock endpoint and does not gate on the router token.
+	mux.HandleFunc("POST /model/{modelId}/invoke", h.bedrockInvoke)
+	mux.HandleFunc("POST /model/{modelId}/invoke-with-response-stream", h.bedrockInvokeStream)
 
 	// Health/observability — admin token
 	mux.HandleFunc("GET /health", h.adminAuth(h.health))
