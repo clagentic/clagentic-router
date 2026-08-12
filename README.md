@@ -234,6 +234,15 @@ Same asymmetric shape as `/v1/messages`:
 - **Routed mode**: requires the router's own inference token, presented as
   `x-api-key: <token>` OR `Authorization: Bearer <token>`.
 
+### Tools
+
+Same refusal behavior as `/v1/messages` routed mode: if the request body's
+`tools` field is present and the resolved chain has no tool-capable backend
+(see [Adapter capabilities](#adapter-capabilities)), the router returns
+`422` (Bedrock error envelope: `{"message": "..."}`) rather than a `200`
+with tools silently dropped. Passthrough forwards `tools` untouched — this
+check only applies to `role:*`/`chain:*`/`backend:*` model IDs.
+
 ### Config
 
 ```yaml

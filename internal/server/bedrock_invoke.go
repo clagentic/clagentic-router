@@ -59,13 +59,22 @@ import (
 // bedrockInvokeRequest is decoded just enough to translate routed-mode
 // requests into backend.Request. Unlike anthropicMsgRequest there is no
 // Model field — the model comes exclusively from the URL path. Passthrough
-// forwards rawBody unmodified, so unknown fields (tools, thinking,
-// anthropic_beta, metadata, etc.) never need explicit representation here.
+// forwards rawBody unmodified, so unknown fields (thinking, anthropic_beta,
+// metadata, etc.) never need explicit representation here.
 type bedrockInvokeRequest struct {
 	AnthropicVersion string                `json:"anthropic_version"`
 	Messages         []anthropicMsgMessage `json:"messages"`
 	System           json.RawMessage       `json:"system,omitempty"`
 	MaxTokens        int                   `json:"max_tokens"`
+	// Tools is decoded only far enough to detect presence — routed mode
+	// (bedrockRouted) does not translate tool definitions to the backend
+	// (see anthropicToBackendMessages, reused from messages.go). A
+	// tools-bearing request must be refused when the resolved chain has no
+	// tool-capable backend rather than silently dropped; see bedrockRouted's
+	// tool-capability check. Passthrough mode is unaffected: it forwards
+	// the original request bytes (including tools) unmodified, never
+	// decoding this field.
+	Tools json.RawMessage `json:"tools,omitempty"`
 }
 
 // bedrockErrorEnvelope is the Bedrock Runtime error response shape — distinct
@@ -144,6 +153,23 @@ func (h *Handler) bedrockRouted(w http.ResponseWriter, r *http.Request, modelID 
 	if len(req.Messages) == 0 {
 		writeBedrockError(w, http.StatusBadRequest, "messages is required")
 		return
+	}
+
+	if hasTools(req.Tools) {
+		filtered, err := h.router.FilterChainForTools(chain)
+		if err != nil {
+			if err == router.ErrNoToolCapableBackend {
+				writeBedrockError(w, http.StatusUnprocessableEntity,
+					fmt.Sprintf("request carries tools but model %q resolves to no tool-capable backend in routed mode; "+
+						"remove tools, or send this request to a real Bedrock model/inference-profile ID directly (passthrough forwards tools intact)",
+						modelID))
+				return
+			}
+			writeBedrockError(w, http.StatusBadRequest,
+				fmt.Sprintf("model %q did not resolve to any configured backends", modelID))
+			return
+		}
+		chain = filtered
 	}
 
 	// Reuse anthropicToBackendMessages (messages.go) — the Bedrock and direct
