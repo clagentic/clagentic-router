@@ -76,14 +76,23 @@ merge_requirements:
 # -----------------------------------------------------------------------
 # post_merge_steps  (optional — post-merge automation)
 # -----------------------------------------------------------------------
+# NOTE: this file is NOT read by loadout-merge — .clagentic/loadout/config.yaml
+# is the only surface load_post_merge_steps consults (see that file's own
+# comment). This copy is kept in sync for parity/documentation only
+# (lr-4e6f31 item 3 precedent).
+#
 # clagentic-router is a long-running daemon: a merge landing in git alone
-# does not make it live. `clagentic-router update` rebuilds the binary and
-# restarts the running service. It is a bare, environment-agnostic verb —
-# every host-specific detail (install path, service name, source checkout)
-# is resolved from the same router.yaml config chain "serve" already uses
-# (the optional [deploy] block; see router.example.yaml), never from this
-# file. No absolute paths, env-var assignments, hostnames, or service names
-# belong here.
+# does not make it live. `go run ./cmd/clagentic-router update` rebuilds the
+# binary and restarts the running service, run from the merged source tree
+# (loadout-merge's cwd for every post-merge step) rather than a bare,
+# PATH-resolved `clagentic-router` name -- a bare name resolves to whatever
+# binary is currently installed, which cannot contain a subcommand that only
+# just landed in this same merge (lr-a814a5; confirmed root cause of PR #33's
+# post-merge failure). Every host-specific detail (install path, service
+# name, source checkout) is resolved from the same router.yaml config chain
+# "serve" already uses (the optional [deploy] block; see router.example.yaml),
+# never from this file. No absolute paths, env-var assignments, hostnames, or
+# service names belong here.
 post_merge_steps:
-  - cmd: clagentic-router update
+  - cmd: ["go", "run", "./cmd/clagentic-router", "update"]
     on_failure: fail
