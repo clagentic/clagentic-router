@@ -30,6 +30,13 @@ var ErrAllFailed = errors.New("all backends in chain failed or unavailable")
 // ErrNoChain is returned when the chain resolves to no backends.
 var ErrNoChain = errors.New("chain resolved to no configured backends")
 
+// ErrNoToolCapableBackend is returned by FilterChainForTools when a chain
+// resolves to at least one backend, but none of them declare
+// Capabilities().SupportsTools. Callers use this to refuse a tool-bearing
+// request explicitly rather than silently dropping the tools and returning
+// a 200 (the defect this capability model exists to close).
+var ErrNoToolCapableBackend = errors.New("chain has no tool-capable backend")
+
 // localPoller is the interface implemented by LlamaCppPoller and OllamaPoller.
 // Only Start is required; the router manages the goroutine lifecycle.
 type localPoller interface {
@@ -448,6 +455,66 @@ func (r *Router) ResolveModel(model string) []string {
 		}
 		return nil
 	}
+}
+
+// AdapterCapabilities returns the declared capabilities of one backend's
+// adapter, or (Capabilities{}, false) if backendID is not configured.
+func (r *Router) AdapterCapabilities(backendID string) (backend.Capabilities, bool) {
+	r.mu.RLock()
+	adp, ok := r.adapters[backendID]
+	r.mu.RUnlock()
+	if !ok {
+		return backend.Capabilities{}, false
+	}
+	return adp.Capabilities(), true
+}
+
+// FilterChainForTools narrows chain to entries that resolve to at least one
+// tool-capable backend. A tier-alias or role-chain entry whose candidate set
+// contains a mix of capable and incapable backends is kept as-is — Route's
+// own selectBest/fallback walk still needs the full candidate list at that
+// position, and per-candidate exclusion happens inside Route via the normal
+// scoring/fallback path once a caller has confirmed (via this filter) that
+// tool-bearing traffic is permitted on the chain at all.
+//
+// Returns ErrNoToolCapableBackend when chain is non-empty but resolves to no
+// tool-capable backend anywhere in it — the caller (server layer) must
+// refuse the request rather than route it through an incapable backend that
+// would silently drop the tools.
+func (r *Router) FilterChainForTools(chain []string) ([]string, error) {
+	if len(chain) == 0 {
+		return nil, ErrNoChain
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	filtered := make([]string, 0, len(chain))
+	anyCapable := false
+
+	for _, entry := range chain {
+		candidates := r.resolveChainEntry(entry)
+		entryHasCapable := false
+		for _, bid := range candidates {
+			adp, ok := r.adapters[bid]
+			if !ok {
+				continue
+			}
+			if adp.Capabilities().SupportsTools {
+				entryHasCapable = true
+				anyCapable = true
+				break
+			}
+		}
+		if entryHasCapable {
+			filtered = append(filtered, entry)
+		}
+	}
+
+	if !anyCapable {
+		return nil, ErrNoToolCapableBackend
+	}
+	return filtered, nil
 }
 
 // BackendIDs returns the IDs of all configured backends.
