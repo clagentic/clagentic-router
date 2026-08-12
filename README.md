@@ -500,6 +500,31 @@ WantedBy=multi-user.target
 If you use only API-based adapters (`anthropic_api`, `openai_api`) and do not configure
 any `claude_cli` backends, this requirement does not apply.
 
+### Redeploying: `clagentic-router update`
+
+The router is a long-running daemon — landing a change in git does not make it live.
+`clagentic-router update` rebuilds the binary from source, installs it atomically (stage
++ rename, never an in-place copy over the running binary — avoids "text file busy"), and
+restarts the service. It reuses the same config file `serve` uses (no second config
+surface); every setting is optional and defaults to a stock systemd install:
+
+```yaml
+deploy:
+  source_dir: .                                   # module root to build from (default: cwd)
+  install_path: /usr/local/bin/clagentic-router    # path the running service execs
+  service_name: clagentic-router                   # systemd unit name, without .service
+  service_manager: systemd                         # systemd | none (install only, no restart)
+```
+
+```bash
+clagentic-router update                # uses the resolved config (see "Configuration")
+clagentic-router update --config PATH   # explicit config path
+```
+
+This is the command a project's `.crew/naomi.yaml` `post_merge_steps` should invoke as a
+bare, environment-agnostic verb — all host-specific detail lives in `router.yaml`'s
+`[deploy]` block, not in the committed post-merge step.
+
 ### Docker (API-only mode)
 
 ```bash
