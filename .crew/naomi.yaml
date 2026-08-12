@@ -76,7 +76,14 @@ merge_requirements:
 # -----------------------------------------------------------------------
 # post_merge_steps  (optional — post-merge automation)
 # -----------------------------------------------------------------------
-# post_merge_steps:
-#   - cmd: "make deploy-staging"
-#     description: "Deploy to staging after merge"
-#     on_failure: warn
+# clagentic-router is a long-running daemon: a merge landing in git alone
+# does not make it live. `clagentic-router update` rebuilds the binary and
+# restarts the running service. It is a bare, environment-agnostic verb —
+# every host-specific detail (install path, service name, source checkout)
+# is resolved from the same router.yaml config chain "serve" already uses
+# (the optional [deploy] block; see router.example.yaml), never from this
+# file. No absolute paths, env-var assignments, hostnames, or service names
+# belong here.
+post_merge_steps:
+  - cmd: clagentic-router update
+    on_failure: fail

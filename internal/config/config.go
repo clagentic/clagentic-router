@@ -431,6 +431,67 @@ type LogConfig struct {
 	Format string `yaml:"format"`
 }
 
+// DeployConfig controls the optional "clagentic-router update" self-deploy
+// subcommand: rebuild the binary from source and restart the running
+// service. All fields are optional with defaults matching a stock
+// systemd install; a clean third-party install works unconfigured.
+type DeployConfig struct {
+	// SourceDir is the module root to build from. Default "." (the current
+	// working directory). The update subcommand does not fetch or check out
+	// anything itself — it builds whatever source is present at this path,
+	// which is expected to already reflect the desired revision (e.g. a
+	// post-merge automation step that runs with cwd already synced to the
+	// merged commit).
+	SourceDir string `yaml:"source_dir"`
+
+	// InstallPath is the absolute path of the installed binary that the
+	// running service executes. Default "/usr/local/bin/clagentic-router".
+	InstallPath string `yaml:"install_path"`
+
+	// ServiceName is the systemd unit name (without the .service suffix) to
+	// restart after a successful install. Default "clagentic-router".
+	// Set to "" explicitly only via ServiceManager below if not using systemd.
+	ServiceName string `yaml:"service_name"`
+
+	// ServiceManager selects how the running daemon is restarted after
+	// install: "systemd" (default) or "none" (install only, no restart —
+	// for setups where an external supervisor handles restarts).
+	ServiceManager string `yaml:"service_manager"`
+}
+
+// ResolvedSourceDir returns SourceDir, defaulting to ".".
+func (d *DeployConfig) ResolvedSourceDir() string {
+	if d.SourceDir == "" {
+		return "."
+	}
+	return d.SourceDir
+}
+
+// ResolvedInstallPath returns InstallPath, defaulting to the standard
+// systemd-unit ExecStart location for a stock install.
+func (d *DeployConfig) ResolvedInstallPath() string {
+	if d.InstallPath == "" {
+		return "/usr/local/bin/clagentic-router"
+	}
+	return d.InstallPath
+}
+
+// ResolvedServiceName returns ServiceName, defaulting to "clagentic-router".
+func (d *DeployConfig) ResolvedServiceName() string {
+	if d.ServiceName == "" {
+		return "clagentic-router"
+	}
+	return d.ServiceName
+}
+
+// ResolvedServiceManager returns ServiceManager, defaulting to "systemd".
+func (d *DeployConfig) ResolvedServiceManager() string {
+	if d.ServiceManager == "" {
+		return "systemd"
+	}
+	return d.ServiceManager
+}
+
 // Config is the top-level router configuration.
 type Config struct {
 	// Backends maps backend ID → configuration.
@@ -452,6 +513,11 @@ type Config struct {
 	Log       LogConfig       `yaml:"log"`
 	Anthropic AnthropicConfig `yaml:"anthropic"`
 	Bedrock   BedrockConfig   `yaml:"bedrock"`
+
+	// Deploy configures the optional "update" self-deploy subcommand.
+	// Every field defaults to a stock systemd install; omit entirely for
+	// that default behavior.
+	Deploy DeployConfig `yaml:"deploy"`
 
 	// RegistryPath is the path to the models registry YAML (tier alias definitions).
 	// If empty, only the Tiers map is used for resolution.

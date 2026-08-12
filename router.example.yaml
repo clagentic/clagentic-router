@@ -267,6 +267,19 @@ anthropic:
 #   region: us-east-1        # required for passthrough; Bedrock has no SDK default region
 #   # profile: env:AWS_PROFILE  # optional named AWS profile for passthrough credential resolution
 
+# --- Deploy ("clagentic-router update" self-deploy subcommand) ---
+# Entirely optional. `update` rebuilds the binary from source and restarts
+# the running service, reusing this same config file (same resolution chain
+# "serve" uses — no second config surface). Every field defaults to a stock
+# systemd install; a clean third-party install works unconfigured. Only add
+# this block if your install path, unit name, or source checkout location
+# differs from the defaults below.
+# deploy:
+#   source_dir: .                                   # module root to build from
+#   install_path: /usr/local/bin/clagentic-router    # path the running service execs
+#   service_name: clagentic-router                   # systemd unit (without .service)
+#   service_manager: systemd                         # systemd | none (install only, no restart)
+
 # --- Storage ---
 storage:
   db_path: ""   # default: $XDG_STATE_HOME/clagentic-router/state.db

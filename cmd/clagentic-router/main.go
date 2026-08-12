@@ -3,6 +3,7 @@
 // Subcommands:
 //
 //	serve [--config path]              Start the routing daemon
+//	update [--config path]             Rebuild from source and restart the running service
 //	health [--server url]              GET /health
 //	doctor [--server url]              GET /doctor  (live probes)
 //	quota  [--server url]              GET /quota
@@ -59,6 +60,8 @@ func run(args []string) error {
 	switch args[0] {
 	case "serve":
 		return cmdServe(args[1:])
+	case "update":
+		return cmdUpdate(args[1:])
 	case "health":
 		return cmdGet(args[1:], "/health")
 	case "doctor":
@@ -836,6 +839,7 @@ func printUsage() {
 
 Usage:
   clagentic-router serve [--config PATH] [--log-level debug|info|warn|error] [--unsafe-no-auth]
+  clagentic-router update [--config PATH]
   clagentic-router health  [--server URL] [--token TOKEN]
   clagentic-router doctor  [--server URL] [--token TOKEN]
   clagentic-router quota   [--server URL] [--token TOKEN]
@@ -847,6 +851,15 @@ Usage:
 
 Serve flags:
   --unsafe-no-auth  Start without authentication (development only — never use in production)
+
+Update:
+  Rebuilds the binary from source (deploy.source_dir, default ".") and
+  atomically installs it at deploy.install_path (default
+  /usr/local/bin/clagentic-router), then restarts deploy.service_name via
+  systemd (default "clagentic-router"; set deploy.service_manager: "none"
+  to install without restarting). Uses the same config resolved by "serve" —
+  add an optional [deploy] block to router.yaml only if these defaults do
+  not match your install.
 
 Environment variables:
   CLAGENTIC_ROUTER_CONFIG       Config file path (default: ./router.yaml)
