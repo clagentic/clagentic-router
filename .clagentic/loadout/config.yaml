@@ -60,6 +60,15 @@ merge:
   # pre_checks: none -- no additional pre-merge validation commands beyond
   # the reviewer-role and tests_pass gates above.
 
-  # post_merge_steps: none -- .crew/naomi.yaml declares no post_merge_steps
-  # for this repo; ship.py's pull_main/delete_branch are harness actions,
-  # not loadout post_merge_steps, and are not reproduced here.
+  # post_merge_steps: this file, under merge:, is the ONLY surface
+  # loadout-post-merge reads (clagentic-loadout
+  # src/clagentic_loadout/merge/post_merge_config.py load_post_merge_steps,
+  # resolve_repo_config_path -> <repo>/.clagentic/loadout/config.yaml,
+  # top-level merge: section, post_merge_steps: key). It has never read
+  # .crew/naomi.yaml. lr-1ffd57 added the step there instead of here, so
+  # PR #32 merged with steps_run=0 -- a silent no-op (lr-8cde5a). The
+  # .crew/naomi.yaml copy is kept transitionally per the lr-4e6f31 item 3
+  # precedent but is not read by any loadout verb.
+  post_merge_steps:
+    - cmd: clagentic-router update
+      on_failure: fail
