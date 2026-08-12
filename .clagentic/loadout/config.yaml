@@ -69,6 +69,25 @@ merge:
   # PR #32 merged with steps_run=0 -- a silent no-op (lr-8cde5a). The
   # .crew/naomi.yaml copy is kept transitionally per the lr-4e6f31 item 3
   # precedent but is not read by any loadout verb.
+  #
+  # lr-a814a5: a bare `clagentic-router update` resolves via PATH to the
+  # INSTALLED binary, which on a fresh merge still predates whatever
+  # commit just landed -- it cannot bootstrap a subcommand only the new
+  # source tree knows about (confirmed: PR #33's merge hit "unknown
+  # subcommand update" because /usr/local/bin/clagentic-router predated
+  # the update subcommand shipped in PR #32). loadout-merge always syncs
+  # the working tree to the merged SHA and runs every step with cwd set to
+  # that tree (merge.post_merge.run_post_merge_steps: `cwd=root`, `root =
+  # str(project_root)`) BEFORE any step executes, so `go run
+  # ./cmd/clagentic-router update` below builds and runs the update
+  # subcommand straight out of the just-merged source -- never the
+  # installed binary -- and is immune to this staleness class permanently.
+  # List-form cmd (an explicit argv, not a shell-quoted string) also drops
+  # the bare-PATH-resolved-name pattern BOBBIE flagged (PR #33 comment
+  # 5271770612): the first token is `go`, a toolchain binary this repo's
+  # own `make build`/`make test` already assume is on PATH, not
+  # `clagentic-router` itself.
   post_merge_steps:
-    - cmd: clagentic-router update
+    - cmd: ["go", "run", "./cmd/clagentic-router", "update"]
+      description: "rebuild+install+restart from the merged source tree (immune to installed-binary staleness; see comment above)"
       on_failure: fail
