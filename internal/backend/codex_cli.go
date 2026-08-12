@@ -51,6 +51,13 @@ func NewCodexCLIAdapter(id, model, reasoningEffort, binPathOverride string) *Cod
 
 func (a *CodexCLIAdapter) ID() string { return a.id }
 
+// Capabilities reports the codex CLI adapter's wire protocol support.
+// The subprocess path pipes a flat prompt string to stdin — no tool,
+// streaming, or image passthrough.
+func (a *CodexCLIAdapter) Capabilities() Capabilities {
+	return Capabilities{SupportsTools: false, SupportsStreaming: false, SupportsImages: false}
+}
+
 func (a *CodexCLIAdapter) resolveBin() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()

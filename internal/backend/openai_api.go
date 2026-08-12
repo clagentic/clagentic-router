@@ -79,6 +79,16 @@ func NewOpenAIAPIAdapter(id, model, apiKey, apiURL string, timeout time.Duration
 
 func (a *OpenAIAPIAdapter) ID() string { return a.id }
 
+// Capabilities reports the OpenAI Chat Completions API adapter's wire
+// protocol support. Like AnthropicAPIAdapter, this declares the adapter's
+// protocol capacity (the OpenAI API supports tool calling and vision);
+// today's router-level translation on the routed-mode path does not yet
+// forward tools/images through any adapter — see AnthropicAPIAdapter's
+// Capabilities doc for the same caveat.
+func (a *OpenAIAPIAdapter) Capabilities() Capabilities {
+	return Capabilities{SupportsTools: true, SupportsStreaming: false, SupportsImages: true}
+}
+
 // Invoke sends a request to the OpenAI Chat Completions API.
 func (a *OpenAIAPIAdapter) Invoke(ctx context.Context, req *Request) (*Response, error) {
 	if a.apiKey == "" {

@@ -26,6 +26,10 @@ func (m *mockAdapter) Invoke(ctx context.Context, req *backend.Request) (*backen
 	return m.invoke(ctx, req)
 }
 
+func (m *mockAdapter) Capabilities() backend.Capabilities {
+	return backend.Capabilities{}
+}
+
 // newTestRouter builds a minimal Router with a single mock adapter and the
 // supplied routing config. store and alertHook are nil (not needed for probe tests).
 func newTestRouter(id string, adapterFn func(ctx context.Context, req *backend.Request) (*backend.Response, error), rcfg config.RoutingConfig) *Router {

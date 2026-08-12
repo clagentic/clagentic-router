@@ -82,6 +82,13 @@ func NewGeminiCLIAdapter(id, model, binPathOverride string) *GeminiCLIAdapter {
 
 func (a *GeminiCLIAdapter) ID() string { return a.id }
 
+// Capabilities reports the gemini CLI adapter's wire protocol support.
+// The subprocess path passes a flat prompt via the -p flag — no tool,
+// streaming, or image passthrough.
+func (a *GeminiCLIAdapter) Capabilities() Capabilities {
+	return Capabilities{SupportsTools: false, SupportsStreaming: false, SupportsImages: false}
+}
+
 // resolveBin returns the gemini binary path, resolving once and caching.
 func (a *GeminiCLIAdapter) resolveBin() string {
 	a.mu.Lock()
