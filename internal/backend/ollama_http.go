@@ -60,6 +60,13 @@ func NewOllamaHTTPAdapter(id, url, model string, timeout time.Duration) *OllamaH
 
 func (a *OllamaHTTPAdapter) ID() string { return a.id }
 
+// Capabilities reports the Ollama HTTP adapter's wire protocol support.
+// The request body sent by this adapter carries plain text messages only —
+// no tools or image content blocks.
+func (a *OllamaHTTPAdapter) Capabilities() Capabilities {
+	return Capabilities{SupportsTools: false, SupportsStreaming: false, SupportsImages: false}
+}
+
 // Invoke sends a chat request to the Ollama API.
 func (a *OllamaHTTPAdapter) Invoke(ctx context.Context, req *Request) (*Response, error) {
 	msgs := make([]ollamaMessage, 0, len(req.Messages))

@@ -214,6 +214,88 @@ func TestBedrockInvokeStream_Routed_EventStreamFraming(t *testing.T) {
 	}
 }
 
+// --- routed mode: tool-capability refusal (lr-be9454) ---
+
+// TestBedrockInvoke_ToolsWithNoCapableBackend_Returns422 verifies the same
+// refusal behavior as messagesRouted/chatCompletions: a tools-bearing
+// Bedrock InvokeModel request against a chain with no tool-capable backend
+// must be refused, never routed with tools silently dropped.
+func TestBedrockInvoke_ToolsWithNoCapableBackend_Returns422(t *testing.T) {
+	ts, cleanup := newBedrockTestServer(t)
+	defer cleanup()
+
+	// newBedrockTestServer's "reviewer-chain" is backed by a stubAdapter with
+	// the zero-value supportsTools (false) — no backend in the chain is
+	// tool-capable.
+	resp := doBedrockInvoke(t, ts, "/model/role:reviewer-chain/invoke", "x-api-key", "secret", map[string]interface{}{
+		"max_tokens": 1,
+		"tools":      []map[string]string{{"name": "some_tool"}},
+		"messages":   []map[string]string{{"role": "user", "content": "use a tool"}},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status: want 422, got %d", resp.StatusCode)
+	}
+
+	var body bedrockErrorEnvelope
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	if body.Message == "" {
+		t.Error("expected a non-empty error message")
+	}
+}
+
+func TestBedrockInvoke_ToolsWithCapableBackend_Succeeds(t *testing.T) {
+	cfg := &config.Config{
+		Backends: map[string]*config.BackendConfig{
+			"tool-backend": {Adapter: "stub", CostWeight: 1.0},
+		},
+		Chains: map[string][]string{
+			"reviewer-chain": {"tool-backend"},
+		},
+		Routing: config.RoutingConfig{
+			Strategy:                   "scored",
+			QuotaWarningThreshold:      0.2,
+			HealthProbeIntervalSeconds: 3600,
+			DegradedFailureThreshold:   3,
+			OfflineFailureThreshold:    6,
+		},
+	}
+	adapters := map[string]backend.Adapter{
+		"tool-backend": &stubAdapter{id: "tool-backend", supportsTools: true},
+	}
+	r := router.New(cfg, adapters, nil, nil)
+	srv := New(":0", "secret", "secret", false, r, nil, "https://api.anthropic.com", "", "", "")
+	ts := httptest.NewServer(srv.httpServer.Handler)
+	defer ts.Close()
+
+	resp := doBedrockInvoke(t, ts, "/model/role:reviewer-chain/invoke", "x-api-key", "secret", map[string]interface{}{
+		"max_tokens": 1,
+		"tools":      []map[string]string{{"name": "some_tool"}},
+		"messages":   []map[string]string{{"role": "user", "content": "use a tool"}},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: want 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestBedrockInvoke_EmptyToolsArray_NotTreatedAsToolsPresent(t *testing.T) {
+	ts, cleanup := newBedrockTestServer(t)
+	defer cleanup()
+
+	resp := doBedrockInvoke(t, ts, "/model/role:reviewer-chain/invoke", "x-api-key", "secret", map[string]interface{}{
+		"max_tokens": 1,
+		"tools":      []map[string]string{},
+		"messages":   []map[string]string{{"role": "user", "content": "hi"}},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: want 200, got %d", resp.StatusCode)
+	}
+}
+
 // --- passthrough mode (not configured) ---
 
 // TestBedrockInvoke_Passthrough_NotConfigured_Returns503 verifies the

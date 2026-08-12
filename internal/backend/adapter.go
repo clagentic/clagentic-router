@@ -97,6 +97,30 @@ func (e *InvokeError) Error() string {
 	return fmt.Sprintf("%s: %s", e.Type, e.Raw)
 }
 
+// Capabilities declares what an adapter's wire protocol can carry, independent
+// of any single request. Values are static per adapter — they describe the
+// adapter's transport contract, not per-backend config or runtime state.
+//
+// This is deliberately generic: it describes protocol capability only, never
+// a specific consumer's roles, config keys, or naming scheme.
+type Capabilities struct {
+	// SupportsTools is true when the adapter's Invoke path can carry tool
+	// definitions and round-trip tool_use/tool_result content to the
+	// provider. False means any tools attached to a request would be
+	// silently dropped if sent through this adapter — callers MUST NOT do
+	// that; see router chain filtering.
+	SupportsTools bool
+	// SupportsStreaming is true when the adapter can stream incremental
+	// output. All current adapters return complete responses (Invoke is
+	// synchronous), so this is false everywhere today; the field exists so
+	// a future streaming-capable adapter can declare it without an
+	// interface change.
+	SupportsStreaming bool
+	// SupportsImages is true when the adapter's Invoke path can carry
+	// multimodal (image) content blocks through to the provider.
+	SupportsImages bool
+}
+
 // Adapter is the interface all backend adapters implement.
 type Adapter interface {
 	// ID returns the backend identifier (matches config key).
@@ -104,6 +128,10 @@ type Adapter interface {
 	// Invoke sends the request to the LLM and returns the response.
 	// Returns *InvokeError on failure.
 	Invoke(ctx context.Context, req *Request) (*Response, error)
+	// Capabilities reports what this adapter's wire protocol supports.
+	// The returned value is static (does not depend on req or runtime
+	// state) — see Capabilities doc for field semantics.
+	Capabilities() Capabilities
 }
 
 // FormatMessages converts a messages slice into a prompt string for CLI-based adapters.

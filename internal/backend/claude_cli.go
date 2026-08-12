@@ -285,6 +285,13 @@ func NewClaudeCLIAdapter(id, model, binPathOverride string, effort EffortLevel, 
 
 func (a *ClaudeCLIAdapter) ID() string { return a.id }
 
+// Capabilities reports the claude CLI adapter's wire protocol support.
+// The subprocess path formats messages into a flat prompt string (see
+// FormatMessages) with no tool, streaming, or image passthrough.
+func (a *ClaudeCLIAdapter) Capabilities() Capabilities {
+	return Capabilities{SupportsTools: false, SupportsStreaming: false, SupportsImages: false}
+}
+
 // resolveBin returns the claude binary path, resolving once and caching.
 func (a *ClaudeCLIAdapter) resolveBin() string {
 	a.mu.Lock()

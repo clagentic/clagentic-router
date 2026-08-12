@@ -20,12 +20,20 @@ import (
 )
 
 // stubAdapter is a no-op backend.Adapter used to register a backend with the
-// router without requiring any real LLM credentials.
-type stubAdapter struct{ id string }
+// router without requiring any real LLM credentials. supportsTools controls
+// the value returned by Capabilities().SupportsTools (zero value: false,
+// matching the CLI-adapter default used by most tests).
+type stubAdapter struct {
+	id            string
+	supportsTools bool
+}
 
 func (s *stubAdapter) ID() string { return s.id }
 func (s *stubAdapter) Invoke(_ context.Context, _ *backend.Request) (*backend.Response, error) {
 	return &backend.Response{Content: "stub"}, nil
+}
+func (s *stubAdapter) Capabilities() backend.Capabilities {
+	return backend.Capabilities{SupportsTools: s.supportsTools}
 }
 
 // newTestServer constructs a minimal Server backed by a real Router with one

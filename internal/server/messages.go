@@ -46,6 +46,14 @@ type anthropicMsgRequest struct {
 	System    json.RawMessage       `json:"system,omitempty"`
 	MaxTokens int                   `json:"max_tokens"`
 	Stream    bool                  `json:"stream,omitempty"`
+	// Tools is decoded only far enough to detect presence — routed mode
+	// (messagesRouted) does not translate tool definitions to the backend
+	// (see anthropicToBackendMessages). A tools-bearing request must be
+	// refused when the resolved chain has no tool-capable backend rather
+	// than silently dropped; see messagesRouted's tool-capability check.
+	// Passthrough mode is unaffected: it forwards the original request
+	// bytes (including tools) unmodified, never decoding this field.
+	Tools json.RawMessage `json:"tools,omitempty"`
 }
 
 type anthropicMsgMessage struct {
@@ -279,6 +287,23 @@ func (h *Handler) messagesRouted(w http.ResponseWriter, r *http.Request, req *an
 	if len(req.Messages) == 0 {
 		writeAnthropicError(w, http.StatusBadRequest, "messages is required")
 		return
+	}
+
+	if hasTools(req.Tools) {
+		filtered, err := h.router.FilterChainForTools(chain)
+		if err != nil {
+			if err == router.ErrNoToolCapableBackend {
+				writeAnthropicError(w, http.StatusUnprocessableEntity,
+					fmt.Sprintf("request carries tools but model %q resolves to no tool-capable backend in routed mode; "+
+						"remove tools, or send this request to %s directly (passthrough forwards tools intact)",
+						req.Model, "a non-role:/chain:/backend:-prefixed model"))
+				return
+			}
+			writeAnthropicError(w, http.StatusBadRequest,
+				fmt.Sprintf("model %q did not resolve to any configured backends", req.Model))
+			return
+		}
+		chain = filtered
 	}
 
 	msgs, err := anthropicToBackendMessages(req)

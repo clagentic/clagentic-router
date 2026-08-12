@@ -36,6 +36,10 @@ func (f *fakeAdapter) Invoke(_ context.Context, _ *Request) (*Response, error) {
 	return &Response{Content: "x"}, nil
 }
 
+func (f *fakeAdapter) Capabilities() Capabilities {
+	return Capabilities{}
+}
+
 func (f *fakeAdapter) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()

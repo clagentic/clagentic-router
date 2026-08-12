@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -76,6 +77,23 @@ type chatCompletionRequest struct {
 	Messages  []backend.Message `json:"messages"`
 	MaxTokens int               `json:"max_tokens,omitempty"`
 	Stream    bool              `json:"stream,omitempty"`
+	// Tools is decoded only far enough to detect presence (any non-null,
+	// non-empty-array JSON value) — the router's routed-mode translation
+	// does not carry tool definitions through to a backend today. A
+	// non-empty Tools value must route only to a tool-capable backend or be
+	// refused outright; see chatCompletions' tool-capability check.
+	Tools json.RawMessage `json:"tools,omitempty"`
+}
+
+// hasTools reports whether raw is a present, non-null, non-empty-array JSON
+// value. Mirrors the same "detect presence without deep validation" approach
+// used for the Anthropic Messages "system" field in messages.go.
+func hasTools(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	trimmed := strings.TrimSpace(string(raw))
+	return trimmed != "" && trimmed != "null" && trimmed != "[]"
 }
 
 type chatCompletionResponse struct {
@@ -172,6 +190,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if hasTools(req.Tools) {
+		filtered, err := h.router.FilterChainForTools(chain)
+		if err != nil {
+			if errors.Is(err, router.ErrNoToolCapableBackend) {
+				writeError(w, http.StatusUnprocessableEntity, "no_tool_capable_backend",
+					fmt.Sprintf("request carries tools but model %q resolves to no tool-capable backend; "+
+						"remove tools or route to a backend whose adapter declares Capabilities().SupportsTools", req.Model))
+				return
+			}
+			writeError(w, http.StatusBadRequest, "unknown_model",
+				fmt.Sprintf("model %q did not resolve to any configured backends", req.Model))
+			return
+		}
+		chain = filtered
+	}
+
 	routerReq := &backend.Request{
 		Messages:  req.Messages,
 		MaxTokens: req.MaxTokens,
@@ -222,16 +256,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// models handles GET /v1/models — lists all configured backends with status.
+// models handles GET /v1/models — lists all configured backends with status
+// and capabilities.
+//
+// The capabilities object lets a caller do pre-flight discovery: know before
+// sending whether a given backend can carry tools, so a tool-bearing request
+// can be routed correctly instead of hitting the routed-mode refusal at
+// request time. Extending this existing endpoint (rather than adding a new
+// one) keeps status and capability discovery in the same read, since a
+// caller choosing a backend needs both together.
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	snaps := h.router.AllSnapshots()
 	type modelData struct {
-		ID     string      `json:"id"`
-		Object string      `json:"object"`
-		Router interface{} `json:"router"`
+		ID           string      `json:"id"`
+		Object       string      `json:"object"`
+		Router       interface{} `json:"router"`
+		Capabilities interface{} `json:"capabilities"`
 	}
 	models := make([]modelData, 0, len(snaps))
 	for id, snap := range snaps {
+		caps, _ := h.router.AdapterCapabilities(id)
 		models = append(models, modelData{
 			ID:     id,
 			Object: "model",
@@ -244,6 +288,11 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 				"last_error_type":      string(snap.LastErrorType),
 				"session_cost_usd":     snap.SessionCostUSDEst,
 				"total_calls":          snap.TotalCalls,
+			},
+			Capabilities: map[string]interface{}{
+				"supports_tools":     caps.SupportsTools,
+				"supports_streaming": caps.SupportsStreaming,
+				"supports_images":    caps.SupportsImages,
 			},
 		})
 	}

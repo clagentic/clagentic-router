@@ -16,14 +16,18 @@ import (
 
 // mockAdapter implements backend.Adapter and allows controlling Invoke outcomes.
 type mockAdapter struct {
-	id      string
-	invoke  func(ctx context.Context, req *backend.Request) (*backend.Response, error)
+	id     string
+	invoke func(ctx context.Context, req *backend.Request) (*backend.Response, error)
 }
 
 func (m *mockAdapter) ID() string { return m.id }
 
 func (m *mockAdapter) Invoke(ctx context.Context, req *backend.Request) (*backend.Response, error) {
 	return m.invoke(ctx, req)
+}
+
+func (m *mockAdapter) Capabilities() backend.Capabilities {
+	return backend.Capabilities{}
 }
 
 // newTestRouter builds a minimal Router with a single mock adapter and the
@@ -261,4 +265,3 @@ func TestOfflineRecoveryProbe_SoftFailureCascadeHeals(t *testing.T) {
 			bs.Snapshot().Status)
 	}
 }
-

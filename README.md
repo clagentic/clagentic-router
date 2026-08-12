@@ -109,7 +109,7 @@ graph LR
 | POST | /v1/messages | Anthropic Messages API — passthrough or `role:*` routed (see below) |
 | POST | /model/{modelId}/invoke | AWS Bedrock Runtime InvokeModel — passthrough or `role:*` routed (see below) |
 | POST | /model/{modelId}/invoke-with-response-stream | AWS Bedrock Runtime InvokeModelWithResponseStream — passthrough or `role:*` routed (see below) |
-| GET | /v1/models | List all backends with status |
+| GET | /v1/models | List all backends with status and capabilities |
 | GET | /v1/capacity | Per-backend capacity snapshot (utilization, reset time, score) |
 | GET | /health | Aggregated health (cached) |
 | GET | /doctor | Live probe of all backends |
@@ -158,13 +158,48 @@ included), the endpoint has two modes, selected by the request's `model` field:
 
 ### Known limitation — routed mode only
 
-Routed models lose tool-calling and true token streaming: the router's CLI
-adapters are request/response, not streaming, and tool-use content blocks are
-dropped in translation (only `text` blocks survive). This makes routed mode
-suitable for **one-shot review/audit roles** (`role:reviewer-chain`,
-`role:auditor-chain` — see `router.example.yaml`), and **wrong for a
-tool-using builder role**. Passthrough mode has none of these limitations —
-it is a byte-for-byte proxy.
+Routed models lose true token streaming — the router's CLI adapters are
+request/response, not streaming — and, as of this writing, no adapter
+round-trips tool_use/tool_result content on a routed *multi-turn* call. This
+makes routed mode suitable for **one-shot review/audit roles**
+(`role:reviewer-chain`, `role:auditor-chain` — see `router.example.yaml`).
+Passthrough mode has none of these limitations — it is a byte-for-byte proxy.
+
+**Tool-bearing requests are refused, never silently degraded.** If a routed
+request's `tools` field is present and the resolved chain has no
+tool-capable backend (see [Adapter capabilities](#adapter-capabilities)
+below), the router returns `422 no_tool_capable_backend` naming the reason —
+it never returns a `200` with the tools silently dropped. As of this
+writing, **no configured adapter declares `supports_tools: true`**: every
+adapter's own wire code sends plain-text messages and reads plain-text
+responses only, so every routed tool-bearing request is refused today,
+regardless of which chain it targets. Use passthrough mode for tool-using
+clients — it forwards tools untouched.
+
+### Adapter capabilities
+
+`GET /v1/models` includes a `capabilities` object per backend so a caller can
+check tool/streaming/image support **before** sending a request:
+
+```json
+{
+  "id": "claude-api",
+  "capabilities": {
+    "supports_tools": false,
+    "supports_streaming": false,
+    "supports_images": false
+  }
+}
+```
+
+Every adapter today declares `supports_tools: false` and
+`supports_images: false` — not because the underlying provider APIs lack
+tool/vision support, but because none of this router's adapters currently
+marshal a `tools` field or a non-text content block on the request, or parse
+one back out of the response (each adapter's `Capabilities()` doc explains
+its specific gap). `Capabilities()` exists as the honest, queryable signal
+of that state and the seam a future adapter would flip to `true` once it
+actually wires tool passthrough — not a router-level translation flag.
 
 ### Config
 
@@ -198,6 +233,15 @@ Same asymmetric shape as `/v1/messages`:
   resolves (see Config below), not by any credential the client presents.
 - **Routed mode**: requires the router's own inference token, presented as
   `x-api-key: <token>` OR `Authorization: Bearer <token>`.
+
+### Tools
+
+Same refusal behavior as `/v1/messages` routed mode: if the request body's
+`tools` field is present and the resolved chain has no tool-capable backend
+(see [Adapter capabilities](#adapter-capabilities)), the router returns
+`422` (Bedrock error envelope: `{"message": "..."}`) rather than a `200`
+with tools silently dropped. Passthrough forwards `tools` untouched — this
+check only applies to `role:*`/`chain:*`/`backend:*` model IDs.
 
 ### Config
 
@@ -245,6 +289,14 @@ Python SDK, openai-node, and any standard SSE client.
 
 **Note:** the current implementation delivers the complete response as a single SSE
 event (one content chunk followed by `[DONE]`). Token-by-token streaming is planned.
+
+### Tools
+
+`/v1/chat/completions` accepts an OpenAI-shaped `tools` field. If `tools` is
+present and non-empty and the resolved chain has no tool-capable backend
+(see [Adapter capabilities](#adapter-capabilities)), the request is refused
+with `422 no_tool_capable_backend` rather than routed to a backend that would
+silently drop the tools.
 
 ## Response headers
 

@@ -42,6 +42,14 @@ func NewCodexSubagentAdapter(id, tier, binPathOverride string) *CodexSubagentAda
 
 func (a *CodexSubagentAdapter) ID() string { return a.id }
 
+// Capabilities reports the codex-subagent adapter's wire protocol support.
+// Like the direct codex CLI path, this pipes a flat prompt through the
+// claude -p --agent codex invocation — no tool, streaming, or image
+// passthrough.
+func (a *CodexSubagentAdapter) Capabilities() Capabilities {
+	return Capabilities{SupportsTools: false, SupportsStreaming: false, SupportsImages: false}
+}
+
 func (a *CodexSubagentAdapter) resolveBin() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
