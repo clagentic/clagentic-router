@@ -16,8 +16,8 @@ import (
 
 // mockAdapter implements backend.Adapter and allows controlling Invoke outcomes.
 type mockAdapter struct {
-	id      string
-	invoke  func(ctx context.Context, req *backend.Request) (*backend.Response, error)
+	id     string
+	invoke func(ctx context.Context, req *backend.Request) (*backend.Response, error)
 }
 
 func (m *mockAdapter) ID() string { return m.id }
@@ -265,4 +265,3 @@ func TestOfflineRecoveryProbe_SoftFailureCascadeHeals(t *testing.T) {
 			bs.Snapshot().Status)
 	}
 }
-

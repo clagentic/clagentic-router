@@ -462,3 +462,87 @@ func mustMarshal(t *testing.T, v interface{}) []byte {
 	}
 	return data
 }
+
+// --- Routed mode: tool-capability refusal (lr-be9454) ---
+
+func TestMessages_Routed_ToolsWithNoCapableBackend_Returns422(t *testing.T) {
+	ts, cleanup := newMessagesTestServer(t, "http://unused.invalid")
+	defer cleanup()
+
+	// newMessagesTestServer's "reviewer-chain" is backed by a stubAdapter with
+	// the zero-value supportsTools (false) — no backend in the chain is
+	// tool-capable, so a tools-bearing request must be refused, never
+	// silently routed with tools dropped.
+	resp := doMessagesRequest(t, ts, "x-api-key", "secret", map[string]interface{}{
+		"model":      "role:reviewer-chain",
+		"max_tokens": 100,
+		"tools":      []map[string]string{{"name": "some_tool"}},
+		"messages":   []map[string]string{{"role": "user", "content": "use a tool"}},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status: want 422, got %d", resp.StatusCode)
+	}
+
+	var errBody anthropicMsgError
+	if err := json.NewDecoder(resp.Body).Decode(&errBody); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	if errBody.Type != "error" {
+		t.Errorf("type: want error, got %q", errBody.Type)
+	}
+}
+
+func TestMessages_Routed_ToolsWithCapableBackend_Succeeds(t *testing.T) {
+	cfg := &config.Config{
+		Backends: map[string]*config.BackendConfig{
+			"tool-backend": {Adapter: "stub", CostWeight: 1.0},
+		},
+		Chains: map[string][]string{
+			"reviewer-chain": {"tool-backend"},
+		},
+		Routing: config.RoutingConfig{
+			Strategy:                   "scored",
+			QuotaWarningThreshold:      0.2,
+			HealthProbeIntervalSeconds: 3600,
+			DegradedFailureThreshold:   3,
+			OfflineFailureThreshold:    6,
+		},
+	}
+	adapters := map[string]backend.Adapter{
+		"tool-backend": &stubAdapter{id: "tool-backend", supportsTools: true},
+	}
+	r := router.New(cfg, adapters, nil, nil)
+	srv := New(":0", "secret", "secret", false, r, nil, "http://unused.invalid", "", "", "")
+	ts := httptest.NewServer(srv.httpServer.Handler)
+	defer ts.Close()
+
+	resp := doMessagesRequest(t, ts, "x-api-key", "secret", map[string]interface{}{
+		"model":      "role:reviewer-chain",
+		"max_tokens": 100,
+		"tools":      []map[string]string{{"name": "some_tool"}},
+		"messages":   []map[string]string{{"role": "user", "content": "use a tool"}},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: want 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestMessages_Routed_EmptyToolsArray_NotTreatedAsToolsPresent(t *testing.T) {
+	ts, cleanup := newMessagesTestServer(t, "http://unused.invalid")
+	defer cleanup()
+
+	// An empty tools array is not "tools present" — must route normally
+	// through the no-tool-capable-backend chain without refusal.
+	resp := doMessagesRequest(t, ts, "x-api-key", "secret", map[string]interface{}{
+		"model":      "role:reviewer-chain",
+		"max_tokens": 100,
+		"tools":      []map[string]string{},
+		"messages":   []map[string]string{{"role": "user", "content": "hi"}},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: want 200, got %d", resp.StatusCode)
+	}
+}
