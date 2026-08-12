@@ -91,12 +91,14 @@ func newBedrockAPIAdapterWithClient(id, model string, client bedrockConverseClie
 func (a *BedrockAPIAdapter) ID() string { return a.id }
 
 // Capabilities reports the Bedrock Converse API adapter's wire protocol
-// support. The Converse API supports tool use and multimodal content across
-// both hosted model families; this declares the adapter's protocol capacity,
-// not today's router-level translation — see AnthropicAPIAdapter's
-// Capabilities doc for the same caveat.
+// support. Unlike AnthropicAPIAdapter/OpenAIAPIAdapter, this adapter's own
+// Invoke implementation builds text-only content blocks and never sends a
+// ToolConfig — tool use and image content are genuinely out of scope for
+// this adapter today (see Invoke and bedrockOutputText), not merely
+// untranslated by the router layer above it. Declaring true here would be
+// inaccurate.
 func (a *BedrockAPIAdapter) Capabilities() Capabilities {
-	return Capabilities{SupportsTools: true, SupportsStreaming: false, SupportsImages: true}
+	return Capabilities{SupportsTools: false, SupportsStreaming: false, SupportsImages: false}
 }
 
 // Invoke sends a request to the Bedrock Converse API.

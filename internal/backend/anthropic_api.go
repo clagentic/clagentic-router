@@ -108,13 +108,15 @@ func NewAnthropicAPIAdapter(id, model, apiKey, apiURL string, timeout time.Durat
 func (a *AnthropicAPIAdapter) ID() string { return a.id }
 
 // Capabilities reports the Anthropic Messages API adapter's wire protocol
-// support. The underlying Anthropic API supports tool use, multimodal
-// content, and streaming; this declares the adapter's protocol capacity, not
-// today's router-level translation, which does not yet forward tools/images
-// on the routed-mode path (internal/server/messages.go) — that is the
-// refusal-vs-drop gap this capability model exists to make explicit.
+// support. Although the underlying Anthropic API supports tool use and
+// multimodal content, this adapter's own Invoke sends plain-text messages
+// only (anthropicMessage.Content is a string, no tools field is ever
+// marshaled) and its response parsing keeps only "text" content blocks (see
+// Invoke below) — so SupportsTools/SupportsImages are false here, matching
+// what this adapter actually does on the wire today, not the provider's
+// theoretical ceiling.
 func (a *AnthropicAPIAdapter) Capabilities() Capabilities {
-	return Capabilities{SupportsTools: true, SupportsStreaming: false, SupportsImages: true}
+	return Capabilities{SupportsTools: false, SupportsStreaming: false, SupportsImages: false}
 }
 
 // Invoke sends a request to the Anthropic Messages API.
