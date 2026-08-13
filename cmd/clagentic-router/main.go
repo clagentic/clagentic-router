@@ -391,7 +391,22 @@ func buildAdapter(id string, b *config.BackendConfig) (backend.Adapter, error) {
 		// can never block adapter construction.
 		providerID, projectID := backend.DiscoverCodexProjectHeader(
 			context.Background(), b.CodexProviderID, b.OpenAIProjectID, b.ResolvedOpenAIAPIKey())
-		return backend.NewCodexCLIAdapter(id, b.Model, b.ReasoningEffort, providerID, projectID, b.BinPath), nil
+
+		model := b.Model
+		if model == "" {
+			// Model discovery (lr-82e68e) is purely additive: it only
+			// engages when the operator has not pinned an explicit model
+			// string. Resolve the codex binary once here so both discovery
+			// and the adapter itself share one resolved path (avoids a
+			// duplicate "binary resolved" log line from ResolveBinPath).
+			bin := backend.ResolveBinPath("codex", b.BinPath, "CODEX_BIN")
+			resolved, err := backend.ResolveCodexModel(context.Background(), bin, b.ResolvedModelRank())
+			if err != nil {
+				return nil, fmt.Errorf("codex_cli: resolve model (rank %d): %w", b.ResolvedModelRank(), err)
+			}
+			model = resolved
+		}
+		return backend.NewCodexCLIAdapter(id, model, b.ReasoningEffort, providerID, projectID, b.BinPath), nil
 
 	case config.AdapterCodexSubagent:
 		return backend.NewCodexSubagentAdapter(id, b.Tier, b.BinPath), nil
