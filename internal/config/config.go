@@ -157,6 +157,23 @@ type BackendConfig struct {
 	// header injection.
 	OpenAIProjectID string `yaml:"openai_project_id"`
 
+	// ModelRank is an OPTIONAL 0-indexed, best-first preference used to
+	// select a model automatically from `codex debug models` when Model is
+	// unset. Only used by codex_cli. Matches the ordered-list idiom Tiers
+	// and Chains already use to express preference (config.go Tiers/Chains
+	// fields): rank 0 is the best available model, rank 1 the next best,
+	// and so on — resolved by SORTED POSITION within the filtered catalog,
+	// never by matching a literal codex `priority` value (those are
+	// provider-specific and not comparable across providers or hosts).
+	//
+	// A pointer so nil (absent from YAML) is distinguishable from an
+	// explicit 0 — same pattern as
+	// RoutingConfig.OfflineRecoveryProbeIntervalSeconds. Absent AND Model
+	// unset defaults to rank 0 (best available). Ignored entirely when
+	// Model is set: explicit Model always wins, byte-identical, zero
+	// discovery attempted. See internal/backend/codex_model_discovery.go.
+	ModelRank *int `yaml:"model_rank"`
+
 	// CostWeight is the routing preference multiplier. Higher = preferred.
 	// Default 1.0. Free local backends should be 1.5; expensive flagship 0.3–0.4.
 	CostWeight float64 `yaml:"cost_weight"`
@@ -228,6 +245,18 @@ func (b *BackendConfig) ResolvedAPIKey() string {
 // ResolvedOpenAIAPIKey returns the OpenAI API key, resolving env: references.
 func (b *BackendConfig) ResolvedOpenAIAPIKey() string {
 	return ResolveEnvRef(b.OpenAIAPIKey)
+}
+
+// ResolvedModelRank returns ModelRank, defaulting to 0 (best available) when
+// absent from YAML. The pointer distinguishes absent from an explicit 0;
+// this method collapses that back to a plain int for callers that only care
+// about "which rank to resolve," matching RoutingConfig's
+// OfflineRecoveryProbeInterval() pattern.
+func (b *BackendConfig) ResolvedModelRank() int {
+	if b.ModelRank == nil {
+		return 0
+	}
+	return *b.ModelRank
 }
 
 // RoutingConfig controls the routing and health-check behavior.
