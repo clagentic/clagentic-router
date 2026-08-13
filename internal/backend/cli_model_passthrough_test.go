@@ -160,7 +160,7 @@ func TestCodexCLI_ModelPassthrough(t *testing.T) {
 			// codex writes plain text stdout
 			binPath := writeFakeBin(t, dir, "codex", "response from codex")
 
-			adapter := NewCodexCLIAdapter("test", tc.model, "", binPath)
+			adapter := NewCodexCLIAdapter("test", tc.model, "", "", "", binPath)
 			req := &Request{Messages: []Message{{Role: "user", Content: "ping"}}}
 
 			resp, err := adapter.Invoke(context.Background(), req)

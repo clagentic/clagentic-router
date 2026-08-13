@@ -381,7 +381,7 @@ func buildAdapter(id string, b *config.BackendConfig) (backend.Adapter, error) {
 			backend.EffortLevel(b.Effort), backend.ThinkingMode(b.ThinkingMode)), nil
 
 	case config.AdapterCodexCLI:
-		return backend.NewCodexCLIAdapter(id, b.Model, b.ReasoningEffort, b.BinPath), nil
+		return backend.NewCodexCLIAdapter(id, b.Model, b.ReasoningEffort, b.CodexProviderID, b.OpenAIProjectID, b.BinPath), nil
 
 	case config.AdapterCodexSubagent:
 		return backend.NewCodexSubagentAdapter(id, b.Tier, b.BinPath), nil

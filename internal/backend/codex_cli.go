@@ -1,10 +1,20 @@
 // internal/backend/codex_cli.go — adapter for the codex CLI (OAuth auth, direct model).
 //
 // Invokes: codex exec --skip-git-repo-check --color never [--model <m>]
-//          [-c model_reasoning_effort="<e>"] - < prompt
+// [-c model_reasoning_effort="<e>"]
+// [-c model_providers.<id>.http_headers={"OpenAI-Project"="<project>"}] - < prompt
 //
 // The trailing "-" tells codex exec to read the prompt from stdin.
 // Output is written to stdout.
+//
+// The http_headers override is additive and opt-in: it is only emitted when
+// both providerID and projectID are non-empty. It exists to attribute
+// per-caller Bedrock-mode traffic against a real OpenAI project registry
+// entry when model_provider is a custom (non-reserved) provider id — codex
+// rejects the same override against a reserved builtin provider. The router
+// treats both values as opaque operator-supplied strings; it does not read,
+// parse, or validate the local codex config.toml, and does not know or care
+// what provider or endpoint sits behind providerID.
 //
 // This is the "openai-via-codex" provider path from the relay registry.
 // For the codex subagent (openai-via-codex-subagent), use CodexSubagentAdapter.
@@ -33,6 +43,8 @@ type CodexCLIAdapter struct {
 	id              string
 	model           string
 	reasoningEffort string
+	providerID      string
+	projectID       string
 
 	mu      sync.Mutex
 	binPath string
@@ -40,9 +52,13 @@ type CodexCLIAdapter struct {
 
 // NewCodexCLIAdapter creates a new adapter for the given backend ID.
 // model and reasoningEffort may be empty.
+// providerID and projectID may be empty; the OpenAI-Project header override
+// is only emitted when both are non-empty (see package doc). providerID is
+// the model_providers.<id> key in the operator's local codex config.toml;
+// projectID is the header value. Both are opaque operator-supplied strings.
 // binPathOverride is the explicit path to the codex binary (empty = auto-resolve).
-func NewCodexCLIAdapter(id, model, reasoningEffort, binPathOverride string) *CodexCLIAdapter {
-	a := &CodexCLIAdapter{id: id, model: model, reasoningEffort: reasoningEffort}
+func NewCodexCLIAdapter(id, model, reasoningEffort, providerID, projectID, binPathOverride string) *CodexCLIAdapter {
+	a := &CodexCLIAdapter{id: id, model: model, reasoningEffort: reasoningEffort, providerID: providerID, projectID: projectID}
 	// Resolve and log the binary path at construction time so misconfigurations
 	// surface in the startup log rather than silently at first invoke.
 	a.binPath = ResolveBinPath("codex", binPathOverride, "CODEX_BIN")
@@ -104,6 +120,9 @@ func (a *CodexCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response, 
 	}
 	if a.reasoningEffort != "" {
 		args = append(args, "-c", fmt.Sprintf(`model_reasoning_effort="%s"`, a.reasoningEffort))
+	}
+	if a.providerID != "" && a.projectID != "" {
+		args = append(args, "-c", fmt.Sprintf(`model_providers.%s.http_headers={"OpenAI-Project"="%s"}`, a.providerID, a.projectID))
 	}
 	args = append(args, "-") // read from stdin
 

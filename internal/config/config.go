@@ -130,6 +130,22 @@ type BackendConfig struct {
 	// Use "env:VAR_NAME" to read from env.
 	OpenAIAPIKey string `yaml:"openai_api_key"`
 
+	// CodexProviderID is the model_providers.<id> key in the operator's local
+	// codex config.toml whose http_headers should be patched with an
+	// OpenAI-Project header at invoke time. Only used by codex_cli, and only
+	// when OpenAIProjectID is also set. Empty (default) means no header
+	// injection — zero behavior change. The router does not read or validate
+	// codex config.toml; this is an opaque operator-supplied provider id
+	// passed straight to a -c override flag.
+	CodexProviderID string `yaml:"codex_provider_id"`
+
+	// OpenAIProjectID is the value injected as the OpenAI-Project header via
+	// CodexProviderID's http_headers override. Only used by codex_cli, and
+	// only when CodexProviderID is also set. Empty (default) means no header
+	// injection. Opaque operator-supplied string; the router does not
+	// interpret or validate it.
+	OpenAIProjectID string `yaml:"openai_project_id"`
+
 	// CostWeight is the routing preference multiplier. Higher = preferred.
 	// Default 1.0. Free local backends should be 1.5; expensive flagship 0.3–0.4.
 	CostWeight float64 `yaml:"cost_weight"`
