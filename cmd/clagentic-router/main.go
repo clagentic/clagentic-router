@@ -381,7 +381,17 @@ func buildAdapter(id string, b *config.BackendConfig) (backend.Adapter, error) {
 			backend.EffortLevel(b.Effort), backend.ThinkingMode(b.ThinkingMode)), nil
 
 	case config.AdapterCodexCLI:
-		return backend.NewCodexCLIAdapter(id, b.Model, b.ReasoningEffort, b.CodexProviderID, b.OpenAIProjectID, b.BinPath), nil
+		// Discovery is cached at construction time (never per-Invoke): reads
+		// the operator's local codex config.toml for the provider id and, if
+		// resolved, makes one live Bedrock mantle project-list call. Both
+		// yaml fields remain honored as explicit overrides for the
+		// ambiguous multi-provider/multi-project case; the default path
+		// (both unset) needs zero operator config. Any discovery failure
+		// degrades to an empty pair — see codex_discovery.go doc — so this
+		// can never block adapter construction.
+		providerID, projectID := backend.DiscoverCodexProjectHeader(
+			context.Background(), b.CodexProviderID, b.OpenAIProjectID, b.ResolvedOpenAIAPIKey())
+		return backend.NewCodexCLIAdapter(id, b.Model, b.ReasoningEffort, providerID, projectID, b.BinPath), nil
 
 	case config.AdapterCodexSubagent:
 		return backend.NewCodexSubagentAdapter(id, b.Tier, b.BinPath), nil
