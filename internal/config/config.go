@@ -130,20 +130,31 @@ type BackendConfig struct {
 	// Use "env:VAR_NAME" to read from env.
 	OpenAIAPIKey string `yaml:"openai_api_key"`
 
-	// CodexProviderID is the model_providers.<id> key in the operator's local
-	// codex config.toml whose http_headers should be patched with an
-	// OpenAI-Project header at invoke time. Only used by codex_cli, and only
-	// when OpenAIProjectID is also set. Empty (default) means no header
-	// injection — zero behavior change. The router does not read or validate
-	// codex config.toml; this is an opaque operator-supplied provider id
-	// passed straight to a -c override flag.
+	// CodexProviderID is an OPTIONAL override for the model_providers.<id> key
+	// in the operator's local codex config.toml whose http_headers should be
+	// patched with an OpenAI-Project header at invoke time. Only used by
+	// codex_cli.
+	//
+	// The default path needs this unset: the router discovers the provider
+	// id automatically from config.toml's model_providers table (exactly one
+	// non-reserved entry) — see internal/backend/codex_discovery.go. Set this
+	// explicitly only to disambiguate when config.toml defines more than one
+	// non-reserved provider. Empty and discovery finding nothing means no
+	// header injection — zero behavior change from the pre-discovery default.
 	CodexProviderID string `yaml:"codex_provider_id"`
 
-	// OpenAIProjectID is the value injected as the OpenAI-Project header via
-	// CodexProviderID's http_headers override. Only used by codex_cli, and
-	// only when CodexProviderID is also set. Empty (default) means no header
-	// injection. Opaque operator-supplied string; the router does not
-	// interpret or validate it.
+	// OpenAIProjectID is an OPTIONAL override for the value injected as the
+	// OpenAI-Project header via CodexProviderID's http_headers override.
+	// Only used by codex_cli.
+	//
+	// The default path needs this unset: the router discovers the project id
+	// automatically via a live GET /v1/organization/projects call against
+	// the discovered provider's Bedrock mantle endpoint, using
+	// OpenAIAPIKey as the bearer credential — see
+	// internal/backend/codex_discovery.go. Set this explicitly only to
+	// disambiguate when the organization has more than one project and none
+	// is named "default". Empty and discovery finding nothing means no
+	// header injection.
 	OpenAIProjectID string `yaml:"openai_project_id"`
 
 	// CostWeight is the routing preference multiplier. Higher = preferred.

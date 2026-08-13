@@ -11,10 +11,16 @@
 // both providerID and projectID are non-empty. It exists to attribute
 // per-caller Bedrock-mode traffic against a real OpenAI project registry
 // entry when model_provider is a custom (non-reserved) provider id — codex
-// rejects the same override against a reserved builtin provider. The router
-// treats both values as opaque operator-supplied strings; it does not read,
-// parse, or validate the local codex config.toml, and does not know or care
-// what provider or endpoint sits behind providerID.
+// rejects the same override against a reserved builtin provider.
+//
+// This adapter itself treats both values as opaque strings and never reads
+// codex config.toml or makes network calls — it only appends the flag it is
+// given. The values normally arrive already resolved by
+// DiscoverCodexProjectHeader (codex_discovery.go), which reads config.toml
+// and queries the Bedrock mantle project-list endpoint once at construction
+// time; router.yaml's codex_provider_id/openai_project_id remain available
+// as explicit overrides for the ambiguous case. See codex_discovery.go for
+// the discovery/fallback shape.
 //
 // This is the "openai-via-codex" provider path from the relay registry.
 // For the codex subagent (openai-via-codex-subagent), use CodexSubagentAdapter.
@@ -54,9 +60,11 @@ type CodexCLIAdapter struct {
 // model and reasoningEffort may be empty.
 // providerID and projectID may be empty; the OpenAI-Project header override
 // is only emitted when both are non-empty (see package doc). providerID is
-// the model_providers.<id> key in the operator's local codex config.toml;
-// projectID is the header value. Both are opaque operator-supplied strings.
-// binPathOverride is the explicit path to the codex binary (empty = auto-resolve).
+// the model_providers.<id> key to patch in codex's own config.toml;
+// projectID is the header value. Callers normally pass the values resolved
+// by DiscoverCodexProjectHeader rather than a hand-set config field — see
+// package doc. binPathOverride is the explicit path to the codex binary
+// (empty = auto-resolve).
 func NewCodexCLIAdapter(id, model, reasoningEffort, providerID, projectID, binPathOverride string) *CodexCLIAdapter {
 	a := &CodexCLIAdapter{id: id, model: model, reasoningEffort: reasoningEffort, providerID: providerID, projectID: projectID}
 	// Resolve and log the binary path at construction time so misconfigurations
