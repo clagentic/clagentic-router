@@ -20,7 +20,7 @@ import "testing"
 func TestAdapterCapabilities_NoneSupportToolsOrImagesToday(t *testing.T) {
 	adapters := map[string]Adapter{
 		"claude_cli":     NewClaudeCLIAdapter("claude_cli", "", "/nonexistent/claude", EffortLevel(""), ThinkingOff),
-		"codex_cli":      NewCodexCLIAdapter("codex_cli", "", "", "/nonexistent/codex"),
+		"codex_cli":      NewCodexCLIAdapter("codex_cli", "", "", "", "", "/nonexistent/codex"),
 		"codex_subagent": NewCodexSubagentAdapter("codex_subagent", "flagship", "/nonexistent/claude"),
 		"gemini_cli":     NewGeminiCLIAdapter("gemini_cli", "", "/nonexistent/gemini"),
 		"ollama_http":    NewOllamaHTTPAdapter("ollama_http", "http://localhost:11434", "test-model", 0),
