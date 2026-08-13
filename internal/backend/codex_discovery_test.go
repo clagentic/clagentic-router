@@ -1,22 +1,17 @@
 // internal/backend/codex_discovery_test.go — table-driven tests for codex_cli's
-// automatic provider/project discovery (lr-8dd85a).
+// automatic provider-id discovery, and for DiscoverCodexProjectHeader's
+// override-only project id handling (lr-8dd85a; project-id discovery
+// reverted at lr-698965).
 //
 // All ids below are fabricated placeholders, not real provider or project ids.
 package backend
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
-
-const fakeRegion = "us-fake-1"
 
 func writeCodexConfig(t *testing.T, dir, content string) string {
 	t.Helper()
@@ -127,67 +122,6 @@ base_url = "https://bedrock-mantle.us-fake-1.api.aws/v1"
 	}
 }
 
-// TestMantleRegionFromBaseURL covers region extraction from the mantle host
-// shape, and rejection of an unrelated base_url or an extracted region that
-// fails character-class validation (e.g. an injected userinfo/path
-// component landing between the anchored prefix/suffix).
-func TestMantleRegionFromBaseURL(t *testing.T) {
-	cases := []struct {
-		name    string
-		baseURL string
-		want    string
-	}{
-		{"standard mantle url", "https://bedrock-mantle.us-fake-1.api.aws/v1", "us-fake-1"},
-		{"mantle url no path", "https://bedrock-mantle.eu-fake-2.api.aws", "eu-fake-2"},
-		{"unrelated provider url", "https://api.openai.com/v1", ""},
-		{"empty", "", ""},
-		{"region with uppercase rejected", "https://bedrock-mantle.US-FAKE-1.api.aws/v1", ""},
-		{"region with at-sign rejected", "https://bedrock-mantle.evil@us-fake-1.api.aws/v1", ""},
-		{"region with dot rejected", "https://bedrock-mantle.us.fake.1.api.aws/v1", ""},
-		{"region with slash-like control char rejected", "https://bedrock-mantle.us-fake-1\t.api.aws/v1", ""},
-		{"region too long rejected", "https://bedrock-mantle." + strings.Repeat("a", maxMantleRegionLen+1) + ".api.aws/v1", ""},
-	}
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			got := mantleRegionFromBaseURL(tc.baseURL)
-			if got != tc.want {
-				t.Errorf("mantleRegionFromBaseURL(%q) = %q, want %q", tc.baseURL, got, tc.want)
-			}
-		})
-	}
-}
-
-// TestValidateMantleRegion covers the character-class/length validator in
-// isolation, including boundary lengths and each rejected character class.
-func TestValidateMantleRegion(t *testing.T) {
-	cases := []struct {
-		name   string
-		region string
-		want   bool
-	}{
-		{"valid lowercase alnum hyphen", "us-fake-1", true},
-		{"valid at max length", strings.Repeat("a", maxMantleRegionLen), true},
-		{"empty rejected", "", false},
-		{"too long rejected", strings.Repeat("a", maxMantleRegionLen+1), false},
-		{"uppercase rejected", "US-FAKE-1", false},
-		{"dot rejected", "us.fake.1", false},
-		{"underscore rejected", "us_fake_1", false},
-		{"at-sign rejected", "us-fake-1@evil", false},
-		{"slash rejected", "us-fake-1/../other", false},
-		{"space rejected", "us fake 1", false},
-	}
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			got := validateMantleRegion(tc.region)
-			if got != tc.want {
-				t.Errorf("validateMantleRegion(%q) = %v, want %v", tc.region, got, tc.want)
-			}
-		})
-	}
-}
-
 // TestValidateCodexProviderID covers the character-class/length validator
 // applied to providerID before it is interpolated into codex's -c
 // model_providers.<id>.http_headers override syntax.
@@ -220,191 +154,18 @@ func TestValidateCodexProviderID(t *testing.T) {
 	}
 }
 
-// fakeProjectsServer returns an httptest.Server that responds to
-// GET /v1/organization/projects with the given JSON body and status.
-func fakeProjectsServer(t *testing.T, status int, body interface{}) *httptest.Server {
-	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") == "" {
-			t.Errorf("missing Authorization header on request to %s", r.URL.Path)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		if body != nil {
-			_ = json.NewEncoder(w).Encode(body)
-		}
-	}))
-}
-
-// TestDiscoverCodexProject_ViaFakeServer covers one/multiple/empty project
-// list responses and an HTTP failure, using discoverCodexProjectAt (the
-// production URL-taking helper discoverCodexProject itself delegates to),
-// pointed at an httptest server since discoverCodexProject's public entry
-// point hardcodes the bedrock-mantle host shape from a region string, not
-// an arbitrary URL.
-func TestDiscoverCodexProject_ViaFakeServer(t *testing.T) {
-	const fakeAPIKey = "fake-bearer-key-0000"
-
-	t.Run("single project", func(t *testing.T) {
-		srv := fakeProjectsServer(t, http.StatusOK, bedrockProjectsResponse{
-			Data: []bedrockProject{{ID: "proj_fake_solo", Name: "solo", Status: "active"}},
-		})
-		defer srv.Close()
-
-		id, err := discoverCodexProjectAt(context.Background(), srv.Client(), srv.URL+"/v1/organization/projects", fakeAPIKey)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if id != "proj_fake_solo" {
-			t.Errorf("project id = %q, want proj_fake_solo", id)
-		}
-	})
-
-	t.Run("multiple projects prefers default-named", func(t *testing.T) {
-		srv := fakeProjectsServer(t, http.StatusOK, bedrockProjectsResponse{
-			Data: []bedrockProject{
-				{ID: "proj_fake_other", Name: "other", Status: "active"},
-				{ID: "proj_fake_default", Name: defaultBedrockProjectName, Status: "active"},
-			},
-		})
-		defer srv.Close()
-
-		id, err := discoverCodexProjectAt(context.Background(), srv.Client(), srv.URL+"/v1/organization/projects", fakeAPIKey)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if id != "proj_fake_default" {
-			t.Errorf("project id = %q, want proj_fake_default (deterministic default-name preference)", id)
-		}
-	})
-
-	t.Run("multiple projects no default is ambiguous", func(t *testing.T) {
-		srv := fakeProjectsServer(t, http.StatusOK, bedrockProjectsResponse{
-			Data: []bedrockProject{
-				{ID: "proj_fake_a", Name: "a", Status: "active"},
-				{ID: "proj_fake_b", Name: "b", Status: "active"},
-			},
-		})
-		defer srv.Close()
-
-		_, err := discoverCodexProjectAt(context.Background(), srv.Client(), srv.URL+"/v1/organization/projects", fakeAPIKey)
-		if err == nil {
-			t.Fatal("expected ambiguity error, got nil")
-		}
-	})
-
-	t.Run("empty project list", func(t *testing.T) {
-		srv := fakeProjectsServer(t, http.StatusOK, bedrockProjectsResponse{Data: nil})
-		defer srv.Close()
-
-		id, err := discoverCodexProjectAt(context.Background(), srv.Client(), srv.URL+"/v1/organization/projects", fakeAPIKey)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if id != "" {
-			t.Errorf("project id = %q, want empty for zero projects", id)
-		}
-	})
-
-	t.Run("HTTP failure", func(t *testing.T) {
-		srv := fakeProjectsServer(t, http.StatusInternalServerError, nil)
-		defer srv.Close()
-
-		_, err := discoverCodexProjectAt(context.Background(), srv.Client(), srv.URL+"/v1/organization/projects", fakeAPIKey)
-		if err == nil {
-			t.Fatal("expected error on HTTP 500, got nil")
-		}
-	})
-
-	t.Run("oversized response body rejected without parsing", func(t *testing.T) {
-		// A hostile or malfunctioning endpoint returning an arbitrarily
-		// large body must be rejected via the io.LimitReader cap, never
-		// buffered in full — see maxBedrockProjectsResponseBytes.
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			// Valid JSON prefix, then padding well past the cap so a naive
-			// decoder streaming the body would still succeed if the cap
-			// were absent.
-			_, _ = w.Write([]byte(`{"data":[`))
-			pad := strings.Repeat("0", maxBedrockProjectsResponseBytes+1024)
-			_, _ = w.Write([]byte(pad))
-		}))
-		defer srv.Close()
-
-		_, err := discoverCodexProjectAt(context.Background(), srv.Client(), srv.URL+"/v1/organization/projects", fakeAPIKey)
-		if err == nil {
-			t.Fatal("expected error for oversized response body, got nil")
-		}
-		if !strings.Contains(err.Error(), "byte cap") {
-			t.Errorf("expected byte-cap error, got: %v", err)
-		}
-	})
-
-	t.Run("response exactly at cap is accepted", func(t *testing.T) {
-		// Boundary check: a response landing exactly at the cap (not over
-		// it) must still be read and parsed successfully — the +1 sentinel
-		// read must not itself cause a false rejection at the boundary.
-		project := bedrockProject{ID: "proj_fake_boundary", Name: "boundary", Status: "active"}
-		encoded, err := json.Marshal(bedrockProjectsResponse{Data: []bedrockProject{project}})
-		if err != nil {
-			t.Fatalf("marshal fixture: %v", err)
-		}
-		if len(encoded) >= maxBedrockProjectsResponseBytes {
-			t.Fatalf("fixture body (%d bytes) is not smaller than the cap (%d) — adjust test", len(encoded), maxBedrockProjectsResponseBytes)
-		}
-		// Pad with JSON whitespace (valid, ignored by encoding/json) up to
-		// exactly the cap.
-		padded := append(encoded, bytes.Repeat([]byte(" "), maxBedrockProjectsResponseBytes-len(encoded))...)
-
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(padded)
-		}))
-		defer srv.Close()
-
-		id, err := discoverCodexProjectAt(context.Background(), srv.Client(), srv.URL+"/v1/organization/projects", fakeAPIKey)
-		if err != nil {
-			t.Fatalf("unexpected error at exactly-cap body size: %v", err)
-		}
-		if id != "proj_fake_boundary" {
-			t.Errorf("project id = %q, want proj_fake_boundary", id)
-		}
-	})
-}
-
-// TestDiscoverCodexProject_RealFunctionHTTPFailure exercises the real
-// discoverCodexProject (region-based URL construction) against an
-// unreachable region string to confirm the failure path returns an error
-// rather than panicking, and that region/apiKey validation short-circuits
-// before any network call.
-func TestDiscoverCodexProject_RealFunctionHTTPFailure(t *testing.T) {
-	t.Run("empty region", func(t *testing.T) {
-		_, err := discoverCodexProject(context.Background(), http.DefaultClient, "", "fake-key")
-		if err == nil {
-			t.Fatal("expected error for empty region, got nil")
-		}
-	})
-
-	t.Run("empty api key", func(t *testing.T) {
-		_, err := discoverCodexProject(context.Background(), http.DefaultClient, fakeRegion, "")
-		if err == nil {
-			t.Fatal("expected error for empty api key, got nil")
-		}
-	})
-}
-
 // TestDiscoverCodexProjectHeader_FailureNeverBreaksInvoke covers the
 // end-to-end DiscoverCodexProjectHeader entry point: discovery failure at
-// any stage (no config, ambiguous config, no api key) must degrade to an
-// empty pair, never an error the caller has to handle.
+// any stage (no config, ambiguous config) must degrade to an empty pair,
+// never an error the caller has to handle. It also proves projectID is
+// override-only: unset means no header injection, set means the operator
+// value passes through verbatim regardless of provider discovery outcome.
 func TestDiscoverCodexProjectHeader_FailureNeverBreaksInvoke(t *testing.T) {
 	t.Run("no codex config at all", func(t *testing.T) {
 		dir := t.TempDir() // empty dir, no config.toml
 		t.Setenv("CODEX_HOME", dir)
 
-		providerID, projectID := DiscoverCodexProjectHeader(context.Background(), "", "", "fake-key")
+		providerID, projectID := DiscoverCodexProjectHeader("", "")
 		if providerID != "" || projectID != "" {
 			t.Errorf("expected empty pair with no config, got providerID=%q projectID=%q", providerID, projectID)
 		}
@@ -421,13 +182,13 @@ base_url = "https://bedrock-mantle.eu-fake-1.api.aws/v1"
 `)
 		t.Setenv("CODEX_HOME", dir)
 
-		providerID, projectID := DiscoverCodexProjectHeader(context.Background(), "", "", "fake-key")
+		providerID, projectID := DiscoverCodexProjectHeader("", "")
 		if providerID != "" || projectID != "" {
 			t.Errorf("expected empty pair on ambiguous provider discovery, got providerID=%q projectID=%q", providerID, projectID)
 		}
 	})
 
-	t.Run("provider resolved but no api key for project lookup", func(t *testing.T) {
+	t.Run("provider resolved, openai_project_id unset means header not injected", func(t *testing.T) {
 		dir := t.TempDir()
 		writeCodexConfig(t, dir, `
 [model_providers.acme-bedrock]
@@ -435,16 +196,33 @@ base_url = "https://bedrock-mantle.us-fake-1.api.aws/v1"
 `)
 		t.Setenv("CODEX_HOME", dir)
 
-		providerID, projectID := DiscoverCodexProjectHeader(context.Background(), "", "", "")
-		// Provider discovery succeeds independently of project discovery;
-		// projectID stays empty (no api key for the live lookup), which
-		// alone suppresses codex_cli.go's header injection (it requires
-		// both to be non-empty) — so this is still functionally feature-off.
+		providerID, projectID := DiscoverCodexProjectHeader("", "")
+		// Provider discovery has no dependency on a project id or api key;
+		// projectID stays empty because it is override-only and nothing
+		// was set. codex_cli.go requires both values non-empty to inject
+		// the header, so an empty projectID alone suppresses injection.
 		if providerID != "acme-bedrock" {
-			t.Errorf("expected provider to resolve to acme-bedrock even without api key, got %q", providerID)
+			t.Errorf("expected provider to resolve to acme-bedrock, got %q", providerID)
 		}
 		if projectID != "" {
-			t.Errorf("expected empty project id with no api key, got %q", projectID)
+			t.Errorf("expected empty project id when openai_project_id is unset, got %q", projectID)
+		}
+	})
+
+	t.Run("provider discovered, openai_project_id set injects header with operator value verbatim", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCodexConfig(t, dir, `
+[model_providers.acme-bedrock]
+base_url = "https://bedrock-mantle.us-fake-1.api.aws/v1"
+`)
+		t.Setenv("CODEX_HOME", dir)
+
+		providerID, projectID := DiscoverCodexProjectHeader("", "operator-project-id")
+		if providerID != "acme-bedrock" {
+			t.Errorf("expected provider to resolve to acme-bedrock, got %q", providerID)
+		}
+		if projectID != "operator-project-id" {
+			t.Errorf("expected operator project id to pass through verbatim, got %q", projectID)
 		}
 	})
 
@@ -452,26 +230,9 @@ base_url = "https://bedrock-mantle.us-fake-1.api.aws/v1"
 		dir := t.TempDir() // no config.toml — discovery would fail if it ran
 		t.Setenv("CODEX_HOME", dir)
 
-		providerID, projectID := DiscoverCodexProjectHeader(context.Background(), "override-provider", "override-project", "")
+		providerID, projectID := DiscoverCodexProjectHeader("override-provider", "override-project")
 		if providerID != "override-provider" || projectID != "override-project" {
 			t.Errorf("expected overrides to pass through unchanged, got providerID=%q projectID=%q", providerID, projectID)
-		}
-	})
-
-	t.Run("provider not pointed at mantle endpoint yields empty project without network call", func(t *testing.T) {
-		dir := t.TempDir()
-		writeCodexConfig(t, dir, `
-[model_providers.acme-other]
-base_url = "https://not-bedrock-mantle.example.com/v1"
-`)
-		t.Setenv("CODEX_HOME", dir)
-
-		providerID, projectID := DiscoverCodexProjectHeader(context.Background(), "", "", "fake-key")
-		if providerID != "acme-other" {
-			t.Errorf("expected provider to resolve to acme-other, got %q", providerID)
-		}
-		if projectID != "" {
-			t.Errorf("expected empty project id when base_url isn't a mantle endpoint, got %q", projectID)
 		}
 	})
 
@@ -483,7 +244,7 @@ base_url = "https://not-bedrock-mantle.example.com/v1"
 		// config.toml-discovered id: a value that would corrupt codex's -c
 		// TOML-override syntax must degrade to feature-off, never be passed
 		// through because it came from an override rather than discovery.
-		providerID, projectID := DiscoverCodexProjectHeader(context.Background(), `evil"}.http_headers={"x"="y`, "override-project", "")
+		providerID, projectID := DiscoverCodexProjectHeader(`evil"}.http_headers={"x"="y`, "override-project")
 		if providerID != "" || projectID != "" {
 			t.Errorf("expected empty pair for invalid override providerID, got providerID=%q projectID=%q", providerID, projectID)
 		}
@@ -505,7 +266,7 @@ base_url = "https://bedrock-mantle.us-fake-1.api.aws/v1"
 		// surviving discoverCodexProvider, DiscoverCodexProjectHeader
 		// returns feature-off before the validator is ever reached. See
 		// the "+"-id case below for a fixture that genuinely reaches it.
-		providerID, projectID := DiscoverCodexProjectHeader(context.Background(), "", "", "fake-key")
+		providerID, projectID := DiscoverCodexProjectHeader("", "")
 		if providerID != "" || projectID != "" {
 			t.Errorf("expected empty pair, got providerID=%q projectID=%q", providerID, projectID)
 		}
@@ -531,7 +292,7 @@ base_url = "https://bedrock-mantle.us-fake-1.api.aws/v1"
 		// (Deleting the validateCodexProviderID call in
 		// DiscoverCodexProjectHeader would make this test fail, since
 		// "acme+bedrock" would otherwise be returned unchanged.)
-		providerID, projectID := DiscoverCodexProjectHeader(context.Background(), "", "", "fake-key")
+		providerID, projectID := DiscoverCodexProjectHeader("", "")
 		if providerID != "" || projectID != "" {
 			t.Errorf("expected empty pair (validator must reject \"acme+bedrock\"), got providerID=%q projectID=%q", providerID, projectID)
 		}

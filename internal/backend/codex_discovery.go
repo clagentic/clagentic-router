@@ -1,12 +1,12 @@
 // internal/backend/codex_discovery.go — automatic discovery of the codex_cli
-// OpenAI-Project header inputs (lr-8dd85a).
+// OpenAI-Project header's provider-id input (lr-8dd85a).
 //
-// PR #35 (lr-60781e) required the operator to hand-type codex_provider_id
-// and openai_project_id in router.yaml. That is the thing this file removes
-// for the common case: both values are now PULLED from local state and a
-// live API call, mirroring the discovery pattern clagentic-console uses for
-// model lists (paginated GET with a static fallback only on failure — see
-// generate-model-catalog.js / yoke/adapters/codex.js's model/list RPC).
+// PR #35 (lr-60781e) required the operator to hand-type codex_provider_id in
+// router.yaml. That is the thing this file removes for the common case: the
+// provider id is PULLED from local state, mirroring the discovery pattern
+// clagentic-console uses for model lists (paginated GET with a static
+// fallback only on failure — see generate-model-catalog.js /
+// yoke/adapters/codex.js's model/list RPC).
 //
 // # Provider discovery
 //
@@ -27,32 +27,22 @@
 // irrelevant to discovery and is not a claim this parser is a general TOML
 // reader.
 //
-// # Project discovery
+// # Project id is override-only
 //
-// Bedrock mantle exposes project enumeration only on the OpenAI-compatible
-// HTTP surface (no aws CLI / boto3 equivalent — established fact, see task
-// lr-8dd85a):
-//
-//	GET https://bedrock-mantle.{region}.api.aws/v1/organization/projects
-//	Authorization: Bearer <api key>
-//
-// The region is never a literal in this file — it is parsed out of the
-// discovered provider's own base_url (which already points at the regional
-// mantle endpoint), so a host in any region resolves correctly with zero
-// code change.
-//
-// Multiple projects is resolved deterministically: a project whose name is
-// literally "default" (AWS's own convention for the auto-created default
-// project in a Bedrock organization) is preferred. No other project list
-// order or count is used to break a tie — anything else would be a silent
-// arbitrary pick, which the task explicitly forbids.
+// The OpenAI-Project header value (openai_project_id) has no discovery path
+// in this file. There is no verified, callable endpoint for enumerating
+// Bedrock mantle projects; a prior version of this file asserted one as
+// fact without ever calling it (lr-698965 reverted that code). An operator
+// who wants the header injected sets openai_project_id explicitly; unset
+// means the header is simply not injected — no live call, no credential
+// needed on this path.
 //
 // # Caching and failure handling
 //
-// Discovery is expensive (reads a file, makes an HTTP call) and must not
-// run on every Invoke. Callers run it once (e.g. at adapter construction,
-// mirroring ResolveBinPath's construction-time binary resolution) and treat
-// any failure as feature-off: an empty providerID/projectID pair, which
+// Discovery is not free (reads a file) and must not run on every Invoke.
+// Callers run it once (e.g. at adapter construction, mirroring
+// ResolveBinPath's construction-time binary resolution) and treat any
+// failure as feature-off: an empty providerID/projectID pair, which
 // codex_cli.go's existing empty-value check already treats as "no header
 // injection" with zero behavior change. Discovery must never return an
 // error that blocks constructing the adapter or invoking it.
@@ -60,66 +50,19 @@ package backend
 
 import (
 	"bufio"
-	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 )
-
-// maxBedrockProjectsResponseBytes caps how much of the mantle project-list
-// response body is read before this package gives up rather than buffer an
-// arbitrarily large (hostile or malfunctioning-endpoint) response. A
-// project-list response is a handful of small JSON objects — 64KiB gives
-// generous headroom over any realistic organization's project count while
-// still rejecting an unbounded body. Mirrors the io.LimitReader(+1 sentinel)
-// pattern codex_model_discovery.go established for the (much larger) model
-// catalog read, reused here for idiom consistency rather than invented
-// fresh.
-const maxBedrockProjectsResponseBytes = 64 << 10 // 64 KiB
-
-// maxMantleRegionLen bounds an accepted AWS region string extracted from a
-// discovered provider's base_url. Real AWS region codes (e.g. "us-east-1",
-// "ap-southeast-2") are well under this; it exists only to reject a
-// pathological value before it is interpolated into an outbound request URL.
-const maxMantleRegionLen = 32
 
 // maxCodexProviderIDLen bounds an accepted codex model_providers.<id> key
 // before it is interpolated into codex's own -c TOML-override syntax. Real
 // provider ids are short slugs; this exists only to reject a pathological
 // value, not to accommodate any observed real-world id.
 const maxCodexProviderIDLen = 64
-
-// isMantleRegionChar reports whether r is valid within an AWS region code:
-// lowercase ASCII letters, digits, and hyphen. This is deliberately a
-// character-class allow-list, not an AWS-region-format parser — it exists to
-// bound what can reach an authenticated outbound URL, not to validate that
-// the value is a real region.
-func isMantleRegionChar(r rune) bool {
-	return (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-'
-}
-
-// validateMantleRegion rejects a region string that is empty, too long, or
-// contains any character outside the lowercase-alphanumeric-and-hyphen
-// class. Never rewrites or strips — an invalid region degrades the caller to
-// feature-off, consistent with every other discovery failure path in this
-// file (see package doc).
-func validateMantleRegion(region string) bool {
-	if region == "" || len(region) > maxMantleRegionLen {
-		return false
-	}
-	for _, r := range region {
-		if !isMantleRegionChar(r) {
-			return false
-		}
-	}
-	return true
-}
 
 // isCodexProviderIDChar reports whether r is valid within a codex
 // model_providers.<id> key. codex's own TOML table-header parsing already
@@ -160,12 +103,6 @@ func validateCodexProviderID(id string) bool {
 var reservedCodexProviderIDs = map[string]struct{}{
 	"openai": {},
 }
-
-// defaultBedrockProjectName is the project name AWS Bedrock organizations
-// use for the auto-created default project. Used only as the deterministic
-// tie-break when GET /v1/organization/projects returns more than one
-// project and the operator has not set an explicit override.
-const defaultBedrockProjectName = "default"
 
 // codexConfigPath returns the path to the codex CLI's config.toml, honoring
 // CODEX_HOME the same way the codex binary itself does. Empty return means
@@ -289,150 +226,25 @@ func parseModelProviders(r io.Reader) ([]codexProviderCandidate, error) {
 	return candidates, nil
 }
 
-// mantleRegionFromBaseURL extracts the AWS region from a Bedrock mantle
-// base_url of the form "https://bedrock-mantle.{region}.api.aws/v1" (or any
-// path suffix). Returns "" if baseURL does not match that host shape (the
-// provider may be pointed somewhere else entirely, which is not this
-// package's business to second-guess) OR if the extracted region fails
-// validateMantleRegion — the caller interpolates this value into an
-// authenticated outbound request URL, so anything outside the expected
-// character class is rejected rather than passed through. Never rewrites or
-// strips a bad value; rejection degrades to feature-off (see package doc).
-func mantleRegionFromBaseURL(baseURL string) string {
-	const hostPrefix = "bedrock-mantle."
-	const hostSuffix = ".api.aws"
-
-	u := strings.TrimPrefix(baseURL, "https://")
-	u = strings.TrimPrefix(u, "http://")
-	host := u
-	if idx := strings.IndexByte(u, '/'); idx >= 0 {
-		host = u[:idx]
-	}
-	if !strings.HasPrefix(host, hostPrefix) || !strings.HasSuffix(host, hostSuffix) {
-		return ""
-	}
-	region := strings.TrimSuffix(strings.TrimPrefix(host, hostPrefix), hostSuffix)
-	if !validateMantleRegion(region) {
-		return ""
-	}
-	return region
-}
-
-// bedrockProject is one entry from GET /v1/organization/projects.
-type bedrockProject struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Status string `json:"status"`
-}
-
-type bedrockProjectsResponse struct {
-	Data []bedrockProject `json:"data"`
-}
-
-// discoverCodexProject calls GET /v1/organization/projects against the
-// Bedrock mantle OpenAI-compatible surface for region and returns the
-// project id to use.
+// DiscoverCodexProjectHeader resolves the provider id for the codex_cli
+// OpenAI-Project header injection, applying an operator override where
+// given and discovery otherwise. Called once at adapter construction time
+// (never per-Invoke — see package doc on caching).
 //
-// Selection rule, applied in order:
-//  1. Zero projects returned: ("", nil) — feature off, not an error.
-//  2. Exactly one project: use it.
-//  3. Multiple projects: prefer the one named "default" (AWS's own
-//     auto-created default project). If none is named "default", this is
-//     genuinely ambiguous and returns an error — never a silent arbitrary
-//     pick.
+// projectID has no discovery path (see package doc, "Project id is
+// override-only"): it is returned unchanged from overrideProjectID, which
+// may be empty. codex_cli.go only emits the header when both providerID and
+// projectID are non-empty, so an unset override means no header injection.
 //
-// Any HTTP/network/decode failure returns an error; callers must treat that
-// as feature-off (see package doc), never as a reason to fail Invoke.
-func discoverCodexProject(ctx context.Context, client *http.Client, region, apiKey string) (string, error) {
-	if region == "" || apiKey == "" {
-		return "", fmt.Errorf("codex_discovery: region and api key are both required for project discovery")
-	}
-
-	url := fmt.Sprintf("https://bedrock-mantle.%s.api.aws/v1/organization/projects", region)
-	return discoverCodexProjectAt(ctx, client, url, apiKey)
-}
-
-// discoverCodexProjectAt performs the GET + bounded-read + selection logic
-// against an arbitrary projects-list URL. Split out from discoverCodexProject
-// so tests can point it at an httptest.Server (127.0.0.1:<port>) instead of
-// needing a live bedrock-mantle.{region}.api.aws host — discoverCodexProject
-// itself remains the only caller that constructs that URL from a
-// (validated) region string.
-func discoverCodexProjectAt(ctx context.Context, client *http.Client, url, apiKey string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return "", fmt.Errorf("codex_discovery: build request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("codex_discovery: GET %s: %w", url, err)
-	}
-	defer resp.Body.Close()
-
-	// Read at most maxBedrockProjectsResponseBytes+1 so an over-limit
-	// response can be distinguished from one that happens to land exactly
-	// at the cap, without ever buffering the unbounded tail of a hostile or
-	// malfunctioning endpoint's response — same pattern as
-	// runCodexDebugModelsWithLimits in codex_model_discovery.go.
-	limited := io.LimitReader(resp.Body, maxBedrockProjectsResponseBytes+1)
-	body, err := io.ReadAll(limited)
-	if err != nil {
-		return "", fmt.Errorf("codex_discovery: GET %s: read response body: %w", url, err)
-	}
-	if len(body) > maxBedrockProjectsResponseBytes {
-		return "", fmt.Errorf("codex_discovery: GET %s: response exceeded %d byte cap — refusing to parse a possibly-truncated body",
-			url, maxBedrockProjectsResponseBytes)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("codex_discovery: GET %s: HTTP %d: %s", url, resp.StatusCode, truncate(string(body), 200))
-	}
-
-	var parsed bedrockProjectsResponse
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return "", fmt.Errorf("codex_discovery: parse projects response: %w", err)
-	}
-
-	switch len(parsed.Data) {
-	case 0:
-		return "", nil
-	case 1:
-		return parsed.Data[0].ID, nil
-	default:
-		for _, p := range parsed.Data {
-			if p.Name == defaultBedrockProjectName {
-				return p.ID, nil
-			}
-		}
-		ids := make([]string, len(parsed.Data))
-		for i, p := range parsed.Data {
-			ids[i] = p.ID
-		}
-		return "", fmt.Errorf(
-			"codex_discovery: multiple projects found with no \"%s\"-named project to prefer (%s) — set openai_project_id explicitly to disambiguate",
-			defaultBedrockProjectName, strings.Join(ids, ", "))
-	}
-}
-
-// DiscoverCodexProjectHeader resolves both the provider id and project id
-// for the codex_cli OpenAI-Project header injection, in one call, applying
-// operator overrides where given and discovery otherwise. Called once at
-// adapter construction time (never per-Invoke — see package doc on
-// caching). apiKey is used only for the live project lookup; it is never
-// logged.
-//
-// Any discovery failure (ambiguous provider, ambiguous project, HTTP
-// failure, missing config) degrades to an empty providerID/projectID pair
-// rather than propagating an error — codex_cli.go already treats an empty
-// pair as "no header injection", so discovery failure can never break the
-// request path. The failure reason is logged at Warn for operator
-// visibility.
-func DiscoverCodexProjectHeader(ctx context.Context, overrideProviderID, overrideProjectID, apiKey string) (providerID, projectID string) {
+// Any provider-discovery failure (ambiguous provider, missing/malformed
+// config) degrades to an empty providerID/projectID pair rather than
+// propagating an error — codex_cli.go already treats an empty pair as "no
+// header injection", so discovery failure can never break the request
+// path. The failure reason is logged at Warn for operator visibility.
+func DiscoverCodexProjectHeader(overrideProviderID, overrideProjectID string) (providerID, projectID string) {
 	providerID = overrideProviderID
 	projectID = overrideProjectID
 
-	var baseURL string
 	if providerID == "" {
 		cand, err := discoverCodexProvider(codexConfigPath())
 		if err != nil {
@@ -443,7 +255,6 @@ func DiscoverCodexProjectHeader(ctx context.Context, overrideProviderID, overrid
 			return "", "" // zero non-reserved providers: feature off, not a warning
 		}
 		providerID = cand.ID
-		baseURL = cand.BaseURL
 	}
 
 	// providerID (whether an operator override or config.toml-discovered)
@@ -456,34 +267,6 @@ func DiscoverCodexProjectHeader(ctx context.Context, overrideProviderID, overrid
 		slog.Warn("codex_cli discovery: providerID failed validation, feature disabled for this call",
 			"provider_id_len", len(providerID))
 		return "", ""
-	}
-
-	if projectID == "" {
-		if apiKey == "" {
-			// No API key available for the live project lookup: feature off.
-			// Not a warning — codex_cli backends commonly authenticate via
-			// OAuth (ChatGPT Plus) with no api_key configured at all. The
-			// provider id resolved above is still returned: codex_cli.go
-			// only emits the header when BOTH values are non-empty, so an
-			// empty projectID alone already suppresses injection correctly.
-			return providerID, ""
-		}
-		region := mantleRegionFromBaseURL(baseURL)
-		if region == "" {
-			// Discovered provider isn't pointed at the mantle endpoint this
-			// package knows how to query — nothing to discover, not an error.
-			return providerID, ""
-		}
-		client := &http.Client{Timeout: 15 * time.Second}
-		pid, err := discoverCodexProject(ctx, client, region, apiKey)
-		if err != nil {
-			logDiscoveryWarn("project", err)
-			return providerID, ""
-		}
-		if pid == "" {
-			return providerID, ""
-		}
-		projectID = pid
 	}
 
 	return providerID, projectID

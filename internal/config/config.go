@@ -143,17 +143,10 @@ type BackendConfig struct {
 	// header injection — zero behavior change from the pre-discovery default.
 	CodexProviderID string `yaml:"codex_provider_id"`
 
-	// OpenAIProjectID is an OPTIONAL override for the value injected as the
+	// OpenAIProjectID is an OPAQUE, OPTIONAL value injected as the
 	// OpenAI-Project header via CodexProviderID's http_headers override.
-	// Only used by codex_cli.
-	//
-	// The default path needs this unset: the router discovers the project id
-	// automatically via a live GET /v1/organization/projects call against
-	// the discovered provider's Bedrock mantle endpoint, using
-	// OpenAIAPIKey as the bearer credential — see
-	// internal/backend/codex_discovery.go. Set this explicitly only to
-	// disambiguate when the organization has more than one project and none
-	// is named "default". Empty and discovery finding nothing means no
+	// Only used by codex_cli. There is no discovery path for this value —
+	// see internal/backend/codex_discovery.go package doc. Empty means no
 	// header injection.
 	OpenAIProjectID string `yaml:"openai_project_id"`
 
