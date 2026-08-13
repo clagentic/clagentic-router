@@ -95,6 +95,28 @@ backends:
   #   timeout_seconds: 600
   #   rate_window_seconds: 10800
   #   rate_window_max_messages: 10
+  #
+  # Model discovery (no hand-typed model string): omit `model` entirely and
+  # codex_cli resolves it automatically from `codex debug models`, filtered
+  # to visibility=list and supported_in_api=true, sorted best-first. Add
+  # `model_rank` (0-indexed, best-first — same ordered-list idiom as tiers/
+  # chains below) to pick something other than the best available model.
+  # Resolution happens once at startup and is cached; a resolution failure
+  # (e.g. codex not authenticated) fails that backend's construction with a
+  # logged, actionable error rather than silently picking a wrong model —
+  # `model` still wins byte-identically over discovery whenever it is set.
+  #
+  # codex-discovered-best:
+  #   adapter: codex_cli
+  #   # no `model` — resolves to model_rank 0 (best available) automatically
+  #   cost_weight: 0.7
+  #   timeout_seconds: 300
+  #
+  # codex-discovered-cheap:
+  #   adapter: codex_cli
+  #   model_rank: 2                # 0 = best available, 1 = next best, ...
+  #   cost_weight: 1.0
+  #   timeout_seconds: 180
 
   # --- Gemini CLI (flash / pro) ---
   # Requires `gemini` binary on PATH with active OAuth session on this host.
