@@ -269,12 +269,12 @@ func TestMatchesEvent(t *testing.T) {
 		event string
 		want  bool
 	}{
-		{nil, "quota_low", true},           // empty = all events
-		{[]string{}, "quota_low", true},    // empty = all events
+		{nil, "quota_low", true},        // empty = all events
+		{[]string{}, "quota_low", true}, // empty = all events
 		{[]string{"quota_low"}, "quota_low", true},
 		{[]string{"backend_offline"}, "quota_low", false},
 		{[]string{"quota_low", "backend_offline"}, "backend_offline", true},
-		{[]string{"*"}, "anything", true},  // wildcard
+		{[]string{"*"}, "anything", true}, // wildcard
 	}
 	for _, tc := range cases {
 		if got := matchesEvent(tc.sub, tc.event); got != tc.want {

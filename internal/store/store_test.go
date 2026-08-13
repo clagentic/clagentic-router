@@ -226,9 +226,9 @@ func TestCallStatsFor_OutcomeClassification(t *testing.T) {
 	insertLogRow(t, s, now, "b2", "pass", 200, 0.002)
 
 	// Three failure outcomes that the router writes.
-	insertLogRow(t, s, now, "b1", "fallback", 50, 0)  // hop failed, chain advanced
-	insertLogRow(t, s, now, "b1", "degraded", 0, 0)   // whole chain exhausted
-	insertLogRow(t, s, now, "b1", "error", 30, 0)     // generic error bucket
+	insertLogRow(t, s, now, "b1", "fallback", 50, 0) // hop failed, chain advanced
+	insertLogRow(t, s, now, "b1", "degraded", 0, 0)  // whole chain exhausted
+	insertLogRow(t, s, now, "b1", "error", 30, 0)    // generic error bucket
 
 	stats, err := s.CallStatsFor(CallLogFilter{})
 	if err != nil {
@@ -301,10 +301,10 @@ func TestCallStatsFor_TotalCost(t *testing.T) {
 func TestCallStatsFor_DateRangeFilter(t *testing.T) {
 	s := tempStore(t)
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	insertLogRow(t, s, base.Format(time.RFC3339), "b1", "pass", 100, 0)                      // outside
-	insertLogRow(t, s, base.Add(time.Hour).Format(time.RFC3339), "b1", "pass", 200, 0)       // inside
-	insertLogRow(t, s, base.Add(2*time.Hour).Format(time.RFC3339), "b1", "pass", 300, 0)     // inside
-	insertLogRow(t, s, base.Add(3*time.Hour).Format(time.RFC3339), "b1", "pass", 400, 0)     // outside
+	insertLogRow(t, s, base.Format(time.RFC3339), "b1", "pass", 100, 0)                  // outside
+	insertLogRow(t, s, base.Add(time.Hour).Format(time.RFC3339), "b1", "pass", 200, 0)   // inside
+	insertLogRow(t, s, base.Add(2*time.Hour).Format(time.RFC3339), "b1", "pass", 300, 0) // inside
+	insertLogRow(t, s, base.Add(3*time.Hour).Format(time.RFC3339), "b1", "pass", 400, 0) // outside
 
 	stats, err := s.CallStatsFor(CallLogFilter{
 		From: base.Add(time.Hour),
@@ -366,4 +366,3 @@ func TestStore_PersistenceAcrossOps(t *testing.T) {
 		t.Errorf("expected 1 persisted row, got %d", len(rows))
 	}
 }
-

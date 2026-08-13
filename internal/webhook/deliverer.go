@@ -336,14 +336,14 @@ func marshalEvent(evt DeliveryEvent) ([]byte, error) {
 		"backend_id": evt.BackendID,
 		"at":         evt.At.UTC().Format(time.RFC3339),
 		"snapshot": map[string]interface{}{
-			"status":               string(evt.Snapshot.Status),
-			"consecutive_failures": evt.Snapshot.ConsecutiveFailures,
-			"quota_exhausted":      evt.Snapshot.QuotaExhausted,
+			"status":                 string(evt.Snapshot.Status),
+			"consecutive_failures":   evt.Snapshot.ConsecutiveFailures,
+			"quota_exhausted":        evt.Snapshot.QuotaExhausted,
 			"quota_tokens_remaining": evt.Snapshot.QuotaTokensRemaining,
-			"quota_tokens_total":   evt.Snapshot.QuotaTokensTotal,
-			"last_error_type":      string(evt.Snapshot.LastErrorType),
-			"total_calls":          evt.Snapshot.TotalCalls,
-			"session_cost_usd":     evt.Snapshot.SessionCostUSDEst,
+			"quota_tokens_total":     evt.Snapshot.QuotaTokensTotal,
+			"last_error_type":        string(evt.Snapshot.LastErrorType),
+			"total_calls":            evt.Snapshot.TotalCalls,
+			"session_cost_usd":       evt.Snapshot.SessionCostUSDEst,
 		},
 	})
 }

@@ -19,9 +19,9 @@ func anthropicSuccessBody(blocks []map[string]interface{}) []byte {
 		}
 	}
 	resp := map[string]interface{}{
-		"id":    "msg_test",
-		"type":  "message",
-		"model": "claude-opus-4-8",
+		"id":      "msg_test",
+		"type":    "message",
+		"model":   "claude-opus-4-8",
 		"content": blocks,
 		"usage": map[string]int{
 			"input_tokens":  10,
@@ -168,7 +168,7 @@ func TestAnthropicAPI_SkipsThinkingBlocks(t *testing.T) {
 	// The adapter must return only the text content.
 	blocks := []map[string]interface{}{
 		{
-			"type":    "thinking",
+			"type":     "thinking",
 			"thinking": "Let me reason through this...",
 		},
 		{
@@ -327,9 +327,9 @@ func TestAnthropicAPI_InBodyError(t *testing.T) {
 func TestAnthropicAPI_SerializeOutputConfigJSON(t *testing.T) {
 	t.Run("effort_and_thinking_set", func(t *testing.T) {
 		req := anthropicRequest{
-			Model:     "claude-opus-4-8",
-			MaxTokens: 1024,
-			Messages:  []anthropicMessage{{Role: "user", Content: "hi"}},
+			Model:        "claude-opus-4-8",
+			MaxTokens:    1024,
+			Messages:     []anthropicMessage{{Role: "user", Content: "hi"}},
 			OutputConfig: &anthropicOutputConfig{Effort: "xhigh"},
 			Thinking:     &anthropicThinking{Type: "adaptive", Display: "omitted"},
 		}

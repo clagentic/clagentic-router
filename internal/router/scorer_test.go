@@ -349,7 +349,7 @@ func TestScore_RateLimitWindowPressureExpiredResetSkipped(t *testing.T) {
 
 	staleData := healthySnap()
 	staleData.LastSuccessAt = time.Time{}
-	staleData.RateLimitTokensRemaining = 100 // below threshold but stale
+	staleData.RateLimitTokensRemaining = 100                            // below threshold but stale
 	staleData.RateLimitTokensResetAt = time.Now().Add(-1 * time.Minute) // past
 
 	noData := healthySnap()

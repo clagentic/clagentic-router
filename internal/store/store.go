@@ -344,14 +344,14 @@ func (s *Store) RecentCalls(f CallLogFilter) ([]CallLogRow, error) {
 
 // CallStats is aggregated statistics over a set of call log rows matching a filter.
 type CallStats struct {
-	TotalCalls          int     `json:"total_calls"`
-	SuccessCalls        int     `json:"success_calls"`
-	ErrorCalls          int     `json:"error_calls"`
-	TotalPromptTokens   int     `json:"total_prompt_tokens_est"`
-	TotalComplTokens    int     `json:"total_completion_tokens_est"`
-	TotalCostUSD        float64 `json:"total_cost_usd_est"`
-	AvgLatencyMS        float64 `json:"avg_latency_ms"`
-	P95LatencyMS        int     `json:"p95_latency_ms"`
+	TotalCalls        int     `json:"total_calls"`
+	SuccessCalls      int     `json:"success_calls"`
+	ErrorCalls        int     `json:"error_calls"`
+	TotalPromptTokens int     `json:"total_prompt_tokens_est"`
+	TotalComplTokens  int     `json:"total_completion_tokens_est"`
+	TotalCostUSD      float64 `json:"total_cost_usd_est"`
+	AvgLatencyMS      float64 `json:"avg_latency_ms"`
+	P95LatencyMS      int     `json:"p95_latency_ms"`
 }
 
 // CallStatsFor returns aggregated statistics for rows matching f.

@@ -77,13 +77,13 @@ type ErrorType string
 
 const (
 	ErrTypeQuota     ErrorType = "quota"      // Hard credit/quota exhaustion
-	ErrTypeRateLimit ErrorType = "rate_limit"  // Soft rate limit (window-based)
-	ErrTypeAuth      ErrorType = "auth"        // Authentication failure (permanent until fixed)
-	ErrTypeNetwork   ErrorType = "network"     // Connectivity failure
-	ErrTypeTimeout   ErrorType = "timeout"     // Call exceeded timeout
-	ErrTypeNotFound  ErrorType = "not_found"   // CLI binary not on PATH
-	ErrTypeSchema    ErrorType = "schema"      // Output failed validation
-	ErrTypeUnknown   ErrorType = "unknown"     // Unclassified failure
+	ErrTypeRateLimit ErrorType = "rate_limit" // Soft rate limit (window-based)
+	ErrTypeAuth      ErrorType = "auth"       // Authentication failure (permanent until fixed)
+	ErrTypeNetwork   ErrorType = "network"    // Connectivity failure
+	ErrTypeTimeout   ErrorType = "timeout"    // Call exceeded timeout
+	ErrTypeNotFound  ErrorType = "not_found"  // CLI binary not on PATH
+	ErrTypeSchema    ErrorType = "schema"     // Output failed validation
+	ErrTypeUnknown   ErrorType = "unknown"    // Unclassified failure
 )
 
 // InvokeError is returned by adapters when invocation fails.
