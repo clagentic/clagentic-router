@@ -21,12 +21,74 @@ make build     # produces bin/clagentic-router
 make test      # go test ./...
 ```
 
-## Adapter preference
+## Breadth is the design principle — read this before adding provider-specific behavior
 
-CLI adapters (`claude_cli`, `codex_cli`, `codex_subagent`, `gemini_cli`) use OAuth
-sessions on the host and require no API keys. They are the recommended path for
-local deployments. API adapters (`anthropic_api`, `openai_api`) require keys and
-work in containerised or keyless environments.
+The router's reason to exist is routing across heterogeneous backends, not
+serving one provider well. A feature that works for exactly one provider, one
+auth mode, or one host is **incomplete by default**. This has cost real
+rework: lr-60781e shipped a codex_cli header design generalized from one
+host's Bedrock setup (hand-typed provider/project ids); lr-8dd85a had to
+replace it with discovery; lr-82e68e then found the replacement's own
+proposed model string didn't exist in the actual ChatGPT-Plus catalog, and
+that catalog slug *format* differs by provider — a single-path assumption
+that would have broken the majority deployment. When you add
+provider-specific behavior, name what happens on every other provider in the
+PR description, including the no-op case.
+
+**Adapter breadth today:** CLI adapters (`claude_cli`, `codex_cli`,
+`codex_subagent`, `gemini_cli`) use OAuth sessions on the host and require no
+API keys — the recommended path for local deployments, but they cannot run in
+a container. API adapters (`anthropic_api`, `openai_api`, `bedrock_api`)
+require keys/credentials and work in containerised or keyless environments.
+Neither family is "preferred" in the abstract — pick per deployment
+constraint (host with OAuth sessions vs. containerised/keyless), and any new
+adapter-level feature should be evaluated against both families, not built
+against whichever one is at hand.
+
+**Discover, don't hardcode.** A value identifying a model, provider, project,
+or endpoint should be pulled from the source of truth at runtime, not typed
+into config. clagentic-console's established pattern is the model: it queries
+`GET /v1/models` and the codex `model/list` RPC, keeping a static table only
+as a failure fallback. In this repo, `internal/backend/codex_discovery.go`
+(provider id + Bedrock project id, lr-8dd85a) and
+`internal/backend/codex_model_discovery.go` (model slug via `codex debug
+models`, lr-82e68e) are the reference implementations: discover once at
+adapter-construction time, never per-request; degrade to feature-off on
+failure *when omission is safe* (header injection — an empty pair is simply
+"no header," see `codex_discovery.go`'s package doc); but treat discovery
+failure as a hard construction error when omission is not safe (model
+selection — an unresolved model is not "feature off," it is "codex picks an
+undocumented default," which is the outcome discovery exists to remove; see
+`codex_model_discovery.go`'s package doc). Bound every discovery call in time
+and response size.
+
+**Explicit config always wins.** Discovery is additive. `buildAdapter` in
+`cmd/clagentic-router/main.go` only invokes discovery when the corresponding
+config field (`CodexProviderID`, `OpenAIProjectID`, `Model`) is empty; an
+operator-supplied value is honored byte-identically with discovery never
+attempted. This is the compatibility guarantee that makes it safe to add
+discovery to a working deployment.
+
+**Don't break working paths.** The Claude brand account via `claude_cli` and
+ChatGPT-Plus via `codex_cli` are load-bearing production paths. A change that
+improves one backend must be a verified no-op for the others — state that
+verification explicitly, don't assume it.
+
+**Verify per-provider assumptions against the live source; never generalize
+one host's observed shape into a parser assumption.** Data shapes differ
+across providers in ways that are not guessable from one example:
+- Codex model catalog slugs are bare on ChatGPT-Plus auth; reportedly
+  provider-prefixed under Bedrock. `codex_model_discovery.go` takes the slug
+  verbatim and never constructs, prefixes, strips, or normalizes it, because
+  the format is not confirmed uniform across auth contexts.
+- Codex model catalog `priority` values are sparse and non-contiguous
+  (1, 7, 16, 23, 43 observed) and are not comparable across auth contexts —
+  `codex_model_discovery.go` selects by sorted position, never by matching a
+  literal priority value.
+- codex hard-rejects an `http_headers` override against a reserved builtin
+  `model_providers` id (e.g. `openai`) — `codex_discovery.go` excludes
+  reserved ids from automatic provider selection rather than attempting the
+  override and handling the rejection.
 
 ## Import graph (no cycles allowed)
 

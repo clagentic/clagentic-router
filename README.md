@@ -25,6 +25,25 @@ A self-hosted LLM routing daemon with fallback chains, live quota intelligence, 
 - Delivers webhook alerts (HMAC-signed, exponential retry) on backend state changes
 - Runs as a daemon on any Linux host; CLI adapters (`claude_cli`, `codex_cli`) require OAuth sessions on that host; API adapters work anywhere
 
+## Design principle: breadth over single-path
+
+Clagentic: Router exists to route across heterogeneous LLM backends, not to
+serve one provider well. A feature that only works for one provider, one auth
+mode, or one host is treated as incomplete. In practice this means:
+
+- **Discover, don't hardcode.** Model/provider/project identifiers are
+  resolved at runtime from the provider's own source of truth (e.g. the codex
+  CLI's local config and model catalog) rather than typed into `router.yaml`.
+  Static values remain available as explicit overrides.
+- **Explicit config always wins.** If you set a value, it is used
+  byte-identically and discovery is never attempted for it — safe to layer
+  onto an existing deployment.
+- **Named production paths stay stable.** The Claude brand account
+  (`claude_cli`) and ChatGPT-Plus (`codex_cli`) are load-bearing; changes that
+  improve one backend must not regress the others.
+
+See `CLAUDE.md` for the full principle and the reference implementations.
+
 ## Quick start
 
 ```bash
