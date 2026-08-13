@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // writeFakeCodexDebugModelsBin writes a fake "codex" binary that ignores its
@@ -34,6 +35,37 @@ func writeFakeCodexDebugModelsBin(t *testing.T, dir, stdout, stderr string, exit
 	}
 	if err := os.WriteFile(binPath, []byte(script), 0755); err != nil {
 		t.Fatalf("write fake codex bin: %v", err)
+	}
+	return binPath
+}
+
+// writeHangingFakeBin writes a fake "codex" binary that sleeps far longer
+// than any test timeout before ever producing output — used to prove the
+// context.WithTimeout bound actually fires and kills the subprocess rather
+// than blocking forever. Uses `exec` so sleep replaces the shell in place
+// (same PID) rather than running as its child, matching how
+// exec.CommandContext's own process-kill targets the direct child PID.
+func writeHangingFakeBin(t *testing.T, dir string) string {
+	t.Helper()
+	binPath := filepath.Join(dir, "codex")
+	script := "#!/bin/sh\nexec sleep 300\n"
+	if err := os.WriteFile(binPath, []byte(script), 0755); err != nil {
+		t.Fatalf("write hanging fake bin: %v", err)
+	}
+	return binPath
+}
+
+// writeOversizedFakeBin writes a fake "codex" binary that emits n bytes of
+// filler (well-formed as far as being ASCII, but never valid JSON on its
+// own) followed by nothing — used to prove the stdout size cap rejects an
+// over-limit response rather than parsing a truncated read of it.
+func writeOversizedFakeBin(t *testing.T, dir string, n int) string {
+	t.Helper()
+	binPath := filepath.Join(dir, "codex")
+	filler := strings.Repeat("x", n)
+	script := "#!/bin/sh\nprintf '%s' " + shellQuote(filler) + "\n"
+	if err := os.WriteFile(binPath, []byte(script), 0755); err != nil {
+		t.Fatalf("write oversized fake bin: %v", err)
 	}
 	return binPath
 }
@@ -286,6 +318,74 @@ func TestResolveCodexModel_ViaFakeBinary(t *testing.T) {
 		_, err := ResolveCodexModel(context.Background(), bin, 5)
 		if err == nil {
 			t.Fatal("expected error for out-of-range rank, got nil")
+		}
+	})
+}
+
+// TestResolveCodexModel_TimeoutKillsSubprocess proves the subprocess bound:
+// a hung/wedged codex process must not block construction (or, in
+// production, daemon startup) indefinitely. Uses a short injected timeout
+// so the test itself completes quickly rather than waiting on the real
+// 15s production bound.
+func TestResolveCodexModel_TimeoutKillsSubprocess(t *testing.T) {
+	dir := t.TempDir()
+	bin := writeHangingFakeBin(t, dir)
+
+	const testTimeout = 200 * time.Millisecond
+	start := time.Now()
+	_, err := resolveCodexModelWithLimits(context.Background(), bin, 0, testTimeout, codexDebugModelsMaxBytes)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error when the codex subprocess hangs past the timeout, got nil")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("expected a timeout-specific error, got: %v", err)
+	}
+	// Generous upper bound (10x the injected timeout) — this asserts the
+	// call actually returned promptly rather than blocking on the hanging
+	// subprocess (which sleeps 300s), not that the timeout is exact.
+	if elapsed > 10*testTimeout {
+		t.Errorf("ResolveCodexModel took %s, expected it to return near the %s timeout — subprocess may have leaked", elapsed, testTimeout)
+	}
+}
+
+// TestResolveCodexModel_OversizedStdoutRejected proves the stdout size cap:
+// a response larger than the configured limit must be rejected outright,
+// never parsed as a truncated (and therefore possibly-wrong) catalog. Uses
+// a small injected cap so the test doesn't need to generate megabytes of
+// filler to exercise the over-limit path.
+func TestResolveCodexModel_OversizedStdoutRejected(t *testing.T) {
+	const testMaxBytes = 100
+
+	t.Run("output exceeding the cap is rejected, not truncated-and-parsed", func(t *testing.T) {
+		dir := t.TempDir()
+		bin := writeOversizedFakeBin(t, dir, testMaxBytes*2)
+
+		_, err := resolveCodexModelWithLimits(context.Background(), bin, 0, codexDebugModelsTimeout, testMaxBytes)
+		if err == nil {
+			t.Fatal("expected error for output exceeding the byte cap, got nil")
+		}
+		if !strings.Contains(err.Error(), "exceeded") {
+			t.Errorf("expected a cap-exceeded-specific error, got: %v", err)
+		}
+	})
+
+	t.Run("output within the cap still resolves normally", func(t *testing.T) {
+		dir := t.TempDir()
+		catalog := fakeCodexModelsJSON(t, []codexModelEntry{
+			{Slug: "fake-best", Priority: 7, Visibility: "list", SupportedInAPI: true},
+		})
+		bin := writeFakeCodexDebugModelsBin(t, dir, catalog, "", 0)
+
+		// Cap generously above this small catalog's size so the "normal"
+		// path still succeeds under an injected (non-production) limit.
+		got, err := resolveCodexModelWithLimits(context.Background(), bin, 0, codexDebugModelsTimeout, int64(len(catalog)+1))
+		if err != nil {
+			t.Fatalf("unexpected error for in-cap output: %v", err)
+		}
+		if got != "fake-best" {
+			t.Errorf("slug = %q, want fake-best", got)
 		}
 	})
 }

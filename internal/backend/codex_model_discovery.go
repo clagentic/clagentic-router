@@ -71,12 +71,20 @@
 //     Zero behavior change from before this feature existed.
 //   - Model unset, discovery succeeds: the resolved slug is used.
 //   - Model unset, discovery fails (command failure, malformed JSON, empty
-//     catalog after filtering, rank out of range): ResolveCodexModel
-//     returns a descriptive error. Callers (buildAdapter in main.go) must
-//     treat this as a construction failure for that backend, not silently
-//     fall back to an empty/default model — an actionable startup log
-//     entry is the correct outcome, matching how buildAdapter already
-//     treats other construction errors (e.g. ollama_http requires url).
+//     catalog after filtering, rank out of range, subprocess timeout,
+//     oversized stdout): ResolveCodexModel returns a descriptive error.
+//     Callers (buildAdapter in main.go) must treat this as a construction
+//     failure for that backend, not silently fall back to an empty/default
+//     model — an actionable startup log entry is the correct outcome,
+//     matching how buildAdapter already treats other construction errors
+//     (e.g. ollama_http requires url).
+//
+// Two bounds protect daemon startup, which calls ResolveCodexModel
+// synchronously: codexDebugModelsTimeout (subprocess wall-clock bound —
+// exec.CommandContext kills the process on expiry, so a timeout never
+// leaks it) and codexDebugModelsMaxBytes (stdout read cap via
+// io.LimitReader — exceeding it is a discovery failure, never a
+// truncated-and-parsed catalog).
 package backend
 
 import (
@@ -84,8 +92,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os/exec"
 	"sort"
+	"time"
 )
 
 // codexModelEntry is one entry from `codex debug models`' "models" array.
@@ -109,31 +119,123 @@ type codexModelsResponse struct {
 
 const (
 	codexModelVisibilityList = "list"
+
+	// codexDebugModelsTimeout bounds the `codex debug models` subprocess
+	// call. Discovery is claimed to be fully offline (bundled install data,
+	// confirmed unaffected by a dead HTTP(S)_PROXY in the task's live
+	// verification), but a hung or wedged subprocess must never block
+	// daemon startup indefinitely — buildAdapter calls ResolveCodexModel
+	// synchronously during boot. Matches the 15s bound codex_discovery.go
+	// already established for its own (network) call, for consistency
+	// rather than because this path is expected to need that long.
+	codexDebugModelsTimeout = 15 * time.Second
+
+	// codexDebugModelsMaxBytes caps how much of the subprocess's stdout is
+	// read before this package gives up rather than parse a truncated (and
+	// therefore silently wrong) catalog. The real catalog observed live is
+	// ~178KB; 4MB gives >20x headroom for catalog growth while still
+	// rejecting a malformed or hostile binary that returns unbounded
+	// output.
+	codexDebugModelsMaxBytes = 4 << 20 // 4 MiB
 )
 
 // runCodexDebugModels invokes `codex debug models` and returns its parsed
-// catalog. bin is the resolved codex binary path (empty falls back to bare
-// "codex" via exec.Command's PATH lookup, matching other adapters'
-// resolution fallback shape).
+// catalog, bounded by the package's real timeout/size defaults. bin is the
+// resolved codex binary path (empty falls back to bare "codex" via
+// exec.Command's PATH lookup, matching other adapters' resolution fallback
+// shape).
 func runCodexDebugModels(ctx context.Context, bin string) ([]codexModelEntry, error) {
+	return runCodexDebugModelsWithLimits(ctx, bin, codexDebugModelsTimeout, codexDebugModelsMaxBytes)
+}
+
+// runCodexDebugModelsWithLimits is runCodexDebugModels with an injectable
+// timeout and max-byte cap, so tests can exercise the timeout and
+// over-limit paths in milliseconds instead of waiting on the real 15s/4MiB
+// production bounds. Production code only ever calls runCodexDebugModels.
+//
+// The subprocess is bounded by timeout: ctx is wrapped with
+// context.WithTimeout, and exec.CommandContext kills the direct child
+// (e.g. a wrapping shell) on expiry. That alone is not sufficient to
+// unblock a pipe read, though: a shell script's last command can be
+// forked (not exec'd in place) and keep the stdout pipe's write end open
+// as an orphan after the shell itself is killed, which would leave
+// io.ReadAll blocked on EOF forever. So the read+wait runs in a goroutine
+// and this function returns via select as soon as ctx is done, regardless
+// of whether that goroutine has finished — guaranteeing callers (and
+// daemon startup, which calls this synchronously) are never blocked past
+// timeout by a wedged or orphaned subprocess.
+func runCodexDebugModelsWithLimits(ctx context.Context, bin string, timeout time.Duration, maxBytes int64) ([]codexModelEntry, error) {
 	if bin == "" {
 		bin = "codex"
 	}
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	cmd := exec.CommandContext(ctx, bin, "debug", "models")
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
+	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("codex_model_discovery: %s debug models: %w (stderr: %s)",
-			bin, err, truncate(stderr.String(), 300))
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("codex_model_discovery: %s debug models: create stdout pipe: %w", bin, err)
 	}
 
-	var parsed codexModelsResponse
-	if err := json.Unmarshal(stdout.Bytes(), &parsed); err != nil {
-		return nil, fmt.Errorf("codex_model_discovery: parse debug models output: %w", err)
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("codex_model_discovery: %s debug models: start: %w", bin, err)
 	}
-	return parsed.Models, nil
+
+	type result struct {
+		stdout []byte
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		// Read at most maxBytes+1 so an over-limit response can be
+		// distinguished from one that happens to land exactly at the cap,
+		// without ever buffering the unbounded tail of a hostile/malformed
+		// response.
+		limited := io.LimitReader(stdoutPipe, maxBytes+1)
+		stdout, readErr := io.ReadAll(limited)
+		waitErr := cmd.Wait()
+		if readErr != nil {
+			done <- result{err: fmt.Errorf("codex_model_discovery: %s debug models: read stdout: %w", bin, readErr)}
+			return
+		}
+		if int64(len(stdout)) > maxBytes {
+			done <- result{err: fmt.Errorf("codex_model_discovery: %s debug models: output exceeded %d byte cap — refusing to parse a possibly-truncated catalog",
+				bin, maxBytes)}
+			return
+		}
+		if waitErr != nil {
+			done <- result{err: fmt.Errorf("codex_model_discovery: %s debug models: %w (stderr: %s)",
+				bin, waitErr, truncate(stderr.String(), 300))}
+			return
+		}
+		done <- result{stdout: stdout}
+	}()
+
+	select {
+	case <-ctx.Done():
+		// exec.CommandContext already signaled the direct child; explicitly
+		// kill it too (idempotent, belt-and-suspenders) so an orphaned
+		// grandchild that inherited the pipe fd is the only thing that
+		// could still be running — this goroutine leaks at most until that
+		// process exits, but the caller is never blocked waiting for it.
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		return nil, fmt.Errorf("codex_model_discovery: %s debug models: timed out after %s", bin, timeout)
+	case r := <-done:
+		if r.err != nil {
+			return nil, r.err
+		}
+		var parsed codexModelsResponse
+		if err := json.Unmarshal(r.stdout, &parsed); err != nil {
+			return nil, fmt.Errorf("codex_model_discovery: parse debug models output: %w", err)
+		}
+		return parsed.Models, nil
+	}
 }
 
 // filterAndSortCodexModels filters entries to visibility=="list" AND
@@ -192,6 +294,18 @@ func selectCodexModelByRank(usable []codexModelEntry, rank int) (string, error) 
 // a silently-empty model string. See package doc.
 func ResolveCodexModel(ctx context.Context, bin string, rank int) (string, error) {
 	entries, err := runCodexDebugModels(ctx, bin)
+	if err != nil {
+		return "", err
+	}
+	usable := filterAndSortCodexModels(entries)
+	return selectCodexModelByRank(usable, rank)
+}
+
+// resolveCodexModelWithLimits is ResolveCodexModel with an injectable
+// timeout/max-byte cap — see runCodexDebugModelsWithLimits doc. Test-only;
+// production code only ever calls ResolveCodexModel.
+func resolveCodexModelWithLimits(ctx context.Context, bin string, rank int, timeout time.Duration, maxBytes int64) (string, error) {
+	entries, err := runCodexDebugModelsWithLimits(ctx, bin, timeout, maxBytes)
 	if err != nil {
 		return "", err
 	}
