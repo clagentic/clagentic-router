@@ -489,7 +489,7 @@ base_url = "https://not-bedrock-mantle.example.com/v1"
 		}
 	})
 
-	t.Run("invalid discovered providerID degrades to empty pair, not error", func(t *testing.T) {
+	t.Run("dotted discovered id rejected upstream by parseModelProviders, never reaches the validator", func(t *testing.T) {
 		dir := t.TempDir()
 		writeCodexConfig(t, dir, `
 [model_providers."acme.bedrock"]
@@ -498,15 +498,42 @@ base_url = "https://bedrock-mantle.us-fake-1.api.aws/v1"
 		t.Setenv("CODEX_HOME", dir)
 
 		// parseModelProviders already rejects a "." inside a bare
-		// [model_providers.<id>] header (see header-parsing loop), so this
-		// exercises the validator's independence from that upstream
-		// constraint rather than relying on it — with no non-reserved
-		// candidate surviving, discovery itself returns feature-off before
-		// validateCodexProviderID is even reached, which is exactly the
-		// point: two independent layers both land on the same safe outcome.
+		// [model_providers.<id>] header (see header-parsing loop: no "."
+		// tolerated) — this proves that upstream rejection path lands on
+		// the same safe (empty pair) outcome. It does NOT exercise
+		// validateCodexProviderID: with no non-reserved candidate
+		// surviving discoverCodexProvider, DiscoverCodexProjectHeader
+		// returns feature-off before the validator is ever reached. See
+		// the "+"-id case below for a fixture that genuinely reaches it.
 		providerID, projectID := DiscoverCodexProjectHeader(context.Background(), "", "", "fake-key")
 		if providerID != "" || projectID != "" {
 			t.Errorf("expected empty pair, got providerID=%q projectID=%q", providerID, projectID)
+		}
+	})
+
+	t.Run("discovered id survives parseModelProviders but fails validateCodexProviderID", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCodexConfig(t, dir, `
+[model_providers."acme+bedrock"]
+base_url = "https://bedrock-mantle.us-fake-1.api.aws/v1"
+`)
+		t.Setenv("CODEX_HOME", dir)
+
+		// "+" contains none of the characters parseModelProviders rejects
+		// (it only rejects "."), and is stripped of nothing by the
+		// quote-trim, so discoverCodexProvider returns candidate ID
+		// "acme+bedrock" — a genuine non-reserved, single candidate. That
+		// means DiscoverCodexProjectHeader's providerID != "" branch is
+		// taken and validateCodexProviderID is the ONLY thing standing
+		// between this id and being interpolated into codex's -c
+		// override syntax: "+" is not in isCodexProviderIDChar's
+		// alnum/hyphen/underscore class, so the validator must reject it.
+		// (Deleting the validateCodexProviderID call in
+		// DiscoverCodexProjectHeader would make this test fail, since
+		// "acme+bedrock" would otherwise be returned unchanged.)
+		providerID, projectID := DiscoverCodexProjectHeader(context.Background(), "", "", "fake-key")
+		if providerID != "" || projectID != "" {
+			t.Errorf("expected empty pair (validator must reject \"acme+bedrock\"), got providerID=%q projectID=%q", providerID, projectID)
 		}
 	})
 }
