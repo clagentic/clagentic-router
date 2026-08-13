@@ -45,13 +45,13 @@ CREATE INDEX IF NOT EXISTS idx_quota_snapshots_time
 type QuotaSnapshotInput struct {
 	Status                string
 	RateLimitType         string
-	Utilization           *float64  // nil when status=allowed (below threshold)
-	ResetsAt              *int64    // Unix seconds; nil if zero time
-	SurpassedThreshold    *float64  // nil when absent
+	Utilization           *float64 // nil when status=allowed (below threshold)
+	ResetsAt              *int64   // Unix seconds; nil if zero time
+	SurpassedThreshold    *float64 // nil when absent
 	IsUsingOverage        bool
 	OverageStatus         *string
 	OverageDisabledReason *string
-	OverageResetsAt       *int64    // Unix seconds; nil when absent
+	OverageResetsAt       *int64 // Unix seconds; nil when absent
 	RawJSON               string
 }
 

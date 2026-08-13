@@ -298,4 +298,3 @@ func parseSSEChunks(t *testing.T, body string) []chatCompletionChunk {
 	}
 	return chunks
 }
-

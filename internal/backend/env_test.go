@@ -110,8 +110,8 @@ func TestCLIEnvAllowed_PrefixMatch(t *testing.T) {
 		{"CODEX_HOME=/home/user/.codex", true},
 		{"CLAGENTIC_DISABLE_RECALL=1", true},
 		{"CLAGENTIC_CODEX_TIER=flagship", true},
-		{"CLAGENTIC_ROUTER_TOKEN=secret", false},   // not in allowlist
-		{"CLAGENTIC_ROUTER_ADMIN_TOKEN=s", false},  // not in allowlist
+		{"CLAGENTIC_ROUTER_TOKEN=secret", false},  // not in allowlist
+		{"CLAGENTIC_ROUTER_ADMIN_TOKEN=s", false}, // not in allowlist
 		{"SECRET_KEY=abc", false},
 		{"DATABASE_URL=postgres://...", false},
 	}

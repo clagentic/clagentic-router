@@ -91,7 +91,7 @@ type BackendState struct {
 	// stale data at restart is worse than no data for capacity signals).
 	LocalSlotsIdle         int
 	LocalSlotsTotal        int
-	LocalVRAMHeadroomPct   float64   // 0.0–1.0; -1.0 = unknown
+	LocalVRAMHeadroomPct   float64 // 0.0–1.0; -1.0 = unknown
 	LocalModelHot          bool
 	LocalCapacityUpdatedAt time.Time
 
@@ -154,7 +154,7 @@ type Snapshot struct {
 	// Ephemeral: not persisted to SQLite.
 	LocalSlotsIdle         int
 	LocalSlotsTotal        int
-	LocalVRAMHeadroomPct   float64   // 0.0–1.0; -1.0 = unknown
+	LocalVRAMHeadroomPct   float64 // 0.0–1.0; -1.0 = unknown
 	LocalModelHot          bool
 	LocalCapacityUpdatedAt time.Time
 
@@ -190,18 +190,18 @@ func (s *BackendState) Snapshot() Snapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return Snapshot{
-		BackendID:            s.BackendID,
-		Status:               s.Status,
-		ConsecutiveFailures:  s.ConsecutiveFailures,
-		LastSuccessAt:        s.LastSuccessAt,
-		LastFailureAt:        s.LastFailureAt,
-		LastErrorType:        s.LastErrorType,
-		LastErrorRaw:         s.LastErrorRaw,
-		QuotaExhausted:       s.QuotaExhausted,
-		QuotaResetAt:         s.QuotaResetAt,
-		QuotaTokensRemaining: s.QuotaTokensRemaining,
-		QuotaTokensTotal:     s.QuotaTokensTotal,
-		QuotaLowAlerted:      s.QuotaLowAlerted,
+		BackendID:                  s.BackendID,
+		Status:                     s.Status,
+		ConsecutiveFailures:        s.ConsecutiveFailures,
+		LastSuccessAt:              s.LastSuccessAt,
+		LastFailureAt:              s.LastFailureAt,
+		LastErrorType:              s.LastErrorType,
+		LastErrorRaw:               s.LastErrorRaw,
+		QuotaExhausted:             s.QuotaExhausted,
+		QuotaResetAt:               s.QuotaResetAt,
+		QuotaTokensRemaining:       s.QuotaTokensRemaining,
+		QuotaTokensTotal:           s.QuotaTokensTotal,
+		QuotaLowAlerted:            s.QuotaLowAlerted,
 		RateLimitResetAt:           s.RateLimitResetAt,
 		RateWindowMessages:         s.RateWindowMessages,
 		RateWindowTokensEst:        s.RateWindowTokensEst,
@@ -211,18 +211,18 @@ func (s *BackendState) Snapshot() Snapshot {
 		RateLimitRequestsRemaining: s.RateLimitRequestsRemaining,
 		RateLimitRequestsResetAt:   s.RateLimitRequestsResetAt,
 		LatencyEMAMs:               s.LatencyEMAMs,
-		LocalSlotsIdle:         s.LocalSlotsIdle,
-		LocalSlotsTotal:        s.LocalSlotsTotal,
-		LocalVRAMHeadroomPct:   s.LocalVRAMHeadroomPct,
-		LocalModelHot:          s.LocalModelHot,
-		LocalCapacityUpdatedAt: s.LocalCapacityUpdatedAt,
-		TotalCalls:           s.TotalCalls,
-		TotalTokensEst:       s.TotalTokensEst,
-		TotalCostUSDEst:      s.TotalCostUSDEst,
-		SessionCostUSDEst:    s.SessionCostUSDEst,
-		LastQuotaSnapshot:    s.LastQuotaSnapshot,
-		LastRecoveryProbeAt:  s.LastRecoveryProbeAt,
-		UpdatedAt:            s.UpdatedAt,
+		LocalSlotsIdle:             s.LocalSlotsIdle,
+		LocalSlotsTotal:            s.LocalSlotsTotal,
+		LocalVRAMHeadroomPct:       s.LocalVRAMHeadroomPct,
+		LocalModelHot:              s.LocalModelHot,
+		LocalCapacityUpdatedAt:     s.LocalCapacityUpdatedAt,
+		TotalCalls:                 s.TotalCalls,
+		TotalTokensEst:             s.TotalTokensEst,
+		TotalCostUSDEst:            s.TotalCostUSDEst,
+		SessionCostUSDEst:          s.SessionCostUSDEst,
+		LastQuotaSnapshot:          s.LastQuotaSnapshot,
+		LastRecoveryProbeAt:        s.LastRecoveryProbeAt,
+		UpdatedAt:                  s.UpdatedAt,
 	}
 }
 

@@ -18,8 +18,8 @@ type RateLimitEvent struct {
 	Status                string
 	RateLimitType         string
 	ResetsAt              time.Time
-	Utilization           *float64   // nil when absent (status=allowed, below threshold)
-	SurpassedThreshold    *float64   // nil when absent
+	Utilization           *float64 // nil when absent (status=allowed, below threshold)
+	SurpassedThreshold    *float64 // nil when absent
 	IsUsingOverage        bool
 	OverageStatus         *string
 	OverageDisabledReason *string

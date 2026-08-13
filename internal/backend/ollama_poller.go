@@ -35,8 +35,8 @@ type OllamaCapacity struct {
 // OllamaPoller polls GET /api/ps on an Ollama server and delivers capacity
 // snapshots via OnUpdate. Start runs the poll loop until ctx is cancelled.
 type OllamaPoller struct {
-	BackendID   string
-	BaseURL     string
+	BackendID string
+	BaseURL   string
 	// TotalVRAM is the operator-configured total VRAM bytes; 0 means unknown.
 	TotalVRAM   int64
 	Interval    time.Duration

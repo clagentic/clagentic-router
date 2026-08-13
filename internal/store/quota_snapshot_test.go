@@ -110,12 +110,12 @@ func TestInsertQuotaSnapshot_NullFields(t *testing.T) {
 
 	resetsAt := int64(1780945600)
 	e := QuotaSnapshotInput{
-		Status:        "allowed",
-		RateLimitType: "five_hour",
-		ResetsAt:      &resetsAt,
-		Utilization:   nil, // legitimately absent when status=allowed
+		Status:         "allowed",
+		RateLimitType:  "five_hour",
+		ResetsAt:       &resetsAt,
+		Utilization:    nil, // legitimately absent when status=allowed
 		IsUsingOverage: false,
-		RawJSON:       `{"status":"allowed"}`,
+		RawJSON:        `{"status":"allowed"}`,
 	}
 
 	if err := s.InsertQuotaSnapshot(ctx, "backend-b", e); err != nil {

@@ -31,7 +31,7 @@ type RateLimitEventData struct {
 type QuotaSnapshot struct {
 	Status        string    `json:"status"`
 	RateLimitType string    `json:"rate_limit_type"`
-	Utilization   *float64  `json:"utilization"`   // null when below threshold
+	Utilization   *float64  `json:"utilization"` // null when below threshold
 	ResetsAt      time.Time `json:"resets_at"`
 	ObservedAt    time.Time `json:"observed_at"`
 }

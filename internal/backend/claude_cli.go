@@ -110,7 +110,7 @@ func resolveDaemonHome() (string, error) {
 			"set HOME in the service environment (e.g. Environment=HOME=/home/router in the systemd unit)", err)
 	}
 	if u.HomeDir == "" {
-		return "", fmt.Errorf("HOME env var is unset and os/user returned an empty HomeDir; "+
+		return "", fmt.Errorf("HOME env var is unset and os/user returned an empty HomeDir; " +
 			"set HOME in the service environment (e.g. Environment=HOME=/home/router in the systemd unit)")
 	}
 	return u.HomeDir, nil

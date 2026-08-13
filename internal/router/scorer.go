@@ -17,6 +17,7 @@
 //  7. Rate-limit window pressure: soft penalty when provider header data shows low remaining tokens
 //  8. Local slot capacity: hard block at 0 idle; tiered penalty below 25%/50% idle (llama.cpp)
 //  9. Local model hot check: cold-start penalty when model not loaded (Ollama)
+//
 // 10. Latency penalty: inverse-proportional above threshold
 //
 // Score is a pure deterministic function — it does not introduce random noise.
