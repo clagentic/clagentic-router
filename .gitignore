@@ -7,3 +7,5 @@ router.yaml
 pr-payload-*.json
 pr-body-*.txt
 pr-body-*.md
+gitleaks-report-*.json
+semgrep-report-*.json
