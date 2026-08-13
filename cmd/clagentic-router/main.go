@@ -381,16 +381,16 @@ func buildAdapter(id string, b *config.BackendConfig) (backend.Adapter, error) {
 			backend.EffortLevel(b.Effort), backend.ThinkingMode(b.ThinkingMode)), nil
 
 	case config.AdapterCodexCLI:
-		// Discovery is cached at construction time (never per-Invoke): reads
-		// the operator's local codex config.toml for the provider id and, if
-		// resolved, makes one live Bedrock mantle project-list call. Both
-		// yaml fields remain honored as explicit overrides for the
-		// ambiguous multi-provider/multi-project case; the default path
-		// (both unset) needs zero operator config. Any discovery failure
-		// degrades to an empty pair — see codex_discovery.go doc — so this
-		// can never block adapter construction.
-		providerID, projectID := backend.DiscoverCodexProjectHeader(
-			context.Background(), b.CodexProviderID, b.OpenAIProjectID, b.ResolvedOpenAIAPIKey())
+		// Provider-id discovery is cached at construction time (never
+		// per-Invoke): reads the operator's local codex config.toml.
+		// codex_provider_id remains honored as an explicit override for the
+		// ambiguous multi-provider case; the default path (unset) needs
+		// zero operator config. openai_project_id has no discovery path —
+		// it is override-only (see codex_discovery.go doc) and is passed
+		// through unchanged. Any provider-discovery failure degrades to an
+		// empty pair — see codex_discovery.go doc — so this can never block
+		// adapter construction.
+		providerID, projectID := backend.DiscoverCodexProjectHeader(b.CodexProviderID, b.OpenAIProjectID)
 
 		model := b.Model
 		if model == "" {

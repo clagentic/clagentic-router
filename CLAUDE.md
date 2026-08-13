@@ -45,29 +45,38 @@ constraint (host with OAuth sessions vs. containerised/keyless), and any new
 adapter-level feature should be evaluated against both families, not built
 against whichever one is at hand.
 
-**Discover, don't hardcode.** A value identifying a model, provider, project,
-or endpoint should be pulled from the source of truth at runtime, not typed
-into config. clagentic-console's established pattern is the model: it queries
-`GET /v1/models` and the codex `model/list` RPC, keeping a static table only
-as a failure fallback. In this repo, `internal/backend/codex_discovery.go`
-(provider id + Bedrock project id, lr-8dd85a) and
-`internal/backend/codex_model_discovery.go` (model slug via `codex debug
-models`, lr-82e68e) are the reference implementations: discover once at
-adapter-construction time, never per-request; degrade to feature-off on
-failure *when omission is safe* (header injection — an empty pair is simply
-"no header," see `codex_discovery.go`'s package doc); but treat discovery
-failure as a hard construction error when omission is not safe (model
-selection — an unresolved model is not "feature off," it is "codex picks an
-undocumented default," which is the outcome discovery exists to remove; see
+**Discover, don't hardcode — but only what you can actually verify by
+calling it.** A value identifying a model, provider, project, or endpoint
+should be pulled from the source of truth at runtime, not typed into
+config, and *never* documented as discoverable against an endpoint that has
+not actually been called (lr-698965 reverted a fabricated Bedrock
+mantle project-discovery endpoint that was asserted as fact and never once
+invoked — see `internal/backend/codex_discovery.go`'s package doc for the
+corrected, override-only shape of that field). clagentic-console's
+established pattern is the model: it queries `GET /v1/models` and the codex
+`model/list` RPC, keeping a static table only as a failure fallback. In this
+repo, `internal/backend/codex_discovery.go`'s provider-id discovery
+(lr-8dd85a) and `internal/backend/codex_model_discovery.go`'s model slug
+discovery via `codex debug models` (lr-82e68e) are the reference
+implementations: both discover once at adapter-construction time, never
+per-request, against a locally-readable file or a real subprocess call whose
+output shape was captured from a live run — not an assumed remote endpoint.
+Degrade to feature-off on failure *when omission is safe* (header
+injection — an empty pair is simply "no header," see
+`codex_discovery.go`'s package doc); but treat discovery failure as a hard
+construction error when omission is not safe (model selection — an
+unresolved model is not "feature off," it is "codex picks an undocumented
+default," which is the outcome discovery exists to remove; see
 `codex_model_discovery.go`'s package doc). Bound every discovery call in time
 and response size.
 
 **Explicit config always wins.** Discovery is additive. `buildAdapter` in
 `cmd/clagentic-router/main.go` only invokes discovery when the corresponding
-config field (`CodexProviderID`, `OpenAIProjectID`, `Model`) is empty; an
-operator-supplied value is honored byte-identically with discovery never
-attempted. This is the compatibility guarantee that makes it safe to add
-discovery to a working deployment.
+config field (`CodexProviderID`, `Model`) is empty; an operator-supplied
+value is honored byte-identically with discovery never attempted. This is
+the compatibility guarantee that makes it safe to add discovery to a working
+deployment. `OpenAIProjectID` has no discovery path at all (see above) — it
+is either set by the operator or the header is not injected.
 
 **Don't break working paths.** The Claude brand account via `claude_cli` and
 ChatGPT-Plus via `codex_cli` are load-bearing production paths. A change that
