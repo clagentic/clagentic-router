@@ -72,6 +72,86 @@ import (
 	"time"
 )
 
+// maxBedrockProjectsResponseBytes caps how much of the mantle project-list
+// response body is read before this package gives up rather than buffer an
+// arbitrarily large (hostile or malfunctioning-endpoint) response. A
+// project-list response is a handful of small JSON objects — 64KiB gives
+// generous headroom over any realistic organization's project count while
+// still rejecting an unbounded body. Mirrors the io.LimitReader(+1 sentinel)
+// pattern codex_model_discovery.go established for the (much larger) model
+// catalog read, reused here for idiom consistency rather than invented
+// fresh.
+const maxBedrockProjectsResponseBytes = 64 << 10 // 64 KiB
+
+// maxMantleRegionLen bounds an accepted AWS region string extracted from a
+// discovered provider's base_url. Real AWS region codes (e.g. "us-east-1",
+// "ap-southeast-2") are well under this; it exists only to reject a
+// pathological value before it is interpolated into an outbound request URL.
+const maxMantleRegionLen = 32
+
+// maxCodexProviderIDLen bounds an accepted codex model_providers.<id> key
+// before it is interpolated into codex's own -c TOML-override syntax. Real
+// provider ids are short slugs; this exists only to reject a pathological
+// value, not to accommodate any observed real-world id.
+const maxCodexProviderIDLen = 64
+
+// isMantleRegionChar reports whether r is valid within an AWS region code:
+// lowercase ASCII letters, digits, and hyphen. This is deliberately a
+// character-class allow-list, not an AWS-region-format parser — it exists to
+// bound what can reach an authenticated outbound URL, not to validate that
+// the value is a real region.
+func isMantleRegionChar(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-'
+}
+
+// validateMantleRegion rejects a region string that is empty, too long, or
+// contains any character outside the lowercase-alphanumeric-and-hyphen
+// class. Never rewrites or strips — an invalid region degrades the caller to
+// feature-off, consistent with every other discovery failure path in this
+// file (see package doc).
+func validateMantleRegion(region string) bool {
+	if region == "" || len(region) > maxMantleRegionLen {
+		return false
+	}
+	for _, r := range region {
+		if !isMantleRegionChar(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// isCodexProviderIDChar reports whether r is valid within a codex
+// model_providers.<id> key. codex's own TOML table-header parsing already
+// constrains what parseModelProviders extracts (see the header-parsing loop
+// above: no "." tolerated, quote-stripped), but the id is re-validated here,
+// independently, at the point it is about to cross into codex's own -c
+// override syntax (codex_cli.go) — a value crossing into another tool's
+// config-override parser should not rely on an upstream parser's side
+// effects to stay safe. Lowercase/uppercase alnum, hyphen, and underscore
+// covers every realistic provider id shape without accepting characters that
+// have any special meaning to TOML or shell.
+func isCodexProviderIDChar(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_'
+}
+
+// validateCodexProviderID rejects a providerID that is empty, too long, or
+// contains any character outside the alnum/hyphen/underscore class. Never
+// rewrites or strips — an invalid providerID degrades the caller to
+// feature-off, consistent with every other discovery failure path in this
+// file (see package doc).
+func validateCodexProviderID(id string) bool {
+	if id == "" || len(id) > maxCodexProviderIDLen {
+		return false
+	}
+	for _, r := range id {
+		if !isCodexProviderIDChar(r) {
+			return false
+		}
+	}
+	return true
+}
+
 // reservedCodexProviderIDs are the codex CLI's built-in model_providers keys.
 // These are never eligible for automatic selection: codex hard-rejects an
 // http_headers override against a reserved/builtin provider id (confirmed
@@ -211,9 +291,13 @@ func parseModelProviders(r io.Reader) ([]codexProviderCandidate, error) {
 
 // mantleRegionFromBaseURL extracts the AWS region from a Bedrock mantle
 // base_url of the form "https://bedrock-mantle.{region}.api.aws/v1" (or any
-// path suffix). Returns "" if baseURL does not match that host shape — the
+// path suffix). Returns "" if baseURL does not match that host shape (the
 // provider may be pointed somewhere else entirely, which is not this
-// package's business to second-guess.
+// package's business to second-guess) OR if the extracted region fails
+// validateMantleRegion — the caller interpolates this value into an
+// authenticated outbound request URL, so anything outside the expected
+// character class is rejected rather than passed through. Never rewrites or
+// strips a bad value; rejection degrades to feature-off (see package doc).
 func mantleRegionFromBaseURL(baseURL string) string {
 	const hostPrefix = "bedrock-mantle."
 	const hostSuffix = ".api.aws"
@@ -227,7 +311,11 @@ func mantleRegionFromBaseURL(baseURL string) string {
 	if !strings.HasPrefix(host, hostPrefix) || !strings.HasSuffix(host, hostSuffix) {
 		return ""
 	}
-	return strings.TrimSuffix(strings.TrimPrefix(host, hostPrefix), hostSuffix)
+	region := strings.TrimSuffix(strings.TrimPrefix(host, hostPrefix), hostSuffix)
+	if !validateMantleRegion(region) {
+		return ""
+	}
+	return region
 }
 
 // bedrockProject is one entry from GET /v1/organization/projects.
@@ -261,6 +349,16 @@ func discoverCodexProject(ctx context.Context, client *http.Client, region, apiK
 	}
 
 	url := fmt.Sprintf("https://bedrock-mantle.%s.api.aws/v1/organization/projects", region)
+	return discoverCodexProjectAt(ctx, client, url, apiKey)
+}
+
+// discoverCodexProjectAt performs the GET + bounded-read + selection logic
+// against an arbitrary projects-list URL. Split out from discoverCodexProject
+// so tests can point it at an httptest.Server (127.0.0.1:<port>) instead of
+// needing a live bedrock-mantle.{region}.api.aws host — discoverCodexProject
+// itself remains the only caller that constructs that URL from a
+// (validated) region string.
+func discoverCodexProjectAt(ctx context.Context, client *http.Client, url, apiKey string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", fmt.Errorf("codex_discovery: build request: %w", err)
@@ -273,7 +371,20 @@ func discoverCodexProject(ctx context.Context, client *http.Client, region, apiK
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	// Read at most maxBedrockProjectsResponseBytes+1 so an over-limit
+	// response can be distinguished from one that happens to land exactly
+	// at the cap, without ever buffering the unbounded tail of a hostile or
+	// malfunctioning endpoint's response — same pattern as
+	// runCodexDebugModelsWithLimits in codex_model_discovery.go.
+	limited := io.LimitReader(resp.Body, maxBedrockProjectsResponseBytes+1)
+	body, err := io.ReadAll(limited)
+	if err != nil {
+		return "", fmt.Errorf("codex_discovery: GET %s: read response body: %w", url, err)
+	}
+	if len(body) > maxBedrockProjectsResponseBytes {
+		return "", fmt.Errorf("codex_discovery: GET %s: response exceeded %d byte cap — refusing to parse a possibly-truncated body",
+			url, maxBedrockProjectsResponseBytes)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("codex_discovery: GET %s: HTTP %d: %s", url, resp.StatusCode, truncate(string(body), 200))
 	}
@@ -333,6 +444,18 @@ func DiscoverCodexProjectHeader(ctx context.Context, overrideProviderID, overrid
 		}
 		providerID = cand.ID
 		baseURL = cand.BaseURL
+	}
+
+	// providerID (whether an operator override or config.toml-discovered)
+	// is about to be interpolated into codex's own -c
+	// model_providers.<id>.http_headers TOML-override syntax (codex_cli.go)
+	// — validate its character class before it ever leaves this function.
+	// Rejection degrades to feature-off like every other discovery failure
+	// path here, never a rewrite/strip.
+	if !validateCodexProviderID(providerID) {
+		slog.Warn("codex_cli discovery: providerID failed validation, feature disabled for this call",
+			"provider_id_len", len(providerID))
+		return "", ""
 	}
 
 	if projectID == "" {
