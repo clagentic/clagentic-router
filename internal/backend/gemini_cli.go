@@ -139,6 +139,18 @@ func (a *GeminiCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Env = env
+	// Neutral working directory so the subprocess does not inherit the
+	// daemon's cwd. Defaults to DefaultWorkingDir ("/") when the caller does
+	// not supply req.WorkingDir; a validated, caller-supplied directory (see
+	// ResolveWorkingDir at the wire boundary) is honored instead. Previously
+	// this adapter set no cmd.Dir at all and silently inherited whatever cwd
+	// the daemon process happened to be started from — see claude_cli.go's
+	// Invoke for the fuller two-layer hook-suppression rationale that makes
+	// this default safe to apply uniformly.
+	cmd.Dir = req.WorkingDir
+	if cmd.Dir == "" {
+		cmd.Dir = DefaultWorkingDir
+	}
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
