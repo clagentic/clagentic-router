@@ -87,6 +87,60 @@ func TestBuildCLIEnv_AllowsRequiredVars(t *testing.T) {
 	}
 }
 
+// TestBuildCLIEnv_CodexCLIBlocksSecrets verifies that codex_cli's subprocess
+// env (buildCLIEnv(nil) — see codex_cli.go's Invoke, which passes no extra
+// vars) filters daemon secrets the same as every other CLI adapter. codex_cli
+// was previously the only CLI adapter that never called buildCLIEnv at all
+// and inherited the daemon's entire environment (lr-bd5dc0).
+func TestBuildCLIEnv_CodexCLIBlocksSecrets(t *testing.T) {
+	os.Setenv("CLAGENTIC_ROUTER_TOKEN", "super-secret-token")
+	os.Setenv("OPENAI_API_KEY", "sk-openai-test")
+	defer func() {
+		os.Unsetenv("CLAGENTIC_ROUTER_TOKEN")
+		os.Unsetenv("OPENAI_API_KEY")
+	}()
+
+	origHome := os.Getenv("HOME")
+	if origHome == "" {
+		os.Setenv("HOME", "/root")
+		defer os.Setenv("HOME", origHome)
+	}
+	os.Setenv("CODEX_HOME", "/home/user/.codex")
+	defer os.Unsetenv("CODEX_HOME")
+
+	// codex_cli.go's Invoke calls buildCLIEnv(nil) — no extra vars, no HOME
+	// override (unlike claude_cli/codex_subagent).
+	env := buildCLIEnv(nil)
+
+	for _, secret := range []string{
+		"CLAGENTIC_ROUTER_TOKEN=super-secret-token",
+		"OPENAI_API_KEY=sk-openai-test",
+	} {
+		for _, kv := range env {
+			if kv == secret {
+				t.Errorf("secret var leaked into codex_cli subprocess env: %q", secret)
+			}
+		}
+	}
+
+	present := func(prefix string) bool {
+		for _, kv := range env {
+			if len(kv) >= len(prefix) && kv[:len(prefix)] == prefix {
+				return true
+			}
+		}
+		return false
+	}
+	// HOME and CODEX_ are both allowlisted — auth.json resolution for
+	// ChatGPT-Plus OAuth (via HOME or CODEX_HOME) must survive the filter.
+	if !present("HOME=") {
+		t.Error("HOME missing from codex_cli subprocess env — would break auth.json resolution")
+	}
+	if !present("CODEX_HOME=") {
+		t.Error("CODEX_HOME missing from codex_cli subprocess env")
+	}
+}
+
 // TestCLIEnvAllowed_KeyMatchesExactly tests exact-key matching (e.g. PATH vs PATHEXT).
 func TestCLIEnvAllowed_KeyMatchesExactly(t *testing.T) {
 	if !cliEnvAllowed("PATH=/usr/bin") {

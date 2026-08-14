@@ -1,8 +1,8 @@
 // internal/backend/env.go — filtered environment construction for CLI subprocess adapters.
 //
-// CLI adapters (claude_cli, codex_subagent, gemini_cli) inherit only a curated
-// subset of the daemon's environment. This prevents API keys, router tokens, and
-// deployment secrets from leaking into subprocess environments. (lr-c7ac)
+// CLI adapters (claude_cli, codex_cli, codex_subagent, gemini_cli) inherit only
+// a curated subset of the daemon's environment. This prevents API keys, router
+// tokens, and deployment secrets from leaking into subprocess environments. (lr-c7ac)
 package backend
 
 import (
