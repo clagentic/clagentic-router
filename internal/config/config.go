@@ -8,6 +8,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -571,39 +572,20 @@ type Config struct {
 	// RegistryPath is the path to the models registry YAML (tier alias definitions).
 	// If empty, only the Tiers map is used for resolution.
 	RegistryPath string `yaml:"registry_path"`
+}
 
-	// TrustedWorkingDirs is the operator-controlled allowlist of directories
-	// the claude_cli and codex_subagent adapters are permitted to mark
-	// trusted in the isolated subprocess HOME's .claude.json (see
-	// internal/backend/trust_allowlist.go and trust_sync.go). This is a
-	// human-in-the-loop safety gate, not a routing convenience: adding a
-	// path here is an explicit opt-in to letting that directory's
-	// .claude/settings.json permissions.allow entries, hooks, and project
-	// CLAUDE.md memory execute inside every router-spawned subprocess
-	// invoked against it, for any caller who can reach this daemon with
-	// that working_dir value.
-	//
-	// Global (top-level, not per-backend) because the isolated HOME and its
-	// .claude.json are shared process-wide state — every claude_cli and
-	// codex_subagent backend writes through the same file, so a per-backend
-	// allowlist would not reflect what actually gets trusted.
-	//
-	// Empty or absent (the default) trusts nothing: every caller-supplied
-	// working_dir is refused the trust write and the subprocess fails with
-	// the pre-existing "workspace has not been trusted" error. This is a
-	// deliberate fail-closed default — see trust_allowlist.go's package doc
-	// for why "no config = old permissive behavior" was rejected. Entries
-	// are resolved via filepath.EvalSymlinks at startup (see
-	// backend.NewTrustAllowlist); an entry that does not exist or cannot be
-	// resolved is dropped with a Warn log, not treated as fatal.
-	//
-	// EXACT-MATCH only, despite the plural field name: each entry trusts
-	// exactly that one directory, never its subtree. Listing "/workspace"
-	// does NOT admit "/workspace/foo" — every distinct working_dir a
-	// deployment needs to trust must have its own entry. See
-	// backend.TrustAllowlist's doc comment for the full rationale (this is
-	// the intentionally safer of the two possible semantics).
-	TrustedWorkingDirs []string `yaml:"trusted_working_dirs"`
+// unknownTopLevelKeyWarnings names top-level config keys this version no
+// longer recognizes but a prior version accepted, so an operator's existing
+// YAML does not turn into a hard startup error on upgrade. Checked against
+// the raw parsed key set in Load, after the normal strict unmarshal. Add an
+// entry here when removing a field that operators may already have set in a
+// deployed router.yaml.
+var unknownTopLevelKeyWarnings = map[string]string{
+	"trusted_working_dirs": "trusted_working_dirs was removed: the claude CLI shows no " +
+		"workspace trust dialog in the non-interactive (-p) mode this daemon uses, so the " +
+		"allowlist it gated was never enforcing anything. claude_cli/codex_subagent now pass " +
+		"--safe-mode instead, which is unconditional and has no config surface. Remove this " +
+		"key from router.yaml; it is ignored.",
 }
 
 // Load reads a Config from the YAML file at path.
@@ -617,10 +599,35 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
 	}
+	warnRemovedTopLevelKeys(data)
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}
 	return &cfg, nil
+}
+
+// warnRemovedTopLevelKeys logs a Warn for each key in unknownTopLevelKeyWarnings
+// present in the raw YAML, so an operator upgrading past a removed config
+// surface (e.g. trusted_working_dirs) gets a visible, actionable explanation
+// instead of either a hard startup error or a silently-ignored setting. A
+// removed field must never become a fatal error on upgrade — the operator
+// could already have it set from a merged prior release, and refusing to
+// start over an ignorable key would be a worse regression than the removal
+// itself.
+func warnRemovedTopLevelKeys(data []byte) {
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		// Already parsed successfully above via strict struct unmarshal;
+		// this generic re-parse (done only to enumerate top-level keys)
+		// should not fail on the same data, but if it does, skip the
+		// warning rather than fail startup over a diagnostic-only pass.
+		return
+	}
+	for key, msg := range unknownTopLevelKeyWarnings {
+		if _, present := raw[key]; present {
+			slog.Warn("config: ignoring removed key", "key", key, "detail", msg)
+		}
+	}
 }
 
 // validate checks required fields and fills defaults.
