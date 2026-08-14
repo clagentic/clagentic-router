@@ -31,18 +31,17 @@ roles:
 # ---------------------------------------------------------------------------
 merge:
   merge_requirements:
-    # ci_pass: false -- the repo's only CI definition is
-    # .forgejo/workflows/ci.yml, which is Forgejo-native (uses:
-    # https://code.forgejo.org/actions/checkout@v3, runs-on: the
-    # clagentic-router repo-scoped Forgejo runner). This repo's origin is
-    # GitHub (clagentic/clagentic-router; migrated Forgejo->GitHub
-    # 2026-06-04) with no .github/workflows/ present -- GitHub Actions does
-    # not read .forgejo/ and cannot run this workflow. No CI actually runs
-    # on PRs on the live platform, so ci_pass:true would be a standing false
-    # merge-blocker. Operator-confirmed 2026-07-18 (lr-f181b6): set to
-    # false to match the live-platform reality, not the aspirational one.
-    # Revisit if/when a .github/workflows/ci.yml equivalent is added.
-    ci_pass: false
+    # ci_pass: true -- .github/workflows/ci.yml (added lr-bfbcf2, PR #24)
+    # runs on every PR targeting main, unconditionally, with two jobs:
+    # "Build + test" and "govulncheck". Confirmed genuinely green on a real
+    # PR on the live platform, not inferred: PR #43, head ce2f9aa, Actions
+    # run 31807041583 -- both "govulncheck" (94788335010) and "Build + test"
+    # (94788334860) concluded SUCCESS. The gate itself was independently
+    # verified working end-to-end when NAOMI merged PR #43 under this same
+    # mechanism (lr-d52fcb's check-runs-at-HEAD read, not legacy commit
+    # status). ci_pass:false (lr-f181b6) was correct when no GitHub Actions
+    # workflow existed; that precondition no longer holds (lr-539a14).
+    ci_pass: true
     # tests_pass: true -- NAOMI requires a clean `go test ./...` run
     # regardless of hosted CI; this repo has real, fast unit tests.
     tests_pass: true
