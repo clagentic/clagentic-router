@@ -22,6 +22,20 @@
 // copies, merges, or reads any of its content; the two files are unrelated
 // beyond sharing a schema.
 //
+// # Containment (BOBBIE finding bobbie.uncat.1, lr-4abfe9 follow-up)
+//
+// The trust bit this function sets is not cosmetic: once true, the claude
+// CLI starts honoring that directory's .claude/settings.json
+// permissions.allow entries, hooks, and project CLAUDE.md memory for every
+// subprocess invocation against it. backend.ResolveWorkingDir validates only
+// absolute/exists/is-a-directory — it is documented (this repo's CLAUDE.md)
+// as NOT a containment control — so a caller-supplied working_dir passing
+// ResolveWorkingDir must never be sufficient, on its own, to grant that
+// trust. syncProjectTrust therefore takes a *TrustAllowlist and refuses
+// (no-op, no write) for any dir not on it. See trust_allowlist.go for the
+// full trust model, the fail-closed empty-allowlist default, and the
+// DefaultWorkingDir ("/") posture.
+//
 // # Write discipline (concurrency)
 //
 // Multiple Invoke calls (claude_cli and codex_subagent both call this, and
@@ -94,6 +108,17 @@ type claudeProjectConfig struct {
 // here, so the trust entry always matches what the CLI itself will look up
 // for its own (identical) cwd.
 //
+// allowlist bounds the write: dir must satisfy allowlist.Allows(dir) or this
+// call is a no-op — no read, no write, no mutation of any kind. This is the
+// containment BOBBIE's finding (bobbie.uncat.1) required: trust is a
+// human-in-the-loop safety gate, and this function must never widen it to a
+// directory the operator did not explicitly opt in via
+// config.Config.TrustedWorkingDirs. See trust_allowlist.go's package doc for
+// the full trust model, the fail-closed default, and the DefaultWorkingDir
+// ("/") posture. A nil allowlist (e.g. a call site that never wired one)
+// also refuses every dir — TrustAllowlist.Allows is nil-safe and fails
+// closed.
+//
 // home == "" or dir == "" are no-ops: home=="" means the isolated-HOME
 // feature itself is off (mirrors the claudeSubprocessHome=="" checks at the
 // claude_cli.go/codex_subagent.go call sites), and dir=="" would upsert a
@@ -105,8 +130,17 @@ type claudeProjectConfig struct {
 // posture in codex_discovery.go for cases where degrading to "feature off"
 // is safe. Here "feature off" means the trust dialog error persists exactly
 // as it does today — a known, pre-existing failure mode, not a regression.
-func syncProjectTrust(home, dir string) {
+func syncProjectTrust(home, dir string, allowlist *TrustAllowlist) {
 	if home == "" || dir == "" {
+		return
+	}
+
+	if !allowlist.Allows(dir) {
+		slog.Debug("claude_cli: working_dir is not on trusted_working_dirs allowlist; "+
+			"trust dialog will not be pre-accepted for this invocation — "+
+			"the underlying Claude Code CLI call will fail with a trust-dialog error "+
+			"unless this directory is added to trusted_working_dirs in router config",
+			"dir", dir)
 		return
 	}
 
