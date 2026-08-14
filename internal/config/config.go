@@ -571,6 +571,39 @@ type Config struct {
 	// RegistryPath is the path to the models registry YAML (tier alias definitions).
 	// If empty, only the Tiers map is used for resolution.
 	RegistryPath string `yaml:"registry_path"`
+
+	// TrustedWorkingDirs is the operator-controlled allowlist of directories
+	// the claude_cli and codex_subagent adapters are permitted to mark
+	// trusted in the isolated subprocess HOME's .claude.json (see
+	// internal/backend/trust_allowlist.go and trust_sync.go). This is a
+	// human-in-the-loop safety gate, not a routing convenience: adding a
+	// path here is an explicit opt-in to letting that directory's
+	// .claude/settings.json permissions.allow entries, hooks, and project
+	// CLAUDE.md memory execute inside every router-spawned subprocess
+	// invoked against it, for any caller who can reach this daemon with
+	// that working_dir value.
+	//
+	// Global (top-level, not per-backend) because the isolated HOME and its
+	// .claude.json are shared process-wide state — every claude_cli and
+	// codex_subagent backend writes through the same file, so a per-backend
+	// allowlist would not reflect what actually gets trusted.
+	//
+	// Empty or absent (the default) trusts nothing: every caller-supplied
+	// working_dir is refused the trust write and the subprocess fails with
+	// the pre-existing "workspace has not been trusted" error. This is a
+	// deliberate fail-closed default — see trust_allowlist.go's package doc
+	// for why "no config = old permissive behavior" was rejected. Entries
+	// are resolved via filepath.EvalSymlinks at startup (see
+	// backend.NewTrustAllowlist); an entry that does not exist or cannot be
+	// resolved is dropped with a Warn log, not treated as fatal.
+	//
+	// EXACT-MATCH only, despite the plural field name: each entry trusts
+	// exactly that one directory, never its subtree. Listing "/workspace"
+	// does NOT admit "/workspace/foo" — every distinct working_dir a
+	// deployment needs to trust must have its own entry. See
+	// backend.TrustAllowlist's doc comment for the full rationale (this is
+	// the intentionally safer of the two possible semantics).
+	TrustedWorkingDirs []string `yaml:"trusted_working_dirs"`
 }
 
 // Load reads a Config from the YAML file at path.

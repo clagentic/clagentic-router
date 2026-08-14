@@ -264,6 +264,32 @@ routing:
   # Default: 300 (5 minutes). Set to 0 to disable (strict manual-intervention
   # semantics — operator must use /backends/{id}/reset to re-enable).
 
+# --- Trusted working directories (claude_cli / codex_subagent only) ---
+# trusted_working_dirs: []
+# Operator opt-in allowlist gating whether claude_cli and codex_subagent are
+# permitted to pre-accept the Claude Code CLI's per-project trust dialog for
+# a caller-supplied working_dir (see the "Working directory (working_dir)"
+# section in README.md). Accepting that dialog is not cosmetic — it makes
+# the CLI start honoring that directory's .claude/settings.json
+# permissions.allow entries, hooks, and project CLAUDE.md memory inside
+# every router-spawned subprocess invoked against it, for any caller who can
+# reach this daemon with that working_dir value. codex_cli and gemini_cli
+# have no trust dialog and ignore this setting entirely.
+#
+# FAIL-CLOSED DEFAULT: empty/absent (as shipped here) trusts nothing — every
+# working_dir is refused the trust write and claude_cli/codex_subagent fail
+# with the CLI's own "workspace has not been trusted" error. Existing
+# deployments upgrading into this default MUST add every directory they
+# invoke against, or those two adapters stop working.
+#
+# EXACT-MATCH ONLY, despite the plural name: each entry trusts exactly that
+# one directory, never its subtree — listing "/workspace" does NOT admit
+# "/workspace/foo". List every directory you need, one entry per directory.
+#
+# trusted_working_dirs:
+#   - /home/router/projects/some-repo
+#   - /home/router/projects/another-repo
+
 # --- Proxy ---
 proxy:
   host: 127.0.0.1        # 0.0.0.0 for network access from other hosts

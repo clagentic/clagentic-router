@@ -120,6 +120,22 @@ TOCTOU window between its `os.Stat` check and the subprocess's later
 are known, accepted limitations of the wire-boundary validation, not gaps
 to close by adding an allowlist here.
 
+`trusted_working_dirs` (lr-4abfe9, `internal/backend/trust_allowlist.go`) is
+a **separate, narrower control** layered on top of the above, not a
+replacement for it — it does not add containment to `ResolveWorkingDir`
+itself. It gates one specific side effect: whether `claude_cli` and
+`codex_subagent` are permitted to pre-accept the Claude Code CLI's
+per-project trust dialog (`hasTrustDialogAccepted` in the isolated
+subprocess HOME's `.claude.json`) for a given directory, which in turn
+determines whether the CLI honors that directory's `.claude/settings.json`
+`permissions.allow` entries, hooks, and project `CLAUDE.md` memory.
+`codex_cli` and `gemini_cli` have no trust dialog and are unaffected. The
+default is fail-closed (empty/absent allowlist trusts nothing), which is a
+breaking change for any deployment upgrading into it — see README.md's
+"Working directory (`working_dir`)" section for the operator-facing upgrade
+note. Matching is exact-match on the canonicalized path, never subtree:
+listing a parent directory does not admit its children.
+
 **Verify per-provider assumptions against the live source; never generalize
 one host's observed shape into a parser assumption.** Data shapes differ
 across providers in ways that are not guessable from one example:

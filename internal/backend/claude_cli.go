@@ -52,6 +52,21 @@ import (
 // The credentials must be present at {home}/.claude/.credentials.json.
 // At init time the subprocess home directory and a stub settings.json are created.
 // Credential freshness is maintained by syncSubprocessCreds, called on each Invoke.
+//
+// This isolation also means {home}/.claude.json starts with an empty
+// projects map, so Claude Code's per-project trust dialog has never been
+// accepted for any directory a subprocess is invoked against — and "claude
+// --print" (non-interactive) has no flag to accept it. syncProjectTrust
+// (trust_sync.go), called from Invoke immediately before cmd.Run(), closes
+// that gap by pre-accepting trust for exactly the directory the subprocess
+// was already told to run in, bounded by the adapter's TrustAllowlist (see
+// trust_allowlist.go) — a dir not on that operator-controlled list gets no
+// write and the subprocess fails exactly as it did before lr-4abfe9.
+// codex_subagent.go shares this same HOME and the same claude binary, so it
+// calls syncProjectTrust too; codex_cli.go and gemini_cli.go invoke
+// different binaries with no HOME override and are unaffected — see
+// trust_sync.go package doc for the full breadth accounting and
+// write-concurrency discipline (lr-4abfe9).
 var claudeSubprocessHome = func() string {
 	// Operator override takes precedence.
 	if v := os.Getenv("CLAGENTIC_ROUTER_SUBPROCESS_HOME"); v != "" {
@@ -260,6 +275,15 @@ type ClaudeCLIAdapter struct {
 	thinkingMode ThinkingMode
 	timeout      func() interface{} // unused; timeout via context
 
+	// trustedDirs bounds syncProjectTrust's write to operator-opted-in
+	// directories (config.Config.TrustedWorkingDirs). nil (a call site that
+	// never set it — e.g. an existing test built with a struct literal
+	// rather than the constructor) is treated as an empty allowlist by
+	// TrustAllowlist.Allows, which is nil-safe and fails closed: no write,
+	// ever, until an operator explicitly configures trusted_working_dirs.
+	// See trust_allowlist.go for the full trust model.
+	trustedDirs *TrustAllowlist
+
 	mu      sync.Mutex
 	binPath string
 }
@@ -267,8 +291,10 @@ type ClaudeCLIAdapter struct {
 // NewClaudeCLIAdapter creates a new adapter for the given backend ID and model.
 // binPathOverride is the explicit path to the binary (empty = auto-resolve).
 // effort and thinkingMode are noted at construction; see Invoke for current support status.
-func NewClaudeCLIAdapter(id, model, binPathOverride string, effort EffortLevel, thinkingMode ThinkingMode) *ClaudeCLIAdapter {
-	a := &ClaudeCLIAdapter{id: id, model: model, effort: effort, thinkingMode: thinkingMode}
+// trustedDirs bounds which working directories syncProjectTrust is allowed
+// to mark trusted (nil is safe and trusts nothing — see TrustAllowlist).
+func NewClaudeCLIAdapter(id, model, binPathOverride string, effort EffortLevel, thinkingMode ThinkingMode, trustedDirs *TrustAllowlist) *ClaudeCLIAdapter {
+	a := &ClaudeCLIAdapter{id: id, model: model, effort: effort, thinkingMode: thinkingMode, trustedDirs: trustedDirs}
 	// Resolve and log the binary path at construction time so misconfigurations
 	// surface in the startup log rather than silently at first invoke.
 	a.binPath = ResolveBinPath("claude", binPathOverride, "CLAUDE_BIN")
@@ -374,6 +400,18 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 	if cmd.Dir == "" {
 		cmd.Dir = DefaultWorkingDir
 	}
+
+	// Pre-accept the Claude Code per-project trust dialog for this exact
+	// directory inside the isolated subprocess HOME, before the subprocess
+	// starts. Without this, "claude --print" against a real project
+	// directory fails non-interactively — there is no flag to accept the
+	// dialog, and the isolated HOME's .claude.json starts with an empty
+	// projects map. Bounded by a.trustedDirs: a dir not on the operator's
+	// trusted_working_dirs allowlist gets no write and the subprocess fails
+	// exactly as it did before lr-4abfe9. See trust_sync.go and
+	// trust_allowlist.go package docs for the write discipline, isolation
+	// guarantees, and trust model (lr-4abfe9).
+	syncProjectTrust(claudeSubprocessHome, cmd.Dir, a.trustedDirs)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
