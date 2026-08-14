@@ -12,8 +12,10 @@
 package backend
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -422,6 +424,104 @@ func TestSyncProjectTrust_DotDotEscapeRefused(t *testing.T) {
 
 	if _, err := os.Stat(filepath.Join(home, ".claude.json")); !os.IsNotExist(err) {
 		t.Error("a \"..\"-escaping path resolving outside the allowlist must be refused")
+	}
+}
+
+// --- Allowlist-refusal log level (operator-visibility follow-up) ---
+
+// withCapturedSlog swaps slog's default logger for a text handler writing
+// into buf at the given minimum level, runs fn, then restores the original
+// default logger. Lets a test assert on log level/content without adding a
+// logger-injection parameter to syncProjectTrust's signature.
+func withCapturedSlog(t *testing.T, level slog.Level, fn func()) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: level})))
+	defer slog.SetDefault(orig)
+	fn()
+	return &buf
+}
+
+// TestSyncProjectTrust_RefusalLoggedAtWarn verifies the allowlist-refusal
+// path logs at Warn (visible at Go's default Info level and above) rather
+// than Debug, and that the line names both the offending directory and the
+// trusted_working_dirs config field — the two things an operator needs to
+// self-diagnose the failure from the log line alone.
+func TestSyncProjectTrust_RefusalLoggedAtWarn(t *testing.T) {
+	// Reset the per-dir dedup state so this test is independent of
+	// execution order relative to other tests in this file that also
+	// exercise the refusal path against a fresh t.TempDir() (which is
+	// always a distinct string, but be explicit rather than rely on that).
+	refusalLogMu.Lock()
+	refusalLogged = make(map[string]bool)
+	refusalLogMu.Unlock()
+
+	home := t.TempDir()
+	dir := t.TempDir()
+
+	buf := withCapturedSlog(t, slog.LevelInfo, func() {
+		syncProjectTrust(home, dir, NewTrustAllowlist(nil))
+	})
+
+	out := buf.String()
+	if !bytes.Contains([]byte(out), []byte("WARN")) {
+		t.Errorf("expected a WARN-level log line for allowlist refusal, got: %s", out)
+	}
+	if !bytes.Contains([]byte(out), []byte(dir)) {
+		t.Errorf("refusal log line does not name the offending dir %q: %s", dir, out)
+	}
+	if !bytes.Contains([]byte(out), []byte("trusted_working_dirs")) {
+		t.Errorf("refusal log line does not name the trusted_working_dirs config field: %s", out)
+	}
+}
+
+// TestSyncProjectTrust_RefusalLoggedOncePerDir verifies the refusal is
+// logged once per distinct dir, not once per call — repeated invocations
+// against the same unconfigured dir (e.g. retries of the same failing
+// request) must not spam Warn on every call.
+func TestSyncProjectTrust_RefusalLoggedOncePerDir(t *testing.T) {
+	refusalLogMu.Lock()
+	refusalLogged = make(map[string]bool)
+	refusalLogMu.Unlock()
+
+	home := t.TempDir()
+	dir := t.TempDir()
+	allow := NewTrustAllowlist(nil)
+
+	buf := withCapturedSlog(t, slog.LevelInfo, func() {
+		syncProjectTrust(home, dir, allow)
+		syncProjectTrust(home, dir, allow)
+		syncProjectTrust(home, dir, allow)
+	})
+
+	count := bytes.Count(buf.Bytes(), []byte("WARN"))
+	if count != 1 {
+		t.Errorf("expected exactly 1 WARN line across 3 calls against the same dir, got %d: %s", count, buf.String())
+	}
+}
+
+// TestSyncProjectTrust_RefusalLoggedPerDistinctDir verifies the per-dir dedup
+// does not over-suppress: two different unconfigured dirs each get their own
+// Warn line.
+func TestSyncProjectTrust_RefusalLoggedPerDistinctDir(t *testing.T) {
+	refusalLogMu.Lock()
+	refusalLogged = make(map[string]bool)
+	refusalLogMu.Unlock()
+
+	home := t.TempDir()
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	allow := NewTrustAllowlist(nil)
+
+	buf := withCapturedSlog(t, slog.LevelInfo, func() {
+		syncProjectTrust(home, dirA, allow)
+		syncProjectTrust(home, dirB, allow)
+	})
+
+	count := bytes.Count(buf.Bytes(), []byte("WARN"))
+	if count != 2 {
+		t.Errorf("expected 2 WARN lines for 2 distinct unconfigured dirs, got %d: %s", count, buf.String())
 	}
 }
 

@@ -82,6 +82,20 @@ import (
 // codex_subagent both go through syncProjectTrust). See package doc.
 var trustSyncMu sync.Mutex
 
+// refusalLogMu guards refusalLogged.
+var refusalLogMu sync.Mutex
+
+// refusalLogged tracks which dirs have already had their allowlist refusal
+// logged, so a hot path that repeatedly invokes against the same
+// unconfigured dir logs once, not once per request. Keyed by the exact dir
+// string syncProjectTrust was called with (not canonicalized — mirrors how
+// the trust entry itself is keyed). Process-local and unbounded: the set of
+// distinct working_dir values a given deployment actually uses is small and
+// operator-controlled (callers choose working_dir; it is not attacker-
+// enumerable into unbounded cardinality any more than the request volume
+// itself already is), so this is not treated as a growth concern.
+var refusalLogged = make(map[string]bool)
+
 // claudeUserConfig models only the fields syncProjectTrust reads or writes
 // in .claude.json. Unknown top-level fields are preserved via rawExtra so a
 // round-trip never drops content this code does not understand.
@@ -136,11 +150,29 @@ func syncProjectTrust(home, dir string, allowlist *TrustAllowlist) {
 	}
 
 	if !allowlist.Allows(dir) {
-		slog.Debug("claude_cli: working_dir is not on trusted_working_dirs allowlist; "+
-			"trust dialog will not be pre-accepted for this invocation — "+
-			"the underlying Claude Code CLI call will fail with a trust-dialog error "+
-			"unless this directory is added to trusted_working_dirs in router config",
-			"dir", dir)
+		// Warn, not Debug: this refusal is the direct cause of a
+		// claude_cli/codex_subagent request failing with the CLI's own
+		// "workspace has not been trusted" error, and Debug is below Go's
+		// default Info level — invisible at default verbosity. An operator
+		// who upgrades into the fail-closed default with no
+		// trusted_working_dirs configured gets every real-directory request
+		// refused with no visible signal at all otherwise. Logged once per
+		// distinct dir (not once per call) so a correctly-configured
+		// deployment — or one that simply hasn't added this dir yet and is
+		// retrying the same failing request — does not get a Warn line on
+		// every single invocation.
+		refusalLogMu.Lock()
+		alreadyLogged := refusalLogged[dir]
+		refusalLogged[dir] = true
+		refusalLogMu.Unlock()
+		if !alreadyLogged {
+			slog.Warn("claude_cli: working_dir is not on the trusted_working_dirs allowlist; "+
+				"trust dialog will not be pre-accepted for this directory — "+
+				"the underlying Claude Code CLI call will fail with a trust-dialog error "+
+				"until this directory is added to trusted_working_dirs in router config "+
+				"(exact-match only — listing a parent directory does not admit its subdirectories)",
+				"dir", dir)
+		}
 		return
 	}
 
