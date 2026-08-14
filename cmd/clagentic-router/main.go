@@ -359,9 +359,17 @@ func resolveDBPath(cfg *config.Config) string {
 // Unknown or unsupported adapter types are logged and skipped (not fatal) so
 // a partial config can still route to the available backends.
 func buildAdapters(cfg *config.Config) (map[string]backend.Adapter, error) {
+	// Built once and shared by every claude_cli/codex_subagent adapter this
+	// process constructs — they all write through the same isolated HOME's
+	// .claude.json, so the allowlist is process-global state, not
+	// per-backend (see config.Config.TrustedWorkingDirs doc). An
+	// empty/absent cfg.TrustedWorkingDirs yields a TrustAllowlist that
+	// trusts nothing (fail-closed default).
+	trustedDirs := backend.NewTrustAllowlist(cfg.TrustedWorkingDirs)
+
 	adapters := make(map[string]backend.Adapter, len(cfg.Backends))
 	for id, b := range cfg.Backends {
-		a, err := buildAdapter(id, b)
+		a, err := buildAdapter(id, b, trustedDirs)
 		if err != nil {
 			slog.Warn("skipping backend: build failed", "backend", id, "err", err)
 			continue
@@ -372,13 +380,13 @@ func buildAdapters(cfg *config.Config) (map[string]backend.Adapter, error) {
 	return adapters, nil
 }
 
-func buildAdapter(id string, b *config.BackendConfig) (backend.Adapter, error) {
+func buildAdapter(id string, b *config.BackendConfig, trustedDirs *backend.TrustAllowlist) (backend.Adapter, error) {
 	timeout := b.Timeout()
 
 	switch b.Adapter {
 	case config.AdapterClaudeCLI:
 		return backend.NewClaudeCLIAdapter(id, b.Model, b.BinPath,
-			backend.EffortLevel(b.Effort), backend.ThinkingMode(b.ThinkingMode)), nil
+			backend.EffortLevel(b.Effort), backend.ThinkingMode(b.ThinkingMode), trustedDirs), nil
 
 	case config.AdapterCodexCLI:
 		// Provider-id discovery is cached at construction time (never
@@ -409,7 +417,7 @@ func buildAdapter(id string, b *config.BackendConfig) (backend.Adapter, error) {
 		return backend.NewCodexCLIAdapter(id, model, b.ReasoningEffort, providerID, projectID, b.BinPath), nil
 
 	case config.AdapterCodexSubagent:
-		return backend.NewCodexSubagentAdapter(id, b.Tier, b.BinPath), nil
+		return backend.NewCodexSubagentAdapter(id, b.Tier, b.BinPath, trustedDirs), nil
 
 	case config.AdapterOllamaHTTP:
 		if b.URL == "" {
