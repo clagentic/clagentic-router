@@ -86,12 +86,15 @@ func (a *CodexSubagentAdapter) Invoke(ctx context.Context, req *Request) (*Respo
 	}
 	fullPrompt.WriteString(prompt)
 
-	// --safe-mode disables CLAUDE.md, skills, plugins, hooks, and MCP servers
-	// while leaving auth, model selection, built-in tools, and permissions
-	// working normally — see claude_cli.go's Invoke for the full rationale,
-	// including why --bare (auth-breaking under OAuth) was rejected. This
-	// adapter invokes the same claude binary via the --agent codex path, so
-	// the same exposure and the same fix apply identically.
+	// --safe-mode disables CLAUDE.md, skills, plugins, hooks, and MCP
+	// servers — see claude_cli.go's Invoke for the full rationale,
+	// including why --bare (auth-breaking under OAuth) was rejected, and
+	// the confirmed residual gap: --safe-mode does NOT suppress a
+	// caller-supplied working_dir's .claude/settings.json permissions.allow
+	// entries. This adapter invokes the same claude binary via the --agent
+	// codex path, so the same exposure and the same residual gap apply
+	// identically. TODO(lr-7871bb): verify whether --setting-sources user
+	// closes the gap for this adapter too.
 	args := []string{
 		"-p",
 		"--agent", "codex",

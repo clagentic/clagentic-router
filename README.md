@@ -230,23 +230,58 @@ place. Trust and tool-permissions are two separate gates in Claude Code;
 this router's subprocess calls never go through the trust gate at all, in
 either direction.
 
-**The real exposure, and how it's closed (`--safe-mode`).** Because there is
-no trust dialog to skip past, a caller-supplied `working_dir` whose
-`.claude/settings.json` defines hooks, `permissions.allow` entries, or a
-project `CLAUDE.md` gets those executed inside this daemon's subprocess on
-every invocation, by default — any caller who can reach
-`/v1/chat/completions` with a `working_dir` value effectively gets that
-directory's Claude Code config executed with this daemon's privileges. This
-is the same shape of exposure as
-[GHSA-wpqr-6v78-jr5g](https://github.com/advisories/GHSA-wpqr-6v78-jr5g)
+**The real exposure, and what `--safe-mode` does and does not close.**
+Because there is no trust dialog to skip past, a caller-supplied
+`working_dir` whose `.claude/settings.json` defines hooks,
+`permissions.allow` entries, or a project `CLAUDE.md` can get those
+executed/applied inside this daemon's subprocess on every invocation, by
+default — any caller who can reach `/v1/chat/completions` with a
+`working_dir` value effectively gets that directory's Claude Code config
+running with this daemon's privileges. This is the same shape of exposure
+as [GHSA-wpqr-6v78-jr5g](https://github.com/advisories/GHSA-wpqr-6v78-jr5g)
 (Gemini CLI auto-trusting workspace folders in headless/CI invocations).
 `claude_cli` and `codex_subagent` now pass `--safe-mode` on every
 invocation, unconditionally — not config-gated, because there is no safe
 reason for an operator to opt back into running an arbitrary caller-chosen
-directory's config inside a shared daemon process. Per the CLI's own
-`--safe-mode` help text, this disables CLAUDE.md, skills, plugins, hooks,
-and MCP servers for the session while auth, model selection, built-in
-tools, and permissions continue to work normally.
+directory's hooks/CLAUDE.md inside a shared daemon process.
+
+Per the CLI's own `--safe-mode` help text, this "start[s] with all
+customizations (CLAUDE.md, skills, plugins, hooks, MCP servers, custom
+commands and agents, output styles, workflows, custom themes, keybindings,
+and more) disabled," while "auth, model selection, built-in tools, and
+permissions work normally." Empirically verified in this environment (a
+temp project directory with a hook, a `CLAUDE.md` sentinel, and a
+`permissions.allow` entry, run with and without `--safe-mode`):
+
+- **Suppressed by `--safe-mode`**: project hooks did not fire; project
+  `CLAUDE.md` auto-discovery did not load.
+- **NOT suppressed by `--safe-mode`**: a project `.claude/settings.json`
+  `permissions.allow` entry still grants the tool it names. A 2x2
+  comparison (rule present/absent, `--safe-mode` on/off, both against a
+  no-tools control) showed the grant firing identically with and without
+  `--safe-mode`, and the absent-rule rows denying identically in both
+  states — proving the grant is sourced from the project file, not ambient
+  user config, and that `--safe-mode` does not touch it. "Permissions work
+  normally" in the CLI's help text means exactly that, including
+  project-sourced permission rules.
+
+**This is a currently open, real residual exposure**: a caller-supplied
+`working_dir` can still widen the daemon subprocess's tool permissions via
+its own `.claude/settings.json` `permissions.allow`, `--safe-mode`
+notwithstanding. `--setting-sources user` (which can exclude project/local
+setting sources) is a plausible candidate fix by its documented semantics,
+but its actual interaction with `--safe-mode` and `permissions.allow` has
+**not** been empirically verified in this environment, so it has not been
+added — an unverified flag asserted as a security boundary would be worse
+than stating the gap plainly. Verifying and, if it works, adding
+`--setting-sources user` is tracked as a follow-up.
+
+Separately: the CLI's `-p`/`--print` help text notes that "Settings files
+that fail validation are silently ignored in this mode (no error
+dialog is shown)" — operationally relevant here because both adapters
+always run non-interactively, so a malformed caller-supplied
+`.claude/settings.json` fails open (ignored) rather than surfacing an
+error to the operator.
 
 `--bare` was considered first and rejected: its help text states Anthropic
 auth under `--bare` is "strictly `ANTHROPIC_API_KEY` or `apiKeyHelper` ...
@@ -258,10 +293,12 @@ an OAuth credentials file synced into the isolated subprocess HOME, so
 points at a real project loses that project's CLAUDE.md context and skills
 under `--safe-mode` — there is currently no way to give a caller
 repo-aware behavior without also giving that directory's config the
-ability to execute inside this daemon's process. `working_dir` under
-`--safe-mode` still selects *where the subprocess runs* (relevant for any
-tool that reads the filesystem relative to cwd); it no longer selects
-*whose Claude Code config executes*.
+ability to run inside this daemon's process, and even with that
+trade-off accepted, `permissions.allow` from the same directory still
+applies (see above). `working_dir` under `--safe-mode` still selects
+*where the subprocess runs* (relevant for any tool that reads the
+filesystem relative to cwd); it no longer selects *whose CLAUDE.md/hooks*
+execute, but it still partially selects *whose permission grants* apply.
 
 `codex_cli` and `gemini_cli` are different binaries — `--safe-mode` is
 claude-specific and does not apply to either. `codex_cli` reads
