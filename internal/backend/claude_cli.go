@@ -1,6 +1,6 @@
 // internal/backend/claude_cli.go — adapter for the claude CLI (OAuth auth).
 //
-// Invokes: claude --print --verbose --output-format stream-json --model <model> [--system-prompt <s>]
+// Invokes: claude --print --verbose --safe-mode --output-format stream-json --model <model> [--system-prompt <s>]
 // Input: user prompt via stdin.
 // Output: newline-delimited JSON stream. The final "result" line carries the
 // response text and cost. Intermediate lines include rate_limit_event lines
@@ -53,20 +53,18 @@ import (
 // At init time the subprocess home directory and a stub settings.json are created.
 // Credential freshness is maintained by syncSubprocessCreds, called on each Invoke.
 //
-// This isolation also means {home}/.claude.json starts with an empty
-// projects map, so Claude Code's per-project trust dialog has never been
-// accepted for any directory a subprocess is invoked against — and "claude
-// --print" (non-interactive) has no flag to accept it. syncProjectTrust
-// (trust_sync.go), called from Invoke immediately before cmd.Run(), closes
-// that gap by pre-accepting trust for exactly the directory the subprocess
-// was already told to run in, bounded by the adapter's TrustAllowlist (see
-// trust_allowlist.go) — a dir not on that operator-controlled list gets no
-// write and the subprocess fails exactly as it did before lr-4abfe9.
-// codex_subagent.go shares this same HOME and the same claude binary, so it
-// calls syncProjectTrust too; codex_cli.go and gemini_cli.go invoke
-// different binaries with no HOME override and are unaffected — see
-// trust_sync.go package doc for the full breadth accounting and
-// write-concurrency discipline (lr-4abfe9).
+// Claude Code's per-project workspace trust dialog is NOT a control this
+// daemon can rely on: "claude --print" (non-interactive, what this adapter
+// and codex_subagent.go both use) never shows it at all — the CLI's own
+// --print help text says so directly ("The workspace trust dialog is
+// skipped when Claude is run in non-interactive mode"). A prior version of
+// this file pre-accepted that dialog in the isolated HOME's .claude.json,
+// gated by an operator-configured allowlist; that machinery has been
+// removed because the dialog it was pre-accepting never fires in this call
+// path, so it was gating nothing real. The actual exposure — a
+// caller-supplied working_dir's .claude/settings.json hooks,
+// permissions.allow entries, and CLAUDE.md memory executing inside this
+// daemon's subprocess — is closed by --safe-mode below instead.
 var claudeSubprocessHome = func() string {
 	// Operator override takes precedence.
 	if v := os.Getenv("CLAGENTIC_ROUTER_SUBPROCESS_HOME"); v != "" {
@@ -275,15 +273,6 @@ type ClaudeCLIAdapter struct {
 	thinkingMode ThinkingMode
 	timeout      func() interface{} // unused; timeout via context
 
-	// trustedDirs bounds syncProjectTrust's write to operator-opted-in
-	// directories (config.Config.TrustedWorkingDirs). nil (a call site that
-	// never set it — e.g. an existing test built with a struct literal
-	// rather than the constructor) is treated as an empty allowlist by
-	// TrustAllowlist.Allows, which is nil-safe and fails closed: no write,
-	// ever, until an operator explicitly configures trusted_working_dirs.
-	// See trust_allowlist.go for the full trust model.
-	trustedDirs *TrustAllowlist
-
 	mu      sync.Mutex
 	binPath string
 }
@@ -291,10 +280,8 @@ type ClaudeCLIAdapter struct {
 // NewClaudeCLIAdapter creates a new adapter for the given backend ID and model.
 // binPathOverride is the explicit path to the binary (empty = auto-resolve).
 // effort and thinkingMode are noted at construction; see Invoke for current support status.
-// trustedDirs bounds which working directories syncProjectTrust is allowed
-// to mark trusted (nil is safe and trusts nothing — see TrustAllowlist).
-func NewClaudeCLIAdapter(id, model, binPathOverride string, effort EffortLevel, thinkingMode ThinkingMode, trustedDirs *TrustAllowlist) *ClaudeCLIAdapter {
-	a := &ClaudeCLIAdapter{id: id, model: model, effort: effort, thinkingMode: thinkingMode, trustedDirs: trustedDirs}
+func NewClaudeCLIAdapter(id, model, binPathOverride string, effort EffortLevel, thinkingMode ThinkingMode) *ClaudeCLIAdapter {
+	a := &ClaudeCLIAdapter{id: id, model: model, effort: effort, thinkingMode: thinkingMode}
 	// Resolve and log the binary path at construction time so misconfigurations
 	// surface in the startup log rather than silently at first invoke.
 	a.binPath = ResolveBinPath("claude", binPathOverride, "CLAUDE_BIN")
@@ -357,9 +344,31 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 	// --verbose is required when combining --print with --output-format stream-json;
 	// the claude CLI (>=2.1.173) rejects the combination without it. The flag does
 	// not change the stream-json output format — it only unlocks the mode. (lr-1994)
+	//
+	// --safe-mode disables CLAUDE.md, skills, plugins, hooks, and MCP servers
+	// for the session while leaving auth, model selection, built-in tools,
+	// and permissions working normally (per the CLI's own --safe-mode help
+	// text). This is what stops a caller-supplied working_dir's
+	// .claude/settings.json hooks/permissions.allow entries and project
+	// CLAUDE.md memory from executing inside this daemon's subprocess — the
+	// real exposure, since "claude --print" shows no workspace trust dialog
+	// to gate it. Unconditional, not config-gated: there is no safe reason
+	// for an operator to opt back into executing an arbitrary caller-chosen
+	// directory's config inside a shared daemon process. The trade-off is
+	// real and is not free: a caller wanting repo-aware behavior (project
+	// CLAUDE.md context, skills) loses it under --safe-mode — there is
+	// currently no way to give a caller that context without also giving
+	// their working_dir's config the ability to run inside this process.
+	//
+	// --bare was considered and rejected: its own help text states Anthropic
+	// auth under --bare is "strictly ANTHROPIC_API_KEY or apiKeyHelper ...
+	// OAuth and keychain are never read" — this adapter's entire auth model
+	// is the OAuth credentials file synced into the isolated subprocess HOME
+	// above, so --bare would break authentication outright, not harden it.
 	args := []string{
 		"--print",
 		"--verbose",
+		"--safe-mode",
 		"--output-format", "stream-json",
 		"--max-turns", "1",
 	}
@@ -400,18 +409,6 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 	if cmd.Dir == "" {
 		cmd.Dir = DefaultWorkingDir
 	}
-
-	// Pre-accept the Claude Code per-project trust dialog for this exact
-	// directory inside the isolated subprocess HOME, before the subprocess
-	// starts. Without this, "claude --print" against a real project
-	// directory fails non-interactively — there is no flag to accept the
-	// dialog, and the isolated HOME's .claude.json starts with an empty
-	// projects map. Bounded by a.trustedDirs: a dir not on the operator's
-	// trusted_working_dirs allowlist gets no write and the subprocess fails
-	// exactly as it did before lr-4abfe9. See trust_sync.go and
-	// trust_allowlist.go package docs for the write discipline, isolation
-	// guarantees, and trust model (lr-4abfe9).
-	syncProjectTrust(claudeSubprocessHome, cmd.Dir, a.trustedDirs)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
