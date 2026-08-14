@@ -195,6 +195,22 @@ responses only, so every routed tool-bearing request is refused today,
 regardless of which chain it targets. Use passthrough mode for tool-using
 clients — it forwards tools untouched.
 
+**Working directory (`working_dir`).** Both `/v1/messages` (routed mode
+only) and `/v1/chat/completions` accept an optional `working_dir` field: an
+absolute path the four subprocess (CLI) adapters (`claude_cli`, `codex_cli`,
+`codex_subagent`, `gemini_cli`) use as the subprocess's working directory.
+It is opt-in and never inferred from server-side state — the router is a
+shared daemon serving arbitrary callers, so guessing a directory server-side
+would just be a different flavor of the bug this field exists to avoid.
+When omitted, all four subprocess adapters default to `/`. A supplied value
+is validated at the wire boundary and rejected with `400`
+(Anthropic-format `invalid_request_error` on `/v1/messages`,
+`invalid_request` on `/v1/chat/completions`) unless it is absolute, exists,
+and is a directory — an invalid path is refused outright rather than
+silently ignored or left to fail opaquely inside the subprocess exec. The
+three HTTP adapters (`anthropic_api`, `openai_api`, `bedrock_api`) have no
+subprocess and ignore this field entirely.
+
 ### Adapter capabilities
 
 `GET /v1/models` includes a `capabilities` object per backend so a caller can
