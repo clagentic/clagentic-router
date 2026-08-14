@@ -144,8 +144,12 @@ func (a *CodexCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response, 
 	// ResolveWorkingDir at the wire boundary) is honored instead. Previously
 	// this adapter set no cmd.Dir at all and silently inherited whatever cwd
 	// the daemon process happened to be started from — see claude_cli.go's
-	// Invoke for the fuller two-layer hook-suppression rationale that makes
-	// this default safe to apply uniformly.
+	// Invoke for the two-layer hook-suppression rationale used
+	// there — that rationale does not transfer here: this adapter sets no
+	// HOME override, so cmd.Dir is its only hook-suppression layer, not a
+	// second layer on top of one. Defaulting it to "/" is still a strict
+	// improvement over the prior no-cmd.Dir behavior regardless of that
+	// asymmetry.
 	cmd.Dir = req.WorkingDir
 	if cmd.Dir == "" {
 		cmd.Dir = DefaultWorkingDir

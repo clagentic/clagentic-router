@@ -207,9 +207,23 @@ is validated at the wire boundary and rejected with `400`
 (Anthropic-format `invalid_request_error` on `/v1/messages`,
 `invalid_request` on `/v1/chat/completions`) unless it is absolute, exists,
 and is a directory — an invalid path is refused outright rather than
-silently ignored or left to fail opaquely inside the subprocess exec. The
-three HTTP adapters (`anthropic_api`, `openai_api`, `bedrock_api`) have no
-subprocess and ignore this field entirely.
+silently ignored or left to fail opaquely inside the subprocess exec. This
+validation has no path-containment allowlist and there is a TOCTOU window
+between the existence check and the subprocess actually starting; both are
+known, accepted limitations, not gaps this field's validation claims to
+close. The three HTTP adapters (`anthropic_api`, `openai_api`,
+`bedrock_api`) have no subprocess and ignore this field entirely.
+
+Hook suppression against the *daemon's own* config differs by adapter and
+predates this field: `claude_cli` and `codex_subagent` also override
+`HOME` for the subprocess (a stub `~/.claude` with no hook-bearing
+`settings.json`), so `working_dir`/`cmd.Dir` is a second, narrower layer
+for them, on top of that HOME override. `codex_cli` and `gemini_cli` set no
+HOME override — `cmd.Dir` is their only layer. Defaulting `cmd.Dir` to `/`
+strengthens both pairs of adapters the same way regardless of that
+asymmetry: none of the four inherits the daemon's actual cwd anymore. See
+`CLAUDE.md`'s "Subprocess cwd contract" for the full per-adapter
+breakdown.
 
 ### Adapter capabilities
 
