@@ -43,7 +43,7 @@ func TestBuildAdapter_CodexCLI_ExplicitModel_SkipsDiscovery(t *testing.T) {
 		BinPath: failingBin,
 	}
 
-	adapter, err := buildAdapter("test-backend", b)
+	adapter, err := buildAdapter("test-backend", b, nil)
 	if err != nil {
 		t.Fatalf("buildAdapter returned an error, implying discovery ran despite explicit Model: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestBuildAdapter_CodexCLI_NoModel_AttemptsDiscoveryAndFails(t *testing.T) {
 		BinPath: failingBin,
 	}
 
-	_, err := buildAdapter("test-backend", b)
+	_, err := buildAdapter("test-backend", b, nil)
 	if err == nil {
 		t.Fatal("expected buildAdapter to fail when model discovery's codex invocation fails, got nil error")
 	}
