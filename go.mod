@@ -1,6 +1,6 @@
 module github.com/clagentic/clagentic-router
 
-go 1.25.5
+go 1.25.13
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.43.4
