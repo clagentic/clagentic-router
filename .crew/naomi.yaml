@@ -43,11 +43,14 @@ merge_allowed: true
 #
 merge_requirements:
   tests_pass: true
-  # ci_pass: false -- matches .clagentic/loadout/config.yaml
-  # merge.merge_requirements.ci_pass (lr-f181b6). No CI runs on GitHub yet;
-  # .github/workflows/ci.yml (lr-bfbcf2) adds it, but the flip to true is a
-  # follow-on migration gated on confirming CI is actually green on PRs.
-  ci_pass: false
+  # ci_pass: true -- matches .clagentic/loadout/config.yaml
+  # merge.merge_requirements.ci_pass. .github/workflows/ci.yml (lr-bfbcf2)
+  # runs both "Build + test" and "govulncheck" on every PR targeting main;
+  # confirmed genuinely green (not inferred) on PR #43, head ce2f9aa,
+  # Actions run 31807041583 -- both jobs SUCCESS. The precondition that
+  # gated this flip (lr-539a14: "once CI is genuinely green on PRs") is
+  # satisfied.
+  ci_pass: true
   # max_files_changed: 50   # Escalate if a PR touches more than N files
 
 # -----------------------------------------------------------------------
