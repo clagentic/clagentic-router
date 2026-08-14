@@ -35,7 +35,12 @@
 // fact without ever calling it (lr-698965 reverted that code). An operator
 // who wants the header injected sets openai_project_id explicitly; unset
 // means the header is simply not injected — no live call, no credential
-// needed on this path.
+// needed on this path. A non-empty value is validated the same way
+// providerID is (validateOpenAIProjectID mirrors validateCodexProviderID)
+// before it is interpolated into codex's own -c http_headers override
+// string; rejection means the header is not injected and is logged at Warn,
+// since — unlike provider discovery — a malformed value here can only be an
+// operator typo, never a discovery-path artifact.
 //
 // # Caching and failure handling
 //
@@ -64,6 +69,14 @@ import (
 // value, not to accommodate any observed real-world id.
 const maxCodexProviderIDLen = 64
 
+// maxOpenAIProjectIDLen bounds an accepted openai_project_id value before it
+// is interpolated into codex's own -c
+// model_providers.<id>.http_headers={"OpenAI-Project"="<id>"} override
+// string (codex_cli.go). Real OpenAI project ids are short slugs; this
+// exists only to reject a pathological value, not to accommodate any
+// observed real-world id.
+const maxOpenAIProjectIDLen = 128
+
 // isCodexProviderIDChar reports whether r is valid within a codex
 // model_providers.<id> key. codex's own TOML table-header parsing already
 // constrains what parseModelProviders extracts (see the header-parsing loop
@@ -89,6 +102,38 @@ func validateCodexProviderID(id string) bool {
 	}
 	for _, r := range id {
 		if !isCodexProviderIDChar(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// isOpenAIProjectIDChar reports whether r is valid within an
+// openai_project_id value. The value is interpolated into codex's own -c
+// http_headers={"OpenAI-Project"="<id>"} TOML/JSON-ish override string
+// (codex_cli.go) — a value crossing into another tool's config-override
+// parser should not rely on that parser tolerating arbitrary bytes.
+// Lowercase/uppercase alnum, hyphen, and underscore covers every realistic
+// project id shape without accepting characters (quote, brace, equals,
+// whitespace) that have special meaning to TOML or the surrounding
+// http_headers JSON-ish literal — the same class used for providerID
+// (isCodexProviderIDChar) since both values cross into the same override
+// string.
+func isOpenAIProjectIDChar(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_'
+}
+
+// validateOpenAIProjectID rejects a projectID that is empty, too long, or
+// contains any character outside the alnum/hyphen/underscore class. Never
+// rewrites or strips — an invalid projectID degrades the caller to
+// feature-off (header not injected), consistent with validateCodexProviderID
+// and every other discovery failure path in this file.
+func validateOpenAIProjectID(id string) bool {
+	if id == "" || len(id) > maxOpenAIProjectIDLen {
+		return false
+	}
+	for _, r := range id {
+		if !isOpenAIProjectIDChar(r) {
 			return false
 		}
 	}
@@ -232,9 +277,19 @@ func parseModelProviders(r io.Reader) ([]codexProviderCandidate, error) {
 // (never per-Invoke — see package doc on caching).
 //
 // projectID has no discovery path (see package doc, "Project id is
-// override-only"): it is returned unchanged from overrideProjectID, which
-// may be empty. codex_cli.go only emits the header when both providerID and
-// projectID are non-empty, so an unset override means no header injection.
+// override-only"): unset (empty) is returned unchanged and simply means no
+// header injection — that is not a validation failure and is never logged.
+// A non-empty overrideProjectID is validated the same way providerID is
+// (see below) before it is returned, because it is interpolated into the
+// same codex -c http_headers override string. Since this field has no
+// discovery path, a non-empty value is always an operator's own
+// router.yaml setting — so unlike a discovery failure (silent, expected in
+// normal operation), a rejected explicit setting is logged at Warn: an
+// operator who typed openai_project_id and had it silently dropped would
+// have no signal that their header is not being injected. codex_cli.go
+// only emits the header when both providerID and projectID are non-empty,
+// so a rejected/unset projectID alone suppresses injection without
+// blocking or delaying Invoke.
 //
 // Any provider-discovery failure (ambiguous provider, missing/malformed
 // config) degrades to an empty providerID/projectID pair rather than
@@ -267,6 +322,18 @@ func DiscoverCodexProjectHeader(overrideProviderID, overrideProjectID string) (p
 		slog.Warn("codex_cli discovery: providerID failed validation, feature disabled for this call",
 			"provider_id_len", len(providerID))
 		return "", ""
+	}
+
+	// projectID is override-only (see doc above) — an empty value is the
+	// normal "operator hasn't set it" case and is not logged. A non-empty
+	// value that fails validation, however, can only be an operator typo in
+	// router.yaml (there is no discovery path to produce a malformed one),
+	// so it is surfaced at Warn rather than silently dropped like the
+	// zero-candidate provider-discovery case above.
+	if projectID != "" && !validateOpenAIProjectID(projectID) {
+		slog.Warn("codex_cli: openai_project_id failed validation, header injection disabled for this call",
+			"project_id_len", len(projectID))
+		return providerID, ""
 	}
 
 	return providerID, projectID
