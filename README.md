@@ -207,12 +207,44 @@ is validated at the wire boundary and rejected with `400`
 (Anthropic-format `invalid_request_error` on `/v1/messages`,
 `invalid_request` on `/v1/chat/completions`) unless it is absolute, exists,
 and is a directory — an invalid path is refused outright rather than
-silently ignored or left to fail opaquely inside the subprocess exec. This
-validation has no path-containment allowlist and there is a TOCTOU window
-between the existence check and the subprocess actually starting; both are
-known, accepted limitations, not gaps this field's validation claims to
+silently ignored or left to fail opaquely inside the subprocess exec.
+`backend.ResolveWorkingDir` itself still has **no path-containment
+allowlist** and there is still a TOCTOU window between its existence check
+and the subprocess actually starting; both remain known, accepted
+limitations of *cwd validation*, not gaps this field's validation claims to
 close. The three HTTP adapters (`anthropic_api`, `openai_api`,
 `bedrock_api`) have no subprocess and ignore this field entirely.
+
+**Trust-granting allowlist (`trusted_working_dirs`) — a separate control,
+`claude_cli`/`codex_subagent` only.** Do not confuse the above with
+`trusted_working_dirs`: `working_dir` picks *where a subprocess runs*;
+`trusted_working_dirs` (top-level router config, `config.Config`) controls a
+narrower, separate question — whether `claude_cli` and `codex_subagent`
+specifically are allowed to pre-accept the Claude Code CLI's per-project
+trust dialog for that directory. Accepting that dialog is not cosmetic: it
+makes the CLI start honoring that directory's `.claude/settings.json`
+`permissions.allow` entries, hooks, and project `CLAUDE.md` memory inside
+the router's subprocess, for any caller able to reach this daemon with that
+`working_dir` value. `codex_cli` and `gemini_cli` have no trust dialog and
+ignore `trusted_working_dirs` entirely.
+
+The default is **fail-closed**: an empty or absent `trusted_working_dirs`
+trusts nothing, so every request against a real project directory fails
+with the CLI's own "workspace has not been trusted" error until the
+directory is added. **Upgrade note:** this is a breaking change for any
+existing deployment using `claude_cli`/`codex_subagent` against real project
+directories — add the directories you need to `trusted_working_dirs` in
+`router.yaml` after upgrading, or those two adapters stop working. The
+refusal is logged at `Warn` (once per distinct directory, not once per
+call) naming both the offending directory and the `trusted_working_dirs`
+field, so this is visible at default log verbosity.
+
+Matching is **exact, not subtree**: listing `/workspace` does **not**
+trust `/workspace/foo` — each directory that needs trust needs its own
+entry. This is the deliberately safer of the two possible semantics; see
+`internal/backend/trust_allowlist.go`'s package doc for the full rationale,
+and `internal/config/config.go`'s `TrustedWorkingDirs` field doc for the
+config-side contract.
 
 Hook suppression against the *daemon's own* config differs by adapter and
 predates this field: `claude_cli` and `codex_subagent` also override
