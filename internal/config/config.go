@@ -596,6 +596,13 @@ type Config struct {
 	// are resolved via filepath.EvalSymlinks at startup (see
 	// backend.NewTrustAllowlist); an entry that does not exist or cannot be
 	// resolved is dropped with a Warn log, not treated as fatal.
+	//
+	// EXACT-MATCH only, despite the plural field name: each entry trusts
+	// exactly that one directory, never its subtree. Listing "/workspace"
+	// does NOT admit "/workspace/foo" — every distinct working_dir a
+	// deployment needs to trust must have its own entry. See
+	// backend.TrustAllowlist's doc comment for the full rationale (this is
+	// the intentionally safer of the two possible semantics).
 	TrustedWorkingDirs []string `yaml:"trusted_working_dirs"`
 }
 

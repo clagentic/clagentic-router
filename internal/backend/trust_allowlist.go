@@ -85,6 +85,18 @@ import (
 // TrustAllowlist is the operator-controlled set of directories syncProjectTrust
 // is permitted to mark trusted. A nil or empty TrustAllowlist trusts nothing
 // (fail-closed default — see package doc).
+//
+// Membership is EXACT-MATCH on the canonicalized path, never subtree/prefix
+// matching: listing "/workspace" does NOT admit "/workspace/foo". Despite
+// the plural "_dirs" in the config field name (trusted_working_dirs), each
+// entry trusts only that one directory — every directory a subprocess may
+// run in, including subdirectories of an already-listed one, needs its own
+// entry. This is the safer of the two possible semantics (an operator who
+// wants breadth must say so explicitly, one entry per directory, rather than
+// a single top-level entry silently trusting an entire tree including
+// directories that did not exist when the allowlist was written) and must
+// be preserved — do not "helpfully" add prefix matching later without
+// treating that as the security-relevant semantic change it would be.
 type TrustAllowlist struct {
 	// canon holds each configured entry's canonicalized (symlink-resolved,
 	// absolute) form, keyed by itself for O(1) membership testing.
@@ -129,8 +141,12 @@ func NewTrustAllowlist(entries []string) *TrustAllowlist {
 // Allows reports whether dir is permitted to receive the trust write. dir is
 // canonicalized via filepath.EvalSymlinks before the membership check, so a
 // symlink or ".."-bearing path that resolves outside every allowlisted
-// directory is refused rather than matched on surface string form. A dir
-// that fails to resolve (e.g. does not exist) is refused — syncProjectTrust
+// directory is refused rather than matched on surface string form. The
+// check itself is EXACT-MATCH against the canonicalized entries (see the
+// TrustAllowlist struct doc) — a dir that is a subdirectory of an
+// allowlisted entry, but not itself an entry, is refused just like any
+// other non-member. A dir that fails to resolve (e.g. does not exist) is
+// refused — syncProjectTrust
 // is only ever called with a path that has already passed
 // backend.ResolveWorkingDir's existence check, so a resolve failure here
 // would indicate the directory vanished between validation and this check
