@@ -44,6 +44,56 @@ type Message struct {
 type Request struct {
 	Messages  []Message
 	MaxTokens int
+	// WorkingDir is the validated, absolute directory a subprocess adapter
+	// sets as its cmd.Dir. Empty means "not specified by the caller" — see
+	// DefaultWorkingDir for the fallback every subprocess adapter applies in
+	// that case. HTTP adapters (anthropic_api, openai_api, bedrock_api)
+	// ignore this field entirely; they have no subprocess and no cwd notion.
+	//
+	// This value is never inferred from server-side state (daemon cwd, HOME,
+	// or any other host-local signal) — the router is a shared daemon and a
+	// server-chosen directory would just be a different flavor of the bug
+	// this field exists to fix for the next caller. It is set only from an
+	// explicit, validated wire request field (see ResolveWorkingDir).
+	WorkingDir string
+}
+
+// DefaultWorkingDir is the cmd.Dir every subprocess adapter uses when the
+// caller does not supply an explicit WorkingDir. It is deliberately neutral
+// so a subprocess never inherits the daemon's own cwd (which may be a
+// project directory carrying its own ./CLAUDE.md or ./.claude/settings.json
+// that the daemon's operator never intended a router-spawned session to
+// pick up).
+const DefaultWorkingDir = "/"
+
+// ResolveWorkingDir validates a caller-supplied working_dir wire value and
+// returns the directory a subprocess adapter should use as cmd.Dir.
+//
+// raw == "" is the explicit-absent case: returns (DefaultWorkingDir, nil)
+// with no inference attempted, mirroring the discovery-only-when-empty
+// pattern used elsewhere in this codebase (buildAdapter in cmd/clagentic-router
+// only invokes discovery when the corresponding config field is empty).
+//
+// A non-empty raw value is fail-loud: it must be an absolute path that
+// exists on disk and is a directory. Any violation returns a descriptive
+// error the caller should surface as a 4xx at the wire boundary — silently
+// falling back to the default or letting exec fail opaquely later would
+// reproduce the exact silent-wrong defect class this field exists to fix.
+func ResolveWorkingDir(raw string) (string, error) {
+	if raw == "" {
+		return DefaultWorkingDir, nil
+	}
+	if !filepath.IsAbs(raw) {
+		return "", fmt.Errorf("working_dir must be an absolute path, got %q", raw)
+	}
+	fi, err := os.Stat(raw)
+	if err != nil {
+		return "", fmt.Errorf("working_dir %q: %w", raw, err)
+	}
+	if !fi.IsDir() {
+		return "", fmt.Errorf("working_dir %q is not a directory", raw)
+	}
+	return raw, nil
 }
 
 // RateLimitInfo holds provider rate-limit header values from one response.
