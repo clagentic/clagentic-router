@@ -83,6 +83,22 @@ ChatGPT-Plus via `codex_cli` are load-bearing production paths. A change that
 improves one backend must be a verified no-op for the others — state that
 verification explicitly, don't assume it.
 
+**Subprocess cwd contract (`working_dir`).** All four subprocess adapters
+(`claude_cli`, `codex_cli`, `codex_subagent`, `gemini_cli`) set `cmd.Dir`
+from `req.WorkingDir` when the wire request supplies it, else
+`backend.DefaultWorkingDir` (`/`). HTTP adapters (`anthropic_api`,
+`openai_api`, `bedrock_api`, `ollama_http`) have no subprocess and ignore
+the field. The value is never inferred from server-side state (daemon cwd,
+HOME, or any other host-local signal) — the router is a shared daemon, and
+a server-chosen directory would just be a different flavor of the bug this
+field exists to fix for the next caller; it comes only from an explicit,
+validated wire field (`backend.ResolveWorkingDir`). This is two independent
+hook-suppression layers, not one: the `claudeSubprocessHome`/`HOME`
+override (`claude_cli.go`) covers `~/.claude`-scoped hooks/MCP/memory and is
+cwd-independent, while `cmd.Dir` covers only project-scoped `./CLAUDE.md`
+and `./.claude/settings.json`, which the HOME override does not touch. A new
+subprocess adapter must set both.
+
 **Verify per-provider assumptions against the live source; never generalize
 one host's observed shape into a parser assumption.** Data shapes differ
 across providers in ways that are not guessable from one example:
