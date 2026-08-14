@@ -15,13 +15,14 @@
 //
 // This adapter itself treats both values as opaque strings and never reads
 // codex config.toml or makes network calls — it only appends the flag it is
-// given. providerID normally arrives already resolved by
-// DiscoverCodexProjectHeader (codex_discovery.go), which reads config.toml
-// once at construction time; projectID is override-only (no discovery path
-// — see codex_discovery.go package doc). router.yaml's
-// codex_provider_id/openai_project_id remain available as explicit
-// overrides for the ambiguous provider case and as the only way to set a
-// project id at all.
+// given. Both values are validated upstream, before this adapter ever sees
+// them, by DiscoverCodexProjectHeader (codex_discovery.go), which is the
+// single call site both cross through on their way into this adapter's
+// constructor: providerID via discovery or override, projectID via
+// override only (no discovery path — see codex_discovery.go package doc).
+// router.yaml's codex_provider_id/openai_project_id remain available as
+// explicit overrides for the ambiguous provider case and as the only way to
+// set a project id at all.
 //
 // This is the "openai-via-codex" provider path from the relay registry.
 // For the codex subagent (openai-via-codex-subagent), use CodexSubagentAdapter.

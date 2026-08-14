@@ -154,6 +154,40 @@ func TestValidateCodexProviderID(t *testing.T) {
 	}
 }
 
+// TestValidateOpenAIProjectID covers the character-class/length validator
+// applied to openai_project_id before it is interpolated into codex's -c
+// model_providers.<id>.http_headers={"OpenAI-Project"="<id>"} override
+// string (codex_cli.go). Mirrors TestValidateCodexProviderID's shape since
+// both validators guard the same override string.
+func TestValidateOpenAIProjectID(t *testing.T) {
+	cases := []struct {
+		name string
+		id   string
+		want bool
+	}{
+		{"valid lowercase slug", "acme-project", true},
+		{"valid mixed case with underscore", "Acme_Project-2", true},
+		{"valid at max length", strings.Repeat("a", maxOpenAIProjectIDLen), true},
+		{"empty rejected", "", false},
+		{"too long rejected", strings.Repeat("a", maxOpenAIProjectIDLen+1), false},
+		{"quote rejected (breaks http_headers JSON-ish literal)", `acme"project`, false},
+		{"brace rejected (TOML inline table)", "acme}project", false},
+		{"equals rejected", "acme=project", false},
+		{"space rejected", "acme project", false},
+		{"newline rejected", "acme\nproject", false},
+		{"dot rejected", "acme.project", false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			got := validateOpenAIProjectID(tc.id)
+			if got != tc.want {
+				t.Errorf("validateOpenAIProjectID(%q) = %v, want %v", tc.id, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestDiscoverCodexProjectHeader_FailureNeverBreaksInvoke covers the
 // end-to-end DiscoverCodexProjectHeader entry point: discovery failure at
 // any stage (no config, ambiguous config) must degrade to an empty pair,
@@ -247,6 +281,37 @@ base_url = "https://bedrock-mantle.us-fake-1.api.aws/v1"
 		providerID, projectID := DiscoverCodexProjectHeader(`evil"}.http_headers={"x"="y`, "override-project")
 		if providerID != "" || projectID != "" {
 			t.Errorf("expected empty pair for invalid override providerID, got providerID=%q projectID=%q", providerID, projectID)
+		}
+	})
+
+	t.Run("invalid openai_project_id degrades to no header injection, providerID still resolves", func(t *testing.T) {
+		dir := t.TempDir() // no config.toml — discovery would fail if it ran
+		t.Setenv("CODEX_HOME", dir)
+
+		// A malformed projectID must never take providerID down with it: the
+		// asymmetric failure mode this task closes means projectID gets its
+		// own validation pass and its own degrade-to-empty, independent of
+		// whether providerID resolved cleanly via override.
+		providerID, projectID := DiscoverCodexProjectHeader("override-provider", `evil"}.http_headers={"x"="y`)
+		if providerID != "override-provider" {
+			t.Errorf("expected providerID to still resolve despite invalid projectID, got %q", providerID)
+		}
+		if projectID != "" {
+			t.Errorf("expected empty projectID for invalid override projectID, got %q", projectID)
+		}
+	})
+
+	t.Run("valid openai_project_id override passes through verbatim", func(t *testing.T) {
+		dir := t.TempDir() // no config.toml — discovery would fail if it ran
+		t.Setenv("CODEX_HOME", dir)
+
+		const validProjectID = "operator-set-project-id_2"
+		providerID, projectID := DiscoverCodexProjectHeader("override-provider", validProjectID)
+		if providerID != "override-provider" {
+			t.Errorf("expected providerID to pass through unchanged, got %q", providerID)
+		}
+		if projectID != validProjectID {
+			t.Errorf("expected valid projectID to pass through verbatim, got %q, want %q", projectID, validProjectID)
 		}
 	})
 
