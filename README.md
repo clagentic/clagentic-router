@@ -215,36 +215,64 @@ limitations of *cwd validation*, not gaps this field's validation claims to
 close. The three HTTP adapters (`anthropic_api`, `openai_api`,
 `bedrock_api`) have no subprocess and ignore this field entirely.
 
-**Trust-granting allowlist (`trusted_working_dirs`) — a separate control,
-`claude_cli`/`codex_subagent` only.** Do not confuse the above with
-`trusted_working_dirs`: `working_dir` picks *where a subprocess runs*;
-`trusted_working_dirs` (top-level router config, `config.Config`) controls a
-narrower, separate question — whether `claude_cli` and `codex_subagent`
-specifically are allowed to pre-accept the Claude Code CLI's per-project
-trust dialog for that directory. Accepting that dialog is not cosmetic: it
-makes the CLI start honoring that directory's `.claude/settings.json`
-`permissions.allow` entries, hooks, and project `CLAUDE.md` memory inside
-the router's subprocess, for any caller able to reach this daemon with that
-`working_dir` value. `codex_cli` and `gemini_cli` have no trust dialog and
-ignore `trusted_working_dirs` entirely.
+**Workspace trust is not a control this daemon can rely on.** Claude Code's
+interactive per-project trust dialog gates hooks, `.claude/settings.json`
+`permissions.allow` entries, and CLAUDE.md memory in a normal terminal
+session — but `claude_cli` and `codex_subagent` both invoke the CLI in
+non-interactive print mode (`claude --print` / `claude -p`), and the CLI's
+own `--print` help text says plainly: the workspace trust dialog is skipped
+in non-interactive mode. It never fires on this call path at all. A prior
+version of this daemon added an operator-configured `trusted_working_dirs`
+allowlist and pre-accepted that dialog in the isolated subprocess HOME's
+`.claude.json` before invoking the CLI — that machinery has been removed,
+because the dialog it pre-accepted was never blocking anything in the first
+place. Trust and tool-permissions are two separate gates in Claude Code;
+this router's subprocess calls never go through the trust gate at all, in
+either direction.
 
-The default is **fail-closed**: an empty or absent `trusted_working_dirs`
-trusts nothing, so every request against a real project directory fails
-with the CLI's own "workspace has not been trusted" error until the
-directory is added. **Upgrade note:** this is a breaking change for any
-existing deployment using `claude_cli`/`codex_subagent` against real project
-directories — add the directories you need to `trusted_working_dirs` in
-`router.yaml` after upgrading, or those two adapters stop working. The
-refusal is logged at `Warn` (once per distinct directory, not once per
-call) naming both the offending directory and the `trusted_working_dirs`
-field, so this is visible at default log verbosity.
+**The real exposure, and how it's closed (`--safe-mode`).** Because there is
+no trust dialog to skip past, a caller-supplied `working_dir` whose
+`.claude/settings.json` defines hooks, `permissions.allow` entries, or a
+project `CLAUDE.md` gets those executed inside this daemon's subprocess on
+every invocation, by default — any caller who can reach
+`/v1/chat/completions` with a `working_dir` value effectively gets that
+directory's Claude Code config executed with this daemon's privileges. This
+is the same shape of exposure as
+[GHSA-wpqr-6v78-jr5g](https://github.com/advisories/GHSA-wpqr-6v78-jr5g)
+(Gemini CLI auto-trusting workspace folders in headless/CI invocations).
+`claude_cli` and `codex_subagent` now pass `--safe-mode` on every
+invocation, unconditionally — not config-gated, because there is no safe
+reason for an operator to opt back into running an arbitrary caller-chosen
+directory's config inside a shared daemon process. Per the CLI's own
+`--safe-mode` help text, this disables CLAUDE.md, skills, plugins, hooks,
+and MCP servers for the session while auth, model selection, built-in
+tools, and permissions continue to work normally.
 
-Matching is **exact, not subtree**: listing `/workspace` does **not**
-trust `/workspace/foo` — each directory that needs trust needs its own
-entry. This is the deliberately safer of the two possible semantics; see
-`internal/backend/trust_allowlist.go`'s package doc for the full rationale,
-and `internal/config/config.go`'s `TrustedWorkingDirs` field doc for the
-config-side contract.
+`--bare` was considered first and rejected: its help text states Anthropic
+auth under `--bare` is "strictly `ANTHROPIC_API_KEY` or `apiKeyHelper` ...
+OAuth and keychain are never read" — both adapters authenticate purely via
+an OAuth credentials file synced into the isolated subprocess HOME, so
+`--bare` would break authentication outright rather than harden anything.
+
+**The capability trade-off is real, not free.** A caller whose `working_dir`
+points at a real project loses that project's CLAUDE.md context and skills
+under `--safe-mode` — there is currently no way to give a caller
+repo-aware behavior without also giving that directory's config the
+ability to execute inside this daemon's process. `working_dir` under
+`--safe-mode` still selects *where the subprocess runs* (relevant for any
+tool that reads the filesystem relative to cwd); it no longer selects
+*whose Claude Code config executes*.
+
+`codex_cli` and `gemini_cli` are different binaries — `--safe-mode` is
+claude-specific and does not apply to either. `codex_cli` reads
+`~/.codex/config.toml`/`auth.json` but has no equivalent
+hooks/settings/CLAUDE.md auto-discovery surface today, so there is no
+known analogous exposure to close for it. `gemini_cli`'s installed version
+in this deployment's build environment (0.47.0) is well past the version
+GHSA-wpqr-6v78-jr5g was fixed in (0.39.1) — not exposed to that specific
+advisory as verified here; operators running an older `gemini` binary
+should confirm their own installed version independently, since this
+daemon does not pin or vendor either CLI.
 
 Hook suppression against the *daemon's own* config differs by adapter and
 predates this field: `claude_cli` and `codex_subagent` also override
@@ -256,6 +284,10 @@ strengthens both pairs of adapters the same way regardless of that
 asymmetry: none of the four inherits the daemon's actual cwd anymore. See
 `CLAUDE.md`'s "Subprocess cwd contract" for the full per-adapter
 breakdown.
+
+**Upgrade note.** A `trusted_working_dirs` key left over in `router.yaml`
+from a prior version is ignored (logged at `Warn`, not a startup error) —
+remove it; it has no effect.
 
 ### Adapter capabilities
 
