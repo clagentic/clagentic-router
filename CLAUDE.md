@@ -83,6 +83,43 @@ ChatGPT-Plus via `codex_cli` are load-bearing production paths. A change that
 improves one backend must be a verified no-op for the others — state that
 verification explicitly, don't assume it.
 
+**Subprocess cwd contract (`working_dir`).** All four subprocess adapters
+(`claude_cli`, `codex_cli`, `codex_subagent`, `gemini_cli`) set `cmd.Dir`
+from `req.WorkingDir` when the wire request supplies it, else
+`backend.DefaultWorkingDir` (`/`). HTTP adapters (`anthropic_api`,
+`openai_api`, `bedrock_api`, `ollama_http`) have no subprocess and ignore
+the field. The value is never inferred from server-side state (daemon cwd,
+HOME, or any other host-local signal) — the router is a shared daemon, and
+a server-chosen directory would just be a different flavor of the bug this
+field exists to fix for the next caller; it comes only from an explicit,
+validated wire field (`backend.ResolveWorkingDir`).
+
+Hook suppression is **not uniform across the four adapters** — this is
+pre-existing (predates `working_dir`), not something this field changes:
+`claude_cli` and `codex_subagent` both set `HOME=claudeSubprocessHome`
+(a stub `~/.claude` with no hook-bearing `settings.json`), so they get two
+independent layers — the HOME override, cwd-independent, covering
+`~/.claude`-scoped hooks/MCP/memory, plus `cmd.Dir`, covering only
+project-scoped `./CLAUDE.md` and `./.claude/settings.json`. `codex_cli` and
+`gemini_cli` set no HOME override at all — `cmd.Dir` is their *only* layer.
+Defaulting `cmd.Dir` to `/` for those two (this field's fix) strengthens
+them regardless: it stops them inheriting the daemon's cwd, even without a
+HOME override to match. Do not remove `cmd.Dir` from `codex_cli` or
+`gemini_cli` on the assumption a HOME override already covers them — it
+doesn't. A new adapter that sets a HOME override should still set `cmd.Dir`
+too (mirror `claude_cli`/`codex_subagent`); one that doesn't should still
+set `cmd.Dir` as its sole layer (mirror `codex_cli`/`gemini_cli`). Adding a
+HOME override to `codex_cli`/`gemini_cli` is a separate, real hardening
+question — out of scope here, tracked as a follow-up, not assumed done.
+
+`backend.ResolveWorkingDir` validates the wire value (absolute, exists, is
+a directory) but is not a containment control: it has no path-containment
+allowlist restricting *which* directories are acceptable, and there is a
+TOCTOU window between its `os.Stat` check and the subprocess's later
+`exec.Start` — the directory could be replaced or removed in between. Both
+are known, accepted limitations of the wire-boundary validation, not gaps
+to close by adding an allowlist here.
+
 **Verify per-provider assumptions against the live source; never generalize
 one host's observed shape into a parser assumption.** Data shapes differ
 across providers in ways that are not guessable from one example:

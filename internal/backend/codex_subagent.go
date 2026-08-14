@@ -107,7 +107,18 @@ func (a *CodexSubagentAdapter) Invoke(ctx context.Context, req *Request) (*Respo
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Stdin = strings.NewReader(fullPrompt.String())
 	cmd.Env = env
-	cmd.Dir = "/"
+	// Neutral working directory so the subprocess does not inherit the
+	// daemon's cwd (which may be a project directory carrying its own
+	// ./CLAUDE.md or ./.claude/settings.json the agent picks up unexpectedly
+	// via the claude -p --agent codex path). Defaults to DefaultWorkingDir
+	// ("/") when the caller does not supply req.WorkingDir; a validated,
+	// caller-supplied directory (see ResolveWorkingDir at the wire boundary)
+	// is honored instead. Mirrors claude_cli.go's cmd.Dir handling — see its
+	// Invoke for the fuller two-layer rationale (HOME override + cmd.Dir).
+	cmd.Dir = req.WorkingDir
+	if cmd.Dir == "" {
+		cmd.Dir = DefaultWorkingDir
+	}
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

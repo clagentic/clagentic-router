@@ -83,6 +83,12 @@ type chatCompletionRequest struct {
 	// non-empty Tools value must route only to a tool-capable backend or be
 	// refused outright; see chatCompletions' tool-capability check.
 	Tools json.RawMessage `json:"tools,omitempty"`
+	// WorkingDir is an opt-in absolute directory subprocess (CLI) adapters
+	// use as their cmd.Dir. Empty (the default) falls through to
+	// backend.DefaultWorkingDir with no inference — never guessed from
+	// server-side state. Validated at this boundary via
+	// backend.ResolveWorkingDir; ignored entirely by HTTP adapters.
+	WorkingDir string `json:"working_dir,omitempty"`
 }
 
 // hasTools reports whether raw is a present, non-null, non-empty-array JSON
@@ -183,6 +189,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "max_tokens exceeds limit (max 32000)")
 		return
 	}
+	workingDir, err := backend.ResolveWorkingDir(req.WorkingDir)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
 	chain := h.router.ResolveModel(req.Model)
 	if len(chain) == 0 {
 		writeError(w, http.StatusBadRequest, "unknown_model",
@@ -207,8 +218,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	routerReq := &backend.Request{
-		Messages:  req.Messages,
-		MaxTokens: req.MaxTokens,
+		Messages:   req.Messages,
+		MaxTokens:  req.MaxTokens,
+		WorkingDir: workingDir,
 	}
 
 	resp, meta, err := h.router.Route(r.Context(), routerReq, chain)

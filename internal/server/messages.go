@@ -54,6 +54,14 @@ type anthropicMsgRequest struct {
 	// Passthrough mode is unaffected: it forwards the original request
 	// bytes (including tools) unmodified, never decoding this field.
 	Tools json.RawMessage `json:"tools,omitempty"`
+	// WorkingDir is an opt-in absolute directory subprocess (CLI) adapters
+	// use as their cmd.Dir, honored only in routed mode (messagesRouted).
+	// Empty (the default) falls through to backend.DefaultWorkingDir with no
+	// inference — never guessed from server-side state. Validated at the
+	// routed-mode boundary via backend.ResolveWorkingDir. Passthrough mode
+	// forwards the original request bytes unmodified and never reads this
+	// field — it has no adapter, no subprocess, no cwd notion.
+	WorkingDir string `json:"working_dir,omitempty"`
 }
 
 type anthropicMsgMessage struct {
@@ -312,9 +320,16 @@ func (h *Handler) messagesRouted(w http.ResponseWriter, r *http.Request, req *an
 		return
 	}
 
+	workingDir, err := backend.ResolveWorkingDir(req.WorkingDir)
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	routerReq := &backend.Request{
-		Messages:  msgs,
-		MaxTokens: req.MaxTokens,
+		Messages:   msgs,
+		MaxTokens:  req.MaxTokens,
+		WorkingDir: workingDir,
 	}
 
 	resp, meta, err := h.router.Route(r.Context(), routerReq, chain)

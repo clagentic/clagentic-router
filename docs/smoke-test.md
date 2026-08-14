@@ -111,6 +111,22 @@ LOG_LEVEL=debug CLAGENTIC_ROUTER_TOKEN=test ./scripts/smoke-test.sh
 | Missing `model` field | 400 |
 | Malformed JSON body | 400 |
 | Unknown route | 404 or 405 |
+| `working_dir` not absolute (e.g. `relative/path`) | 400 |
+
+### 9. `working_dir`
+| Check | Expected |
+|---|---|
+| `POST /v1/chat/completions` with `"working_dir":"/tmp"` | 200 — valid absolute, existing directory is accepted |
+| `POST /v1/chat/completions` with `"working_dir":"/no/such/path"` | 400 — path does not exist |
+| `POST /v1/messages` (routed mode) with `"working_dir":"/tmp"` | 200 — same validation applies to the routed Anthropic surface |
+
+The smoke harness runs against `ollama_http`, an HTTP adapter that ignores
+`working_dir` entirely (see README.md's "Working directory" section) — these
+checks exercise the wire-boundary validation in `backend.ResolveWorkingDir`,
+not subprocess `cmd.Dir`. Subprocess adapters (`claude_cli`, `codex_cli`,
+`codex_subagent`, `gemini_cli`) require an OAuth session on the host and are
+out of scope for this harness; `internal/backend/working_dir_test.go`
+exercises `cmd.Dir` assignment directly per adapter.
 
 ### 8. Call log
 | Check | Expected |

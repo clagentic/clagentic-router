@@ -347,11 +347,13 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 	// buildCLIEnv filters the daemon environment to the allowlist — router tokens
 	// and API keys are not passed to the subprocess. (lr-c7ac)
 	//
-	// CLAUDE_CONFIG_DIR is set to an empty directory so the subprocess does not
-	// load any hooks, MCP servers, or memory from the operator's ~/.claude config.
-	// Without this, SessionStart hooks (e.g. LORE) fire on every router invocation,
-	// polluting stdout with hook telemetry and occasionally triggering auth
-	// misclassification in parseStreamJSON.
+	// The subprocess HOME is overridden to claudeSubprocessHome (see its doc
+	// above), which points at a stub config dir with an empty settings.json —
+	// this is what suppresses hooks, MCP servers, and memory loaded from
+	// ~/.claude, not any CLAUDE_CONFIG_DIR setting. Without it, SessionStart
+	// hooks (e.g. LORE) fire on every router invocation, polluting stdout with
+	// hook telemetry and occasionally triggering auth misclassification in
+	// parseStreamJSON.
 	extra := []string{"CLAGENTIC_DISABLE_RECALL=1"}
 	if claudeSubprocessHome != "" {
 		extra = append(extra, "HOME="+claudeSubprocessHome)
@@ -361,9 +363,17 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Stdin = strings.NewReader(prompt)
 	cmd.Env = env
-	// Set a neutral working directory so the subprocess does not inherit the
-	// daemon's cwd (which may be a project directory with CLAUDE.md hooks).
-	cmd.Dir = "/"
+	// Working directory: the HOME override above is the first of two hook-
+	// suppression layers and covers ~/.claude-scoped hooks regardless of cwd.
+	// cmd.Dir is the second, narrower layer — it covers project-scoped
+	// ./CLAUDE.md and ./.claude/settings.json, which the HOME override does
+	// not touch. Defaults to DefaultWorkingDir ("/") when the caller does not
+	// supply req.WorkingDir; a validated, caller-supplied directory (see
+	// ResolveWorkingDir at the wire boundary) is honored instead.
+	cmd.Dir = req.WorkingDir
+	if cmd.Dir == "" {
+		cmd.Dir = DefaultWorkingDir
+	}
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
