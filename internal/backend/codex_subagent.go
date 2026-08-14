@@ -120,6 +120,14 @@ func (a *CodexSubagentAdapter) Invoke(ctx context.Context, req *Request) (*Respo
 		cmd.Dir = DefaultWorkingDir
 	}
 
+	// This adapter invokes the same claude CLI binary as claude_cli.go
+	// ("claude -p --agent codex" vs. "claude --print"), through the same
+	// isolated HOME, so it is gated by the identical per-project trust
+	// dialog. Pre-accept it for this exact directory before the subprocess
+	// starts — see trust_sync.go package doc for the write discipline and
+	// isolation guarantees (lr-4abfe9).
+	syncProjectTrust(claudeSubprocessHome, cmd.Dir)
+
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
