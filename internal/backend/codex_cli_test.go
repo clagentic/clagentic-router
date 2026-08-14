@@ -87,6 +87,69 @@ func TestCodexCLI_Invoke_SubprocessEnvFiltered(t *testing.T) {
 	}
 }
 
+// TestCodexCLI_Invoke_SubprocessEnvAWSCredentialsSurvive proves, at the
+// actual Invoke call site, that AWS SDK standard credential/config env vars
+// survive buildCLIEnv's filter — a live regression this test guards
+// against: codex_cli routed through buildCLIEnv for the first time in
+// lr-bd5dc0, and the allowlist had never contained an AWS_ entry, so a
+// Bedrock-env-authed host (AWS_PROFILE/AWS_REGION set, no ~/.aws/credentials
+// file) failed 100% of codex exec invocations with "AWS SDK config did not
+// resolve a region". Composed with the same secret-blocking assertions as
+// TestCodexCLI_Invoke_SubprocessEnvFiltered to cover both directions in one
+// real subprocess env dump.
+func TestCodexCLI_Invoke_SubprocessEnvAWSCredentialsSurvive(t *testing.T) {
+	os.Setenv("CLAGENTIC_ROUTER_TOKEN", "super-secret-token")
+	os.Setenv("AWS_PROFILE", "test-profile")
+	os.Setenv("AWS_REGION", "us-test-1")
+	os.Setenv("AWS_SECRET_ACCESS_KEY", "fake-secret-access-key")
+	os.Setenv("AWS_SESSION_TOKEN", "fake-session-token")
+	defer func() {
+		os.Unsetenv("CLAGENTIC_ROUTER_TOKEN")
+		os.Unsetenv("AWS_PROFILE")
+		os.Unsetenv("AWS_REGION")
+		os.Unsetenv("AWS_SECRET_ACCESS_KEY")
+		os.Unsetenv("AWS_SESSION_TOKEN")
+	}()
+
+	origHome := os.Getenv("HOME")
+	if origHome == "" {
+		os.Setenv("HOME", "/root")
+		defer os.Setenv("HOME", origHome)
+	}
+
+	dir := t.TempDir()
+	envFile := filepath.Join(dir, "env.txt")
+	bin := writeFakeCodexBinWithEnvDump(t, dir, envFile, "response from codex")
+
+	adapter := NewCodexCLIAdapter("test", "", "", "", "", bin)
+	req := &Request{Messages: []Message{{Role: "user", Content: "ping"}}}
+
+	if _, err := adapter.Invoke(context.Background(), req); err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+
+	data, err := os.ReadFile(envFile)
+	if err != nil {
+		t.Fatalf("read subprocess env dump: %v", err)
+	}
+	subprocessEnv := string(data)
+
+	if strings.Contains(subprocessEnv, "CLAGENTIC_ROUTER_TOKEN=super-secret-token") {
+		t.Error("router token leaked into codex_cli subprocess env")
+	}
+
+	for _, want := range []string{
+		"AWS_PROFILE=test-profile",
+		"AWS_REGION=us-test-1",
+		"AWS_SECRET_ACCESS_KEY=fake-secret-access-key",
+		"AWS_SESSION_TOKEN=fake-session-token",
+	} {
+		if !strings.Contains(subprocessEnv, want) {
+			t.Errorf("%s missing from codex_cli subprocess env — Bedrock-env auth would fail", want)
+		}
+	}
+}
+
 // findFlagAll returns every value immediately following an occurrence of flag
 // in args, preserving order. Used because -c may appear more than once.
 func findFlagAll(args []string, flag string) []string {

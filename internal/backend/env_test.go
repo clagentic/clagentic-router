@@ -152,7 +152,8 @@ func TestCLIEnvAllowed_KeyMatchesExactly(t *testing.T) {
 	}
 }
 
-// TestCLIEnvAllowed_PrefixMatch tests prefix matching (e.g. LC_ALL, CLAUDE_BIN).
+// TestCLIEnvAllowed_PrefixMatch tests prefix matching (e.g. LC_ALL) and exact
+// literal matching (e.g. CLAUDE_BIN, CODEX_HOME).
 func TestCLIEnvAllowed_PrefixMatch(t *testing.T) {
 	cases := []struct {
 		kv      string
@@ -160,7 +161,6 @@ func TestCLIEnvAllowed_PrefixMatch(t *testing.T) {
 	}{
 		{"LC_ALL=en_US.UTF-8", true},
 		{"CLAUDE_BIN=/usr/local/bin/claude", true},
-		{"GEMINI_API_KEY=token", true}, // GEMINI_ prefix is allowed
 		{"CODEX_HOME=/home/user/.codex", true},
 		{"CLAGENTIC_DISABLE_RECALL=1", true},
 		{"CLAGENTIC_CODEX_TIER=flagship", true},
@@ -168,6 +168,40 @@ func TestCLIEnvAllowed_PrefixMatch(t *testing.T) {
 		{"CLAGENTIC_ROUTER_ADMIN_TOKEN=s", false}, // not in allowlist
 		{"SECRET_KEY=abc", false},
 		{"DATABASE_URL=postgres://...", false},
+		// Narrowing: bare CLAUDE_/CODEX_/GEMINI_ prefixes used to admit
+		// anything with that stem, including secret-shaped vars.
+		// Literal-only matching now blocks these.
+		{"GEMINI_API_KEY=token", false},
+		{"CODEX_API_KEY=token", false},
+		{"CLAUDE_API_KEY=token", false},
+		// Widening: AWS SDK standard credential/config vars are admitted
+		// (Bedrock-fronted codex_cli), listed as literals — see env.go
+		// package doc for why a suffix denylist was rejected (it would
+		// also block AWS_SECRET_ACCESS_KEY/AWS_SESSION_TOKEN, which are
+		// the exact vars this widening exists to admit).
+		{"AWS_PROFILE=my-profile", true},
+		{"AWS_REGION=us-east-1", true},
+		{"AWS_DEFAULT_REGION=us-east-1", true},
+		{"AWS_ACCESS_KEY_ID=AKIA...", true},
+		{"AWS_SECRET_ACCESS_KEY=abc", true},
+		{"AWS_SESSION_TOKEN=abc", true},
+		{"AWS_ROLE_ARN=arn:aws:iam::x", true},
+		{"AWS_WEB_IDENTITY_TOKEN_FILE=/p", true},
+		{"AWS_SDK_LOAD_CONFIG=1", true},
+		{"AWS_CONFIG_FILE=/p", true},
+		{"AWS_SHARED_CREDENTIALS_FILE=/p", true},
+		// An AWS var NOT in the enumerated literal set must still be
+		// blocked — proves this is literal matching, not a disguised
+		// AWS_ prefix.
+		{"AWS_UNLISTED_MADE_UP_VAR=x", false},
+		// Vertex AI / Azure OpenAI SDK credential vars, pre-empting the
+		// identical gap AWS_ absence caused for Bedrock — not known to be
+		// in live use by any adapter today.
+		{"GOOGLE_APPLICATION_CREDENTIALS=/p", true},
+		{"GOOGLE_CLOUD_PROJECT=my-project", true},
+		{"CLOUDSDK_CORE_PROJECT=my-project", true},
+		{"AZURE_TENANT_ID=abc", true},
+		{"AZURE_CLIENT_SECRET=abc", true},
 	}
 	for _, tc := range cases {
 		got := cliEnvAllowed(tc.kv)
