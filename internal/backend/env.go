@@ -15,16 +15,14 @@
 // env:VAR indirection, never inherited raw by a CLI subprocess — see
 // .env.example).
 //
-// The cloud-provider SDK credential vars (AWS_*, GOOGLE_*/CLOUDSDK_*,
-// AZURE_*) are listed here as literals too, not a prefix+denylist. A
-// suffix-based denylist (blocking names ending in _TOKEN/_SECRET) was
-// evaluated and rejected: the AWS SDK's own standard credential vars
-// include AWS_SESSION_TOKEN and AWS_SECRET_ACCESS_KEY — a denylist wide
-// enough to catch operator-typo'd secrets would also block the exact vars
-// this task exists to admit. Each cloud SDK's env-var vocabulary is small,
-// stable, and documented (AWS SDK, Google Application Default Credentials,
-// Azure Identity SDK), so literal enumeration is both safer and no more
-// maintenance burden than a prefix would be.
+// The AWS SDK credential vars are listed here as literals too, not a
+// prefix+denylist. A suffix-based denylist (blocking names ending in
+// _TOKEN/_SECRET) was evaluated and rejected: the AWS SDK's own standard
+// credential vars include AWS_SESSION_TOKEN and AWS_SECRET_ACCESS_KEY — a
+// denylist wide enough to catch operator-typo'd secrets would also block
+// the exact vars this task exists to admit. The AWS SDK's env-var
+// vocabulary is small, stable, and documented, so literal enumeration is
+// both safer and no more maintenance burden than a prefix would be.
 //
 // cliEnvAllowlistPrefixes is reserved for genuinely unbounded families
 // (locale/XDG vars) where no finite literal list is possible.
@@ -38,6 +36,43 @@
 // leak. Listing them does not reopen the lr-c7ac leak the same way a bare
 // CLAUDE_/CODEX_/GEMINI_ prefix did.
 //
+// # Why AWS is a flat literal list, and why Google/Azure are NOT treated the same
+//
+// The AWS set fixes a live, documented regression: Bedrock-fronted codex_cli
+// (model_provider = amazon-bedrock in ~/.codex/config.toml) genuinely reads
+// these vars today, and codex_cli's env was previously unfiltered, so
+// filtering it without this set would have broken a working deployment
+// (lr-bd5dc0). That is not true of Azure: no adapter in this repo talks to
+// Azure OpenAI / Azure Identity, so there is no live regression and no
+// deployment this admits. Pre-admitting a cloud provider's credential vars
+// ahead of any adapter that reads them is not "breadth" in the sense
+// CLAUDE.md's doctrine means — breadth there means naming what a change
+// does on every existing provider, including the no-op case, not
+// pre-opening a secret-admission boundary for a provider with no consumer.
+// AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET,
+// AZURE_CLIENT_CERTIFICATE_PATH, AZURE_USERNAME, and AZURE_PASSWORD
+// (lr-268431, bobbie.uncat.1) were removed in full rather than partially
+// kept, because unlike the Google set below, every var in Azure's SDK
+// credential-chain vocabulary that would be worth admitting either IS raw
+// secret material (AZURE_CLIENT_SECRET, AZURE_PASSWORD) or exists only to
+// pair with one (AZURE_TENANT_ID/AZURE_CLIENT_ID/AZURE_USERNAME identify an
+// auth flow that has no other purpose once its secret half is gone;
+// AZURE_CLIENT_CERTIFICATE_PATH is a path but authenticates via a
+// certificate this repo has no story for provisioning either). Keeping a
+// stub of identity-only vars with no working auth flow behind them would
+// just be dead surface. The clean path for a future Azure adapter: add the
+// specific vars that adapter's SDK path needs, in the same PR that adds the
+// adapter, the same way lr-bd5dc0 added AWS_* alongside the Bedrock fix
+// this file documents above — not ahead of time.
+//
+// The Google/CLOUDSDK set is kept, on the opposite basis BOBBIE accepted:
+// GOOGLE_APPLICATION_CREDENTIALS and CLOUDSDK_CONFIG are file paths,
+// GOOGLE_CLOUD_PROJECT and CLOUDSDK_CORE_PROJECT are project identifiers —
+// none is raw secret material, and gemini_cli is a live adapter in this
+// repo today (unlike Azure, which has no adapter at all). The exposure of
+// an unused project-id or config-path var is qualitatively smaller than the
+// exposure of an unused long-lived secret.
+//
 // # Why a flat cloud-provider list, not per-adapter/per-model routing
 //
 // The router's BackendConfig has no notion of "this backend's upstream
@@ -48,18 +83,10 @@
 // identity from config through adapter construction into every buildCLIEnv
 // call site — a much larger change than this defect calls for, and env.go
 // has no other per-adapter conditional logic today (every call site uses
-// the same allowlist). A flat list covering the three known cloud-provider
-// SDK credential families is the deliberately chosen, smaller alternative:
-// it fixes the live Bedrock regression and pre-empts the identical Vertex/
-// Azure-shaped gap without new plumbing. The trade-off: a
-// CLI that has no business talking to, say, Azure still gets AZURE_* vars
-// if the operator's shell happens to export them — acceptable because (a)
-// these are the backend's own upstream-cloud credentials, not another
-// backend's secret or a router token, and (b) an unused credential var
-// passed to a CLI that ignores it is a strictly smaller exposure than the
-// AWS_-absence live regression this task fixes. Per-adapter/per-model
-// scoping remains a real hardening option if the flat list proves too
-// broad in practice; it is not implemented here.
+// the same allowlist). A flat list is the deliberately chosen, smaller
+// alternative for the cloud-provider families it does cover. Per-adapter/
+// per-model scoping remains a real hardening option if the flat list proves
+// too broad in practice; it is not implemented here.
 package backend
 
 import (
@@ -126,27 +153,16 @@ var cliEnvAllowlistLiterals = []string{
 	"AWS_CONFIG_FILE",
 	"AWS_SHARED_CREDENTIALS_FILE",
 
-	// Google Cloud SDK / Vertex AI standard credential env vars. Not known
-	// to be in live use by any adapter in this repo today, but gemini_cli
-	// (or any future Vertex-fronted CLI backend) would hit the identical
-	// gap AWS_ absence caused for Bedrock the moment such a backend
-	// existed — pre-empted here per CLAUDE.md breadth doctrine rather than
-	// waiting for its own live regression.
+	// Google Cloud SDK / Vertex AI credential env vars. gemini_cli is a live
+	// adapter in this repo, and none of these four is raw secret material —
+	// GOOGLE_APPLICATION_CREDENTIALS/CLOUDSDK_CONFIG are file paths,
+	// GOOGLE_CLOUD_PROJECT/CLOUDSDK_CORE_PROJECT are project identifiers.
+	// See package doc for why this set is kept while the Azure set
+	// (secret-shaped, no adapter consumer) was removed (lr-268431).
 	"GOOGLE_APPLICATION_CREDENTIALS",
 	"GOOGLE_CLOUD_PROJECT",
 	"CLOUDSDK_CORE_PROJECT",
 	"CLOUDSDK_CONFIG",
-
-	// Azure OpenAI / Azure Identity SDK standard credential env vars. Same
-	// rationale as the Google set above — no adapter in this repo talks to
-	// Azure OpenAI today, but the SDK-standard env-credential-chain shape
-	// is identical.
-	"AZURE_TENANT_ID",
-	"AZURE_CLIENT_ID",
-	"AZURE_CLIENT_SECRET",
-	"AZURE_CLIENT_CERTIFICATE_PATH",
-	"AZURE_USERNAME",
-	"AZURE_PASSWORD",
 }
 
 // cliEnvAllowlistPrefixes is reserved for genuinely unbounded families where

@@ -194,14 +194,24 @@ func TestCLIEnvAllowed_PrefixMatch(t *testing.T) {
 		// blocked — proves this is literal matching, not a disguised
 		// AWS_ prefix.
 		{"AWS_UNLISTED_MADE_UP_VAR=x", false},
-		// Vertex AI / Azure OpenAI SDK credential vars, pre-empting the
-		// identical gap AWS_ absence caused for Bedrock — not known to be
-		// in live use by any adapter today.
+		// Google Cloud SDK / Vertex AI credential vars: kept because
+		// gemini_cli is a live adapter and none of these is raw secret
+		// material (file paths / project ids only).
 		{"GOOGLE_APPLICATION_CREDENTIALS=/p", true},
 		{"GOOGLE_CLOUD_PROJECT=my-project", true},
 		{"CLOUDSDK_CORE_PROJECT=my-project", true},
-		{"AZURE_TENANT_ID=abc", true},
-		{"AZURE_CLIENT_SECRET=abc", true},
+		{"CLOUDSDK_CONFIG=/p", true},
+		// Azure removed entirely (lr-268431, bobbie.uncat.1): no adapter in
+		// this repo consumes Azure credentials, and the vars that would
+		// remain after dropping raw secrets are identity-only with no
+		// working auth flow behind them. Raw-secret-shaped cloud vars must
+		// never be admitted speculatively, regardless of provider.
+		{"AZURE_TENANT_ID=abc", false},
+		{"AZURE_CLIENT_ID=abc", false},
+		{"AZURE_CLIENT_SECRET=abc", false},
+		{"AZURE_CLIENT_CERTIFICATE_PATH=/p", false},
+		{"AZURE_USERNAME=user", false},
+		{"AZURE_PASSWORD=abc", false},
 	}
 	for _, tc := range cases {
 		got := cliEnvAllowed(tc.kv)
