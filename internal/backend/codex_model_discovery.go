@@ -85,6 +85,14 @@
 // leaks it) and codexDebugModelsMaxBytes (stdout read cap via
 // io.LimitReader — exceeding it is a discovery failure, never a
 // truncated-and-parsed catalog).
+//
+// # Subprocess environment
+//
+// The `codex debug models` subprocess's cmd.Env is filtered through
+// buildCLIEnv (env.go), the same allowlist every other CLI subprocess in
+// this package uses — router tokens and API keys are never inherited
+// (lr-bd5dc0; this file was the second, previously-missed leak site after
+// codex_cli.go's Invoke).
 package backend
 
 import (
@@ -173,6 +181,18 @@ func runCodexDebugModelsWithLimits(ctx context.Context, bin string, timeout time
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, bin, "debug", "models")
+	// buildCLIEnv filters the daemon environment to the allowlist — router
+	// tokens and API keys are not passed to this subprocess, matching every
+	// other codex/claude/gemini subprocess spawn in this package (lr-bd5dc0).
+	// HOME and CODEX_ are both allowlisted (env.go), so ~/.codex/auth.json
+	// (or CODEX_HOME-relative) resolution for the ChatGPT-Plus OAuth session
+	// `codex debug models` needs to enumerate the catalog is preserved
+	// unchanged — identical to codex_cli.go's Invoke, which needs the same
+	// auth for `codex exec`. No extra vars are injected here (nil), mirroring
+	// codex_cli.go's own buildCLIEnv(nil) call: this adapter sets no HOME
+	// override either, for the same reason (see codex_cli.go's Invoke
+	// comment on that asymmetry).
+	cmd.Env = buildCLIEnv(nil)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 

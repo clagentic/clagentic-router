@@ -136,8 +136,18 @@ func (a *CodexCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response, 
 	}
 	args = append(args, "-") // read from stdin
 
+	// buildCLIEnv filters the daemon environment to the allowlist — router
+	// tokens and API keys are not passed to the subprocess. (lr-c7ac). HOME
+	// and CODEX_ are both on the allowlist (env.go), so ~/.codex/auth.json
+	// (or CODEX_HOME-relative) resolution for ChatGPT-Plus OAuth is preserved
+	// unchanged. Unlike claude_cli.go/codex_subagent.go, this adapter sets no
+	// HOME override here — see cmd.Dir comment below for why that asymmetry
+	// is fine; HOME curation is a separate, out-of-scope concern.
+	env := buildCLIEnv(nil)
+
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Stdin = strings.NewReader(fullPrompt.String())
+	cmd.Env = env
 	// Neutral working directory so the subprocess does not inherit the
 	// daemon's cwd. Defaults to DefaultWorkingDir ("/") when the caller does
 	// not supply req.WorkingDir; a validated, caller-supplied directory (see

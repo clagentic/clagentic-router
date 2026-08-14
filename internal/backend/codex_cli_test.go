@@ -8,8 +8,84 @@ package backend
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
+
+// writeFakeCodexBinWithEnvDump writes a fake "codex" binary that dumps its
+// own subprocess environment (via `env`) to envFile, then emits stdout.
+// Exercises CodexCLIAdapter.Invoke's actual cmd.Env at the real
+// exec.CommandContext call site — TestBuildCLIEnv_CodexCLIBlocksSecrets in
+// env_test.go tests buildCLIEnv in isolation and would not, by itself, have
+// caught a call site that built the env but never assigned it to cmd.Env
+// (the codex_model_discovery.go leak this task fixed) or never called
+// buildCLIEnv at all (the original lr-bd5dc0 defect in this adapter).
+func writeFakeCodexBinWithEnvDump(t *testing.T, dir, envFile, stdout string) string {
+	t.Helper()
+	binPath := filepath.Join(dir, "codex")
+	script := "#!/bin/sh\n" +
+		"env > " + envFile + "\n" +
+		"printf '%s' " + shellQuote(stdout) + "\n"
+	if err := os.WriteFile(binPath, []byte(script), 0755); err != nil {
+		t.Fatalf("write fake codex bin: %v", err)
+	}
+	return binPath
+}
+
+// TestCodexCLI_Invoke_SubprocessEnvFiltered proves, at the actual Invoke
+// call site, that the codex_cli subprocess's real cmd.Env is filtered
+// through buildCLIEnv: a daemon secret must not appear in the subprocess
+// environment, while HOME/CODEX_HOME survive (lr-bd5dc0).
+func TestCodexCLI_Invoke_SubprocessEnvFiltered(t *testing.T) {
+	os.Setenv("CLAGENTIC_ROUTER_TOKEN", "super-secret-token")
+	os.Setenv("OPENAI_API_KEY", "sk-openai-test")
+	defer func() {
+		os.Unsetenv("CLAGENTIC_ROUTER_TOKEN")
+		os.Unsetenv("OPENAI_API_KEY")
+	}()
+
+	origHome := os.Getenv("HOME")
+	if origHome == "" {
+		os.Setenv("HOME", "/root")
+		defer os.Setenv("HOME", origHome)
+	}
+	os.Setenv("CODEX_HOME", "/home/user/.codex")
+	defer os.Unsetenv("CODEX_HOME")
+
+	dir := t.TempDir()
+	envFile := filepath.Join(dir, "env.txt")
+	bin := writeFakeCodexBinWithEnvDump(t, dir, envFile, "response from codex")
+
+	adapter := NewCodexCLIAdapter("test", "", "", "", "", bin)
+	req := &Request{Messages: []Message{{Role: "user", Content: "ping"}}}
+
+	if _, err := adapter.Invoke(context.Background(), req); err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+
+	data, err := os.ReadFile(envFile)
+	if err != nil {
+		t.Fatalf("read subprocess env dump: %v", err)
+	}
+	subprocessEnv := string(data)
+
+	for _, secret := range []string{
+		"CLAGENTIC_ROUTER_TOKEN=super-secret-token",
+		"OPENAI_API_KEY=sk-openai-test",
+	} {
+		if strings.Contains(subprocessEnv, secret) {
+			t.Errorf("secret var leaked into codex_cli subprocess env: %q", secret)
+		}
+	}
+
+	for _, prefix := range []string{"HOME=", "CODEX_HOME="} {
+		if !strings.Contains(subprocessEnv, "\n"+prefix) && !strings.HasPrefix(subprocessEnv, prefix) {
+			t.Errorf("%s missing from codex_cli subprocess env — would break auth.json resolution", prefix)
+		}
+	}
+}
 
 // findFlagAll returns every value immediately following an occurrence of flag
 // in args, preserving order. Used because -c may appear more than once.

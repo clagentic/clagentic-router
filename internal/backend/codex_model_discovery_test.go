@@ -322,6 +322,81 @@ func TestResolveCodexModel_ViaFakeBinary(t *testing.T) {
 	})
 }
 
+// writeFakeCodexDebugModelsBinWithEnvDump writes a fake "codex" binary that
+// dumps its own subprocess environment (via `env`) to envFile before
+// emitting the given catalog on stdout. This exercises the actual call site
+// (runCodexDebugModelsWithLimits' cmd.Env), not buildCLIEnv in isolation —
+// TestBuildCLIEnv_CodexCLIBlocksSecrets in env_test.go already covered the
+// latter and would not have caught the lr-bd5dc0 second leak site (this
+// file's exec.CommandContext had no cmd.Env assignment at all until this
+// fix), because it never runs a subprocess.
+func writeFakeCodexDebugModelsBinWithEnvDump(t *testing.T, dir, envFile, catalog string) string {
+	t.Helper()
+	binPath := filepath.Join(dir, "codex")
+	script := "#!/bin/sh\n" +
+		"env > " + envFile + "\n" +
+		"printf '%s' " + shellQuote(catalog) + "\n"
+	if err := os.WriteFile(binPath, []byte(script), 0755); err != nil {
+		t.Fatalf("write fake codex bin: %v", err)
+	}
+	return binPath
+}
+
+// TestRunCodexDebugModels_SubprocessEnvFiltered proves, at the actual
+// runCodexDebugModelsWithLimits call site, that the `codex debug models`
+// subprocess's real cmd.Env is filtered through buildCLIEnv: a daemon
+// secret set in the test process's environment must not appear in the
+// subprocess's environment, while HOME/CODEX_HOME (needed to authenticate
+// and enumerate the catalog) must survive (lr-bd5dc0).
+func TestRunCodexDebugModels_SubprocessEnvFiltered(t *testing.T) {
+	os.Setenv("CLAGENTIC_ROUTER_TOKEN", "super-secret-token")
+	os.Setenv("OPENAI_API_KEY", "sk-openai-test")
+	defer func() {
+		os.Unsetenv("CLAGENTIC_ROUTER_TOKEN")
+		os.Unsetenv("OPENAI_API_KEY")
+	}()
+
+	origHome := os.Getenv("HOME")
+	if origHome == "" {
+		os.Setenv("HOME", "/root")
+		defer os.Setenv("HOME", origHome)
+	}
+	os.Setenv("CODEX_HOME", "/home/user/.codex")
+	defer os.Unsetenv("CODEX_HOME")
+
+	dir := t.TempDir()
+	envFile := filepath.Join(dir, "env.txt")
+	catalog := fakeCodexModelsJSON(t, []codexModelEntry{
+		{Slug: "fake-best", Priority: 7, Visibility: "list", SupportedInAPI: true},
+	})
+	bin := writeFakeCodexDebugModelsBinWithEnvDump(t, dir, envFile, catalog)
+
+	if _, err := runCodexDebugModels(context.Background(), bin); err != nil {
+		t.Fatalf("runCodexDebugModels: %v", err)
+	}
+
+	data, err := os.ReadFile(envFile)
+	if err != nil {
+		t.Fatalf("read subprocess env dump: %v", err)
+	}
+	subprocessEnv := string(data)
+
+	for _, secret := range []string{
+		"CLAGENTIC_ROUTER_TOKEN=super-secret-token",
+		"OPENAI_API_KEY=sk-openai-test",
+	} {
+		if strings.Contains(subprocessEnv, secret) {
+			t.Errorf("secret var leaked into `codex debug models` subprocess env: %q", secret)
+		}
+	}
+
+	for _, prefix := range []string{"HOME=", "CODEX_HOME="} {
+		if !strings.Contains(subprocessEnv, "\n"+prefix) && !strings.HasPrefix(subprocessEnv, prefix) {
+			t.Errorf("%s missing from `codex debug models` subprocess env — would break auth.json resolution", prefix)
+		}
+	}
+}
+
 // TestResolveCodexModel_TimeoutKillsSubprocess proves the subprocess bound:
 // a hung/wedged codex process must not block construction (or, in
 // production, daemon startup) indefinitely. Uses a short injected timeout
