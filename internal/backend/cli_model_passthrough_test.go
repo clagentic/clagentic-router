@@ -97,7 +97,7 @@ func TestClaudeCLI_ModelPassthrough(t *testing.T) {
 			dir := t.TempDir()
 			binPath := writeFakeBin(t, dir, "claude", string(claudeSuccess()))
 
-			adapter := NewClaudeCLIAdapter("test", tc.model, binPath, "", ThinkingOff, nil)
+			adapter := NewClaudeCLIAdapter("test", tc.model, binPath, "", ThinkingOff)
 			req := &Request{Messages: []Message{{Role: "user", Content: "ping"}}}
 
 			resp, err := adapter.Invoke(context.Background(), req)

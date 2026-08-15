@@ -1,6 +1,6 @@
 // internal/backend/codex_subagent.go — adapter for codex via the claude subagent.
 //
-// Invokes: claude -p --agent codex --output-format json
+// Invokes: claude -p --agent codex --safe-mode --output-format json
 // with CLAGENTIC_CODEX_TIER=<tier> in the environment.
 //
 // The codex subagent (~/.claude/agents/codex.md) reads ~/.codex/models.json
@@ -25,21 +25,14 @@ type CodexSubagentAdapter struct {
 	id   string
 	tier string // flagship | mini | spark
 
-	// trustedDirs bounds syncProjectTrust's write to operator-opted-in
-	// directories (config.Config.TrustedWorkingDirs). nil trusts nothing —
-	// see ClaudeCLIAdapter.trustedDirs / trust_allowlist.go.
-	trustedDirs *TrustAllowlist
-
 	mu      sync.Mutex
 	binPath string
 }
 
 // NewCodexSubagentAdapter creates an adapter for the given tier.
 // tier should be one of: flagship, mini, spark.
-// trustedDirs bounds which working directories syncProjectTrust is allowed
-// to mark trusted (nil is safe and trusts nothing — see TrustAllowlist).
-func NewCodexSubagentAdapter(id, tier, binPathOverride string, trustedDirs *TrustAllowlist) *CodexSubagentAdapter {
-	a := &CodexSubagentAdapter{id: id, tier: tier, trustedDirs: trustedDirs}
+func NewCodexSubagentAdapter(id, tier, binPathOverride string) *CodexSubagentAdapter {
+	a := &CodexSubagentAdapter{id: id, tier: tier}
 	// Resolve and log the binary path at construction time so misconfigurations
 	// surface in the startup log rather than silently at first invoke.
 	// codex_subagent invokes the claude CLI (not codex directly).
@@ -93,9 +86,21 @@ func (a *CodexSubagentAdapter) Invoke(ctx context.Context, req *Request) (*Respo
 	}
 	fullPrompt.WriteString(prompt)
 
+	// --safe-mode disables CLAUDE.md, skills, plugins, hooks, and MCP
+	// servers — see claude_cli.go's Invoke for the full rationale,
+	// including why --bare (auth-breaking under OAuth) was rejected, and
+	// the confirmed residual gap: --safe-mode does NOT suppress a
+	// caller-supplied working_dir's .claude/settings.json permissions.allow
+	// entries. This adapter invokes the same claude binary via the --agent
+	// codex path, so the same exposure and the same residual gap apply
+	// identically. scripts/verify-safe-mode-permissions.sh (`make
+	// verify-safe-mode`) is the reproducible harness for that claim — see
+	// claude_cli.go's Invoke for the fuller note. TODO(lr-7871bb): verify
+	// whether --setting-sources user closes the gap for this adapter too.
 	args := []string{
 		"-p",
 		"--agent", "codex",
+		"--safe-mode",
 		"--output-format", "json",
 		"--max-turns", "1",
 	}
@@ -126,16 +131,6 @@ func (a *CodexSubagentAdapter) Invoke(ctx context.Context, req *Request) (*Respo
 	if cmd.Dir == "" {
 		cmd.Dir = DefaultWorkingDir
 	}
-
-	// This adapter invokes the same claude CLI binary as claude_cli.go
-	// ("claude -p --agent codex" vs. "claude --print"), through the same
-	// isolated HOME, so it is gated by the identical per-project trust
-	// dialog. Pre-accept it for this exact directory before the subprocess
-	// starts, bounded by a.trustedDirs — a dir not on the operator's
-	// trusted_working_dirs allowlist gets no write. See trust_sync.go and
-	// trust_allowlist.go package docs for the write discipline, isolation
-	// guarantees, and trust model (lr-4abfe9).
-	syncProjectTrust(claudeSubprocessHome, cmd.Dir, a.trustedDirs)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

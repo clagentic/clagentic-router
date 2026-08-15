@@ -215,36 +215,113 @@ limitations of *cwd validation*, not gaps this field's validation claims to
 close. The three HTTP adapters (`anthropic_api`, `openai_api`,
 `bedrock_api`) have no subprocess and ignore this field entirely.
 
-**Trust-granting allowlist (`trusted_working_dirs`) — a separate control,
-`claude_cli`/`codex_subagent` only.** Do not confuse the above with
-`trusted_working_dirs`: `working_dir` picks *where a subprocess runs*;
-`trusted_working_dirs` (top-level router config, `config.Config`) controls a
-narrower, separate question — whether `claude_cli` and `codex_subagent`
-specifically are allowed to pre-accept the Claude Code CLI's per-project
-trust dialog for that directory. Accepting that dialog is not cosmetic: it
-makes the CLI start honoring that directory's `.claude/settings.json`
-`permissions.allow` entries, hooks, and project `CLAUDE.md` memory inside
-the router's subprocess, for any caller able to reach this daemon with that
-`working_dir` value. `codex_cli` and `gemini_cli` have no trust dialog and
-ignore `trusted_working_dirs` entirely.
+**Workspace trust is not a control this daemon can rely on.** Claude Code's
+interactive per-project trust dialog gates hooks, `.claude/settings.json`
+`permissions.allow` entries, and CLAUDE.md memory in a normal terminal
+session — but `claude_cli` and `codex_subagent` both invoke the CLI in
+non-interactive print mode (`claude --print` / `claude -p`), and the CLI's
+own `--print` help text says plainly: the workspace trust dialog is skipped
+in non-interactive mode. It never fires on this call path at all. A prior
+version of this daemon added an operator-configured `trusted_working_dirs`
+allowlist and pre-accepted that dialog in the isolated subprocess HOME's
+`.claude.json` before invoking the CLI — that machinery has been removed,
+because the dialog it pre-accepted was never blocking anything in the first
+place. Trust and tool-permissions are two separate gates in Claude Code;
+this router's subprocess calls never go through the trust gate at all, in
+either direction.
 
-The default is **fail-closed**: an empty or absent `trusted_working_dirs`
-trusts nothing, so every request against a real project directory fails
-with the CLI's own "workspace has not been trusted" error until the
-directory is added. **Upgrade note:** this is a breaking change for any
-existing deployment using `claude_cli`/`codex_subagent` against real project
-directories — add the directories you need to `trusted_working_dirs` in
-`router.yaml` after upgrading, or those two adapters stop working. The
-refusal is logged at `Warn` (once per distinct directory, not once per
-call) naming both the offending directory and the `trusted_working_dirs`
-field, so this is visible at default log verbosity.
+**The real exposure, and what `--safe-mode` does and does not close.**
+Because there is no trust dialog to skip past, a caller-supplied
+`working_dir` whose `.claude/settings.json` defines hooks,
+`permissions.allow` entries, or a project `CLAUDE.md` can get those
+executed/applied inside this daemon's subprocess on every invocation, by
+default — any caller who can reach `/v1/chat/completions` with a
+`working_dir` value effectively gets that directory's Claude Code config
+running with this daemon's privileges. This is the same shape of exposure
+as [GHSA-wpqr-6v78-jr5g](https://github.com/advisories/GHSA-wpqr-6v78-jr5g)
+(Gemini CLI auto-trusting workspace folders in headless/CI invocations).
+`claude_cli` and `codex_subagent` now pass `--safe-mode` on every
+invocation, unconditionally — not config-gated, because there is no safe
+reason for an operator to opt back into running an arbitrary caller-chosen
+directory's hooks/CLAUDE.md inside a shared daemon process.
 
-Matching is **exact, not subtree**: listing `/workspace` does **not**
-trust `/workspace/foo` — each directory that needs trust needs its own
-entry. This is the deliberately safer of the two possible semantics; see
-`internal/backend/trust_allowlist.go`'s package doc for the full rationale,
-and `internal/config/config.go`'s `TrustedWorkingDirs` field doc for the
-config-side contract.
+Per the CLI's own `--safe-mode` help text, this "start[s] with all
+customizations (CLAUDE.md, skills, plugins, hooks, MCP servers, custom
+commands and agents, output styles, workflows, custom themes, keybindings,
+and more) disabled," while "auth, model selection, built-in tools, and
+permissions work normally." Empirically verified in this environment (a
+temp project directory with a hook, a `CLAUDE.md` sentinel, and a
+`permissions.allow` entry, run with and without `--safe-mode`) — **run
+`make verify-safe-mode` (or `./scripts/verify-safe-mode-permissions.sh`
+directly) to reproduce this result yourself**, including against a newer
+CLI version; the script is the evidence, not this prose. It builds its own
+throwaway fixture under `$TMPDIR`, never touches `~/.claude`, and skips
+honestly (never a false pass) if `claude` is absent or unauthenticated:
+
+- **Suppressed by `--safe-mode`**: project hooks did not fire; project
+  `CLAUDE.md` auto-discovery did not load.
+- **NOT suppressed by `--safe-mode`**: a project `.claude/settings.json`
+  `permissions.allow` entry still grants the tool it names. A 2x2
+  comparison (rule present/absent, `--safe-mode` on/off, both against a
+  no-tools control) showed the grant firing identically with and without
+  `--safe-mode`, and the absent-rule rows denying identically in both
+  states — proving the grant is sourced from the project file, not ambient
+  user config, and that `--safe-mode` does not touch it. "Permissions work
+  normally" in the CLI's help text means exactly that, including
+  project-sourced permission rules.
+
+**This is a currently open, real residual exposure**: a caller-supplied
+`working_dir` can still widen the daemon subprocess's tool permissions via
+its own `.claude/settings.json` `permissions.allow`, `--safe-mode`
+notwithstanding. `--setting-sources user` (which can exclude project/local
+setting sources) is a plausible candidate fix by its documented semantics,
+but its actual interaction with `--safe-mode` and `permissions.allow` has
+**not** been empirically verified in this environment, so it has not been
+added — an unverified flag asserted as a security boundary would be worse
+than stating the gap plainly.
+`scripts/verify-safe-mode-permissions.sh` now exists as the reproducible
+instrument for that verification (matrix includes `--safe-mode
+--setting-sources user` and a causality check varying only the setting
+sources with the rule held present) — it ships without a pasted result;
+run it to get a real reading. TODO(lr-7871bb): once a run's structural
+`permission_denials` output confirms `--setting-sources user` closes the
+gap, wire it into both `claude_cli.go` and `codex_subagent.go` and update
+this section from that run's output, not from memory.
+
+Separately: the CLI's `-p`/`--print` help text notes that "Settings files
+that fail validation are silently ignored in this mode (no error
+dialog is shown)" — operationally relevant here because both adapters
+always run non-interactively, so a malformed caller-supplied
+`.claude/settings.json` fails open (ignored) rather than surfacing an
+error to the operator.
+
+`--bare` was considered first and rejected: its help text states Anthropic
+auth under `--bare` is "strictly `ANTHROPIC_API_KEY` or `apiKeyHelper` ...
+OAuth and keychain are never read" — both adapters authenticate purely via
+an OAuth credentials file synced into the isolated subprocess HOME, so
+`--bare` would break authentication outright rather than harden anything.
+
+**The capability trade-off is real, not free.** A caller whose `working_dir`
+points at a real project loses that project's CLAUDE.md context and skills
+under `--safe-mode` — there is currently no way to give a caller
+repo-aware behavior without also giving that directory's config the
+ability to run inside this daemon's process, and even with that
+trade-off accepted, `permissions.allow` from the same directory still
+applies (see above). `working_dir` under `--safe-mode` still selects
+*where the subprocess runs* (relevant for any tool that reads the
+filesystem relative to cwd); it no longer selects *whose CLAUDE.md/hooks*
+execute, but it still partially selects *whose permission grants* apply.
+
+`codex_cli` and `gemini_cli` are different binaries — `--safe-mode` is
+claude-specific and does not apply to either. `codex_cli` reads
+`~/.codex/config.toml`/`auth.json` but has no equivalent
+hooks/settings/CLAUDE.md auto-discovery surface today, so there is no
+known analogous exposure to close for it. `gemini_cli`'s installed version
+in this deployment's build environment (0.47.0) is well past the version
+GHSA-wpqr-6v78-jr5g was fixed in (0.39.1) — not exposed to that specific
+advisory as verified here; operators running an older `gemini` binary
+should confirm their own installed version independently, since this
+daemon does not pin or vendor either CLI.
 
 Hook suppression against the *daemon's own* config differs by adapter and
 predates this field: `claude_cli` and `codex_subagent` also override
@@ -256,6 +333,10 @@ strengthens both pairs of adapters the same way regardless of that
 asymmetry: none of the four inherits the daemon's actual cwd anymore. See
 `CLAUDE.md`'s "Subprocess cwd contract" for the full per-adapter
 breakdown.
+
+**Upgrade note.** A `trusted_working_dirs` key left over in `router.yaml`
+from a prior version is ignored (logged at `Warn`, not a startup error) —
+remove it; it has no effect.
 
 ### Adapter capabilities
 

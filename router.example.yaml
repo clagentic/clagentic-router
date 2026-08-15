@@ -264,31 +264,29 @@ routing:
   # Default: 300 (5 minutes). Set to 0 to disable (strict manual-intervention
   # semantics — operator must use /backends/{id}/reset to re-enable).
 
-# --- Trusted working directories (claude_cli / codex_subagent only) ---
-# trusted_working_dirs: []
-# Operator opt-in allowlist gating whether claude_cli and codex_subagent are
-# permitted to pre-accept the Claude Code CLI's per-project trust dialog for
-# a caller-supplied working_dir (see the "Working directory (working_dir)"
-# section in README.md). Accepting that dialog is not cosmetic — it makes
-# the CLI start honoring that directory's .claude/settings.json
-# permissions.allow entries, hooks, and project CLAUDE.md memory inside
-# every router-spawned subprocess invoked against it, for any caller who can
-# reach this daemon with that working_dir value. codex_cli and gemini_cli
-# have no trust dialog and ignore this setting entirely.
+# --- Workspace trust (claude_cli / codex_subagent) ---
+# There is no trusted_working_dirs setting — a prior version of this file
+# had one, gating an operator-configured allowlist for pre-accepting the
+# Claude Code CLI's per-project trust dialog. That dialog never fires for
+# claude_cli/codex_subagent in the first place: both invoke the CLI in
+# non-interactive print mode ("claude --print" / "claude -p"), and the CLI's
+# own --print help text states the trust dialog is skipped in non-interactive
+# mode. The allowlist was gating nothing real; a leftover
+# trusted_working_dirs key in an existing router.yaml is ignored (logged at
+# Warn, not a startup error) — remove it.
 #
-# FAIL-CLOSED DEFAULT: empty/absent (as shipped here) trusts nothing — every
-# working_dir is refused the trust write and claude_cli/codex_subagent fail
-# with the CLI's own "workspace has not been trusted" error. Existing
-# deployments upgrading into this default MUST add every directory they
-# invoke against, or those two adapters stop working.
-#
-# EXACT-MATCH ONLY, despite the plural name: each entry trusts exactly that
-# one directory, never its subtree — listing "/workspace" does NOT admit
-# "/workspace/foo". List every directory you need, one entry per directory.
-#
-# trusted_working_dirs:
-#   - /home/router/projects/some-repo
-#   - /home/router/projects/another-repo
+# The real exposure this daemon closes instead: because there is no trust
+# dialog, a caller-supplied working_dir's .claude/settings.json hooks,
+# permissions.allow entries, and project CLAUDE.md memory would otherwise
+# execute inside this daemon's subprocess for any caller who can reach
+# /v1/chat/completions with that working_dir value. claude_cli and
+# codex_subagent now pass --safe-mode unconditionally (not configurable
+# here) to disable CLAUDE.md/skills/plugins/hooks/MCP servers for the
+# session while auth and normal operation continue unaffected. See the
+# "Working directory (working_dir)" section in README.md for the full
+# writeup, including the capability trade-off (a caller loses project
+# CLAUDE.md context and skills under --safe-mode) and the codex_cli/
+# gemini_cli exposure assessment.
 
 # --- Proxy ---
 proxy:

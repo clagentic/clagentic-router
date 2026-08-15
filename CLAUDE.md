@@ -83,7 +83,8 @@ ChatGPT-Plus via `codex_cli` are load-bearing production paths. A change that
 improves one backend must be a verified no-op for the others — state that
 verification explicitly, don't assume it.
 
-**Subprocess cwd contract (`working_dir`).** All four subprocess adapters
+**Subprocess cwd contract (`working_dir`) — cwd is not just file context, it
+also selects which config executes.** All four subprocess adapters
 (`claude_cli`, `codex_cli`, `codex_subagent`, `gemini_cli`) set `cmd.Dir`
 from `req.WorkingDir` when the wire request supplies it, else
 `backend.DefaultWorkingDir` (`/`). HTTP adapters (`anthropic_api`,
@@ -93,6 +94,25 @@ HOME, or any other host-local signal) — the router is a shared daemon, and
 a server-chosen directory would just be a different flavor of the bug this
 field exists to fix for the next caller; it comes only from an explicit,
 validated wire field (`backend.ResolveWorkingDir`).
+
+An earlier version of this doc treated `cmd.Dir` as picking only *which
+files a subprocess can read/write* — that assumption was wrong for
+`claude_cli`/`codex_subagent`. The claude CLI reads `./CLAUDE.md` and
+`./.claude/settings.json` (hooks, `permissions.allow`, MCP servers) from its
+cwd. `claude --print`/`claude -p` (what these two adapters use) shows no
+workspace trust dialog to gate that read — the CLI's own `--print` help
+text says the dialog is skipped in non-interactive mode — so `working_dir`
+was, until `--safe-mode` was added to both adapters, also implicitly
+choosing *whose Claude Code config executes inside this daemon's process*
+for any caller who could reach `/v1/chat/completions` with that value. This
+is closed now (`--safe-mode`, unconditional on both adapters — see
+README.md's "Working directory (`working_dir`)" section for the full
+writeup and the capability trade-off it costs). There is no
+`trusted_working_dirs` config surface for this any more; a prior version had
+one, gating a trust-dialog pre-acceptance write that turned out to be
+pre-accepting a dialog that never fired on this call path in the first
+place. A leftover `trusted_working_dirs` key in an existing `router.yaml` is
+ignored, not fatal, on load.
 
 Hook suppression is **not uniform across the four adapters** — this is
 pre-existing (predates `working_dir`), not something this field changes:
@@ -111,6 +131,11 @@ too (mirror `claude_cli`/`codex_subagent`); one that doesn't should still
 set `cmd.Dir` as its sole layer (mirror `codex_cli`/`gemini_cli`). Adding a
 HOME override to `codex_cli`/`gemini_cli` is a separate, real hardening
 question — out of scope here, tracked as a follow-up, not assumed done.
+`codex_cli` and `gemini_cli` are different binaries with no
+`--safe-mode`-equivalent flag verified to exist; if either grows an
+analogous config-auto-discovery surface in the future, evaluate it against
+this same non-interactive-mode question before assuming a trust/permission
+gate protects it.
 
 `backend.ResolveWorkingDir` validates the wire value (absolute, exists, is
 a directory) but is not a containment control: it has no path-containment
@@ -119,22 +144,6 @@ TOCTOU window between its `os.Stat` check and the subprocess's later
 `exec.Start` — the directory could be replaced or removed in between. Both
 are known, accepted limitations of the wire-boundary validation, not gaps
 to close by adding an allowlist here.
-
-`trusted_working_dirs` (lr-4abfe9, `internal/backend/trust_allowlist.go`) is
-a **separate, narrower control** layered on top of the above, not a
-replacement for it — it does not add containment to `ResolveWorkingDir`
-itself. It gates one specific side effect: whether `claude_cli` and
-`codex_subagent` are permitted to pre-accept the Claude Code CLI's
-per-project trust dialog (`hasTrustDialogAccepted` in the isolated
-subprocess HOME's `.claude.json`) for a given directory, which in turn
-determines whether the CLI honors that directory's `.claude/settings.json`
-`permissions.allow` entries, hooks, and project `CLAUDE.md` memory.
-`codex_cli` and `gemini_cli` have no trust dialog and are unaffected. The
-default is fail-closed (empty/absent allowlist trusts nothing), which is a
-breaking change for any deployment upgrading into it — see README.md's
-"Working directory (`working_dir`)" section for the operator-facing upgrade
-note. Matching is exact-match on the canonicalized path, never subtree:
-listing a parent directory does not admit its children.
 
 **Verify per-provider assumptions against the live source; never generalize
 one host's observed shape into a parser assumption.** Data shapes differ
