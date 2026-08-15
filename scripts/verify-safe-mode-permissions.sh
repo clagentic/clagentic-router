@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
 # scripts/verify-safe-mode-permissions.sh — reproducible evidence for the
-# --safe-mode / permissions.allow claim documented in README.md's "The real
-# exposure, and what --safe-mode does and does not close" section and in
-# internal/backend/claude_cli.go's Invoke doc comment (TODO(lr-7871bb)).
+# --setting-sources user / permissions.allow claim documented in README.md's
+# "The real exposure, and what closes it" section and in
+# internal/backend/claude_cli.go's Invoke doc comment.
+#
+# RESOLVED: --safe-mode alone left a permissions.allow gap open (a project
+# .claude/settings.json allow-rule still granted the tool it named).
+# --setting-sources user closes that gap — it excludes the project settings
+# source entirely, which covers everything --safe-mode covered (hooks,
+# CLAUDE.md) plus the gap it missed. Both adapters now ship
+# --setting-sources user alone (--safe-mode dropped). This script's matrix
+# still includes the --safe-mode cells as the historical record of why that
+# flag was tried first and rejected — see docs/lr-7871bb-verified-run.txt
+# for a committed real run's output.
 #
 # THIS SCRIPT IS THE EVIDENCE, NOT ANY PASTED TABLE. Re-run it against a
 # newer claude CLI version to re-derive the claim rather than trusting prose.
@@ -55,7 +65,7 @@
 # ---------------------------------------------------------------------------
 #
 # ---------------------------------------------------------------------------
-# PARSER PLUMBING NOTE (lr-7871bb bug fix — read before touching run_cell)
+# PARSER PLUMBING NOTE — read before touching run_cell
 # ---------------------------------------------------------------------------
 # The structural JSON parse below writes its Python source to a FILE
 # (PARSER_SCRIPT, created once, outside the per-cell loop) and invokes it as
@@ -141,7 +151,7 @@ trap cleanup EXIT
 
 ## ---- preflight: CLI present and authenticated -------------------------------
 
-bold "=== clagentic-router: --safe-mode / permissions.allow verification harness ==="
+bold "=== clagentic-router: --setting-sources user / permissions.allow verification harness ==="
 echo ""
 
 if ! command -v "$CLAUDE_BIN" >/dev/null 2>&1; then
@@ -448,30 +458,25 @@ run_sentinel_cell() {
 
 echo ""
 bold "--- Assert isolation: probe is gated ONLY by the project rule, not a user-level rule ---"
-# Run the no-rule fixture with NO safe-mode flags at all. If the probe still
-# runs here, some ambient (user/global) permission grants it independently
-# of this harness's fixture, and every other cell's result would be
-# confounded by that ambient grant rather than isolating the project rule.
+# Run the no-rule fixture with NO restricting flags at all. If the probe
+# still runs here, some ambient (user/global) permission grants it
+# independently of this harness's fixture, and every other cell's result
+# would be confounded by that ambient grant rather than isolating the
+# project rule.
 run_cell "rule ABSENT, no flags (isolation control)" "$FIXTURE_NO_RULE" "yes" "deny"
 
 echo ""
 bold "--- Baseline matrix ---"
 run_cell "rule PRESENT, no flags (baseline: probe runs)"                          "$FIXTURE_WITH_RULE" "yes" "run"
-run_cell "rule PRESENT, --safe-mode (THE GAP: probe should still run)"            "$FIXTURE_WITH_RULE" "no"  "run"  --safe-mode
+run_cell "rule PRESENT, --safe-mode (THE REJECTED GAP: probe still runs)"         "$FIXTURE_WITH_RULE" "no"  "run"  --safe-mode
 run_cell "rule PRESENT, --safe-mode --setting-sources user"                        "$FIXTURE_WITH_RULE" "no"  "deny" --safe-mode --setting-sources user
 run_cell "rule ABSENT,  --safe-mode --setting-sources user (control)"              "$FIXTURE_NO_RULE"   "no"  "deny" --safe-mode --setting-sources user
-# NOTE (lr-7871bb bug fix): --setting-sources user WITHOUT --safe-mode was
-# previously expected to still fire the project hook (hook_expect "yes"),
-# on the assumption that --setting-sources governs permissions only and
-# hooks are suppressed exclusively by --safe-mode. That assumption was
-# wrong: --setting-sources user excludes the project settings SOURCE
-# entirely, which is where the PreToolUse hook definition itself lives, so
-# the hook has nothing to fire from regardless of --safe-mode. Corrected to
-# "no" per the empirically recorded prior (lr-7871bb task thread, Cell 4:
-# "--setting-sources user (NO safe-mode), rule PRESENT -> DENIED, hook
-# suppressed, no sentinel"). If a fresh run of this harness disagrees with
-# that prior, THIS HARNESS'S OWN OUTPUT WINS -- do not silently re-paper
-# over a disagreement by editing the expectation back.
+# --setting-sources user WITHOUT --safe-mode excludes the project settings
+# SOURCE entirely, which is where the PreToolUse hook definition itself
+# lives, so the hook has nothing to fire from regardless of --safe-mode
+# (hook_expect "no" below). If a fresh run of this harness disagrees, THIS
+# HARNESS'S OWN OUTPUT WINS -- do not silently re-paper over a disagreement
+# by editing the expectation back.
 run_cell "rule PRESENT, --setting-sources user (isolates which flag does the work)" "$FIXTURE_WITH_RULE" "no" "deny" --setting-sources user
 
 echo ""
@@ -498,12 +503,12 @@ echo ""
 echo "This script reports the matrix above; it does not itself assert what"
 echo "README.md or claude_cli.go should claim. Update those docs from a real"
 echo "run's output, never from a pasted/remembered table (see this repo's"
-echo "breadth/evidence discipline and the TODO(lr-7871bb) marker in"
-echo "internal/backend/claude_cli.go)."
+echo "breadth/evidence discipline). docs/lr-7871bb-verified-run.txt is the"
+echo "committed evidence for the shipped --setting-sources user configuration."
 
 if [[ -n "$OUTPUT_FILE" ]]; then
     {
-        printf 'clagentic-router --safe-mode / permissions.allow verification run\n'
+        printf 'clagentic-router --setting-sources user / permissions.allow verification run\n'
         printf 'claude CLI: %s\n' "$("$CLAUDE_BIN" --version 2>/dev/null || echo unknown)"
         printf 'run date (UTC): %s\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         for line in "${RESULT_LINES[@]}"; do
