@@ -369,10 +369,17 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 	// --safe-mode has not been empirically verified in this environment,
 	// and shipping an unverified flag as a stated security boundary is
 	// worse than documenting the gap plainly.
-	// TODO(lr-7871bb): empirically verify whether --setting-sources user
-	// closes the permissions.allow gap and, if so, add it to both adapters.
-	// See README.md's "Workspace trust is not a control this daemon can
-	// rely on" section for the full writeup.
+	// scripts/verify-safe-mode-permissions.sh (run via `make
+	// verify-safe-mode`) is the committed, reproducible harness for that
+	// verification — it derives a pass/fail matrix from a live claude CLI
+	// against a throwaway fixture rather than resting on prose. It is
+	// gated out of `make test` (real CLI invocation, costs tokens) and
+	// skips honestly if claude is absent/unauthenticated.
+	// TODO(lr-7871bb): once the harness's structural permission_denials
+	// output confirms --setting-sources user closes the permissions.allow
+	// gap, add it to both adapters and update the doc comment/README from
+	// that run's output. See README.md's "Workspace trust is not a
+	// control this daemon can rely on" section for the full writeup.
 	//
 	// Unconditional, not config-gated: there is no safe reason for an
 	// operator to opt back into executing an arbitrary caller-chosen

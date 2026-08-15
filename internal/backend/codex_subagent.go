@@ -93,8 +93,10 @@ func (a *CodexSubagentAdapter) Invoke(ctx context.Context, req *Request) (*Respo
 	// caller-supplied working_dir's .claude/settings.json permissions.allow
 	// entries. This adapter invokes the same claude binary via the --agent
 	// codex path, so the same exposure and the same residual gap apply
-	// identically. TODO(lr-7871bb): verify whether --setting-sources user
-	// closes the gap for this adapter too.
+	// identically. scripts/verify-safe-mode-permissions.sh (`make
+	// verify-safe-mode`) is the reproducible harness for that claim — see
+	// claude_cli.go's Invoke for the fuller note. TODO(lr-7871bb): verify
+	// whether --setting-sources user closes the gap for this adapter too.
 	args := []string{
 		"-p",
 		"--agent", "codex",

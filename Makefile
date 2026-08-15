@@ -13,7 +13,7 @@ export GOMODCACHE  := $(HOME)/go/pkg/mod
 export GOCACHE     := $(HOME)/.cache/go
 endif
 
-.PHONY: all build test smoke lint clean install tidy docker
+.PHONY: all build test smoke verify-safe-mode lint clean install tidy docker
 
 all: build
 
@@ -46,6 +46,13 @@ clean:
 ## smoke: end-to-end smoke test against a live daemon (requires Ollama)
 smoke: build
 	./scripts/smoke-test.sh
+
+## verify-safe-mode: reproduce the --safe-mode / permissions.allow evidence
+## in README.md and claude_cli.go against a live claude CLI. NOT part of
+## `make test` -- invokes a real CLI, costs tokens, and skips honestly if
+## claude is absent/unauthenticated. See scripts/verify-safe-mode-permissions.sh.
+verify-safe-mode:
+	./scripts/verify-safe-mode-permissions.sh
 
 ## docker: build Docker image
 docker:

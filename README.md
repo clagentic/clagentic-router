@@ -251,7 +251,12 @@ commands and agents, output styles, workflows, custom themes, keybindings,
 and more) disabled," while "auth, model selection, built-in tools, and
 permissions work normally." Empirically verified in this environment (a
 temp project directory with a hook, a `CLAUDE.md` sentinel, and a
-`permissions.allow` entry, run with and without `--safe-mode`):
+`permissions.allow` entry, run with and without `--safe-mode`) — **run
+`make verify-safe-mode` (or `./scripts/verify-safe-mode-permissions.sh`
+directly) to reproduce this result yourself**, including against a newer
+CLI version; the script is the evidence, not this prose. It builds its own
+throwaway fixture under `$TMPDIR`, never touches `~/.claude`, and skips
+honestly (never a false pass) if `claude` is absent or unauthenticated:
 
 - **Suppressed by `--safe-mode`**: project hooks did not fire; project
   `CLAUDE.md` auto-discovery did not load.
@@ -273,8 +278,15 @@ setting sources) is a plausible candidate fix by its documented semantics,
 but its actual interaction with `--safe-mode` and `permissions.allow` has
 **not** been empirically verified in this environment, so it has not been
 added — an unverified flag asserted as a security boundary would be worse
-than stating the gap plainly. Verifying and, if it works, adding
-`--setting-sources user` is tracked as a follow-up.
+than stating the gap plainly.
+`scripts/verify-safe-mode-permissions.sh` now exists as the reproducible
+instrument for that verification (matrix includes `--safe-mode
+--setting-sources user` and a causality check varying only the setting
+sources with the rule held present) — it ships without a pasted result;
+run it to get a real reading. TODO(lr-7871bb): once a run's structural
+`permission_denials` output confirms `--setting-sources user` closes the
+gap, wire it into both `claude_cli.go` and `codex_subagent.go` and update
+this section from that run's output, not from memory.
 
 Separately: the CLI's `-p`/`--print` help text notes that "Settings files
 that fail validation are silently ignored in this mode (no error
