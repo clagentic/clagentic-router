@@ -280,12 +280,15 @@ routing:
 # permissions.allow entries, and project CLAUDE.md memory would otherwise
 # execute inside this daemon's subprocess for any caller who can reach
 # /v1/chat/completions with that working_dir value. claude_cli and
-# codex_subagent now pass --safe-mode unconditionally (not configurable
-# here) to disable CLAUDE.md/skills/plugins/hooks/MCP servers for the
-# session while auth and normal operation continue unaffected. See the
-# "Working directory (working_dir)" section in README.md for the full
-# writeup, including the capability trade-off (a caller loses project
-# CLAUDE.md context and skills under --safe-mode) and the codex_cli/
+# codex_subagent now pass --setting-sources user unconditionally (not
+# configurable here) so the CLI loads only user-scope settings for the
+# session -- project-scope settings.json (hooks, permissions.allow) and
+# CLAUDE.md are never read, while auth and normal operation continue
+# unaffected. --safe-mode was tried first and found insufficient (it left
+# project permissions.allow entries in effect); --setting-sources user
+# closes that gap too. See the "Working directory (working_dir)" section
+# in README.md for the full writeup, including the capability trade-off
+# (a caller loses project CLAUDE.md context and skills) and the codex_cli/
 # gemini_cli exposure assessment.
 
 # --- Proxy ---
