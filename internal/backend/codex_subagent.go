@@ -1,6 +1,6 @@
 // internal/backend/codex_subagent.go — adapter for codex via the claude subagent.
 //
-// Invokes: claude -p --agent codex --safe-mode --output-format json
+// Invokes: claude -p --agent codex --setting-sources user --output-format json
 // with CLAGENTIC_CODEX_TIER=<tier> in the environment.
 //
 // The codex subagent (~/.claude/agents/codex.md) reads ~/.codex/models.json
@@ -86,21 +86,22 @@ func (a *CodexSubagentAdapter) Invoke(ctx context.Context, req *Request) (*Respo
 	}
 	fullPrompt.WriteString(prompt)
 
-	// --safe-mode disables CLAUDE.md, skills, plugins, hooks, and MCP
-	// servers — see claude_cli.go's Invoke for the full rationale,
-	// including why --bare (auth-breaking under OAuth) was rejected, and
-	// the confirmed residual gap: --safe-mode does NOT suppress a
-	// caller-supplied working_dir's .claude/settings.json permissions.allow
-	// entries. This adapter invokes the same claude binary via the --agent
-	// codex path, so the same exposure and the same residual gap apply
-	// identically. scripts/verify-safe-mode-permissions.sh (`make
-	// verify-safe-mode`) is the reproducible harness for that claim — see
-	// claude_cli.go's Invoke for the fuller note. TODO(lr-7871bb): verify
-	// whether --setting-sources user closes the gap for this adapter too.
+	// --setting-sources user restricts the CLI to user-scope settings only,
+	// excluding a caller-supplied working_dir's .claude/settings.json
+	// (hooks, permissions.allow) and project CLAUDE.md entirely — see
+	// claude_cli.go's Invoke for the full rationale, including why --bare
+	// (auth-breaking under OAuth) was rejected and why --safe-mode was
+	// tried first and found insufficient (it left a permissions.allow gap
+	// open that --setting-sources user closes). This adapter invokes the
+	// same claude binary via the --agent codex path, so the same fix
+	// applies identically. scripts/verify-safe-mode-permissions.sh (`make
+	// verify-safe-mode`) is the reproducible harness for that claim;
+	// docs/lr-7871bb-verified-run.txt is the committed evidence from a
+	// real run — see claude_cli.go's Invoke for the fuller note.
 	args := []string{
 		"-p",
 		"--agent", "codex",
-		"--safe-mode",
+		"--setting-sources", "user",
 		"--output-format", "json",
 		"--max-turns", "1",
 	}
