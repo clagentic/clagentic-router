@@ -11,7 +11,7 @@
 # CLAUDE.md) plus the gap it missed. Both adapters now ship
 # --setting-sources user alone (--safe-mode dropped). This script's matrix
 # still includes the --safe-mode cells as the historical record of why that
-# flag was tried first and rejected — see docs/lr-7871bb-verified-run.txt
+# flag was tried first and rejected — see docs/setting-sources-verification-run.txt
 # for a committed real run's output.
 #
 # THIS SCRIPT IS THE EVIDENCE, NOT ANY PASTED TABLE. Re-run it against a
@@ -28,11 +28,15 @@
 # no-tool-use sentinel-recall cell per fixture (see "Sentinel control" below).
 #
 # Usage:
-#   ./scripts/verify-safe-mode-permissions.sh [--output <file>]
+#   ./scripts/verify-safe-mode-permissions.sh [--output <file>] [--force]
 #
 # --output <file>  Also write a plain-text copy of the result table to
 #                   <file>, so a run's evidence can be committed as an
 #                   artifact rather than only printed to a terminal.
+#                   Refuses to overwrite an existing file unless --force is
+#                   also given, since <file> is caller-supplied and this
+#                   script has no path-containment allowlist for it.
+# --force          Permit --output to overwrite an existing file.
 #
 # Gating (NOT part of `make test` — invokes a real CLI, costs tokens):
 #   make verify-safe-mode
@@ -102,6 +106,7 @@ set -euo pipefail
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
 WORKDIR=""
 OUTPUT_FILE=""
+FORCE_OUTPUT="no"
 PASS=0
 FAIL=0
 SKIP=0
@@ -120,12 +125,26 @@ while [[ $# -gt 0 ]]; do
             OUTPUT_FILE="${2:?--output requires a file path}"
             shift 2
             ;;
+        --force)
+            FORCE_OUTPUT="yes"
+            shift
+            ;;
         *)
             echo "unknown argument: $1" >&2
             exit 2
             ;;
     esac
 done
+
+# Refuse to silently clobber an existing --output path — this script has no
+# path-containment allowlist for a caller-supplied file, so the cheapest
+# guard is requiring an explicit --force to overwrite anything already
+# there. A fresh path (the common case: writing a new evidence artifact)
+# is unaffected.
+if [[ -n "$OUTPUT_FILE" && -e "$OUTPUT_FILE" && "$FORCE_OUTPUT" != "yes" ]]; then
+    echo "refusing to overwrite existing file: $OUTPUT_FILE (pass --force to overwrite)" >&2
+    exit 2
+fi
 
 ## ---- helpers ---------------------------------------------------------------
 
@@ -503,7 +522,7 @@ echo ""
 echo "This script reports the matrix above; it does not itself assert what"
 echo "README.md or claude_cli.go should claim. Update those docs from a real"
 echo "run's output, never from a pasted/remembered table (see this repo's"
-echo "breadth/evidence discipline). docs/lr-7871bb-verified-run.txt is the"
+echo "breadth/evidence discipline). docs/setting-sources-verification-run.txt is the"
 echo "committed evidence for the shipped --setting-sources user configuration."
 
 if [[ -n "$OUTPUT_FILE" ]]; then

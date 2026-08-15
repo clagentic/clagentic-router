@@ -8,7 +8,7 @@
 // --setting-sources user replaces an earlier --safe-mode-only approach:
 // --safe-mode suppressed project hooks/CLAUDE.md but left project
 // .claude/settings.json permissions.allow entries in effect (verified via
-// scripts/verify-safe-mode-permissions.sh, see docs/lr-7871bb-verified-run.txt
+// scripts/verify-safe-mode-permissions.sh, see docs/setting-sources-verification-run.txt
 // for the committed evidence). --setting-sources user closes that gap by
 // excluding the project settings source entirely.
 //

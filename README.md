@@ -260,7 +260,7 @@ directory with a hook, a `CLAUDE.md` sentinel, and a `permissions.allow`
 entry, run with and without `--safe-mode`) — **run `make verify-safe-mode`
 (or `./scripts/verify-safe-mode-permissions.sh` directly) to reproduce
 this result yourself**, including against a newer CLI version; the script
-is the evidence, not this prose. `docs/lr-7871bb-verified-run.txt` is a
+is the evidence, not this prose. `docs/setting-sources-verification-run.txt` is a
 committed real run's output (claude CLI 2.1.232, repo SHA `dde17ef`) so
 the claim below rests on evidence in the diff, not memory:
 
@@ -284,15 +284,30 @@ check — varying only `--setting-sources` with the rule held present —
 shows `user` denying the probe, `user,project` and `project` both granting
 it: `permission_denials` proves the project settings source is the
 variable, not `--safe-mode`. `--setting-sources user` also independently
-reproduces every suppression `--safe-mode` provided (project hooks did not
-fire, `CLAUDE.md` sentinel was unknown to the model) — see
-`docs/lr-7871bb-verified-run.txt`'s full matrix. `claude_cli.go` and
-`codex_subagent.go` now pass `--setting-sources user` alone; `--safe-mode`
-is dropped, not stacked with it, because `--setting-sources user` is a
-strict superset of what `--safe-mode` closed, and dropping `--safe-mode`
-means legitimate user-scope customizations (e.g. the operator's own
-user-level `permissions.allow` entries) still apply, where `--safe-mode`
-would have discarded those too.
+reproduces every suppression `--safe-mode` provided that the harness
+actually measured (project hooks did not fire, `CLAUDE.md` sentinel was
+unknown to the model) — see `docs/setting-sources-verification-run.txt`'s
+full matrix. `claude_cli.go` and `codex_subagent.go` now pass
+`--setting-sources user` alone; `--safe-mode` is dropped, not stacked with
+it.
+
+**What "excludes the project settings source" covers, and what of that is
+empirically verified.** `--setting-sources user` works by excluding the
+entire project settings source, not by suppressing individual features one
+at a time — by construction this should cover every project-scoped
+customization the CLI supports, not only the three the harness probes. The
+harness itself only exercises three: `permissions.allow`, hooks, and
+`CLAUDE.md` auto-discovery. It does not touch project-scope MCP servers or
+subagent definitions (see Scope limits in
+`docs/setting-sources-verification-run.txt`), and `--safe-mode`'s own help
+text names several more project-scoped surfaces neither flag's coverage was
+tested against here: skills, plugins, output styles, custom commands and
+agents, workflows, custom themes, keybindings. Those are **expected to be
+excluded by the same source-level mechanism, not separately measured** —
+treat that distinction as load-bearing when citing this claim elsewhere.
+Dropping `--safe-mode` also means legitimate user-scope customizations
+(e.g. the operator's own user-level `permissions.allow` entries) still
+apply, where `--safe-mode` would have discarded those too.
 
 Separately: the CLI's `-p`/`--print` help text notes that "Settings files
 that fail validation are silently ignored in this mode (no error

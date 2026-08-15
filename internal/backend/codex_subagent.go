@@ -96,7 +96,7 @@ func (a *CodexSubagentAdapter) Invoke(ctx context.Context, req *Request) (*Respo
 	// same claude binary via the --agent codex path, so the same fix
 	// applies identically. scripts/verify-safe-mode-permissions.sh (`make
 	// verify-safe-mode`) is the reproducible harness for that claim;
-	// docs/lr-7871bb-verified-run.txt is the committed evidence from a
+	// docs/setting-sources-verification-run.txt is the committed evidence from a
 	// real run — see claude_cli.go's Invoke for the fuller note.
 	args := []string{
 		"-p",

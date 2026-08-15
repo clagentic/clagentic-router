@@ -109,10 +109,14 @@ with that value. This is closed now: both adapters pass
 directory (`working_dir`)" section for the full writeup and the capability
 trade-off it costs. `--safe-mode` was tried first and found insufficient
 (it suppressed hooks/CLAUDE.md but left project `permissions.allow`
-entries in effect — see `docs/lr-7871bb-verified-run.txt` for the
-committed evidence); `--setting-sources user` is a strict superset of what
-`--safe-mode` closed, so it replaced rather than supplemented it. There is
-no `trusted_working_dirs` config surface for this any more; a prior version
+entries in effect — see `docs/setting-sources-verification-run.txt` for the
+committed evidence); `--setting-sources user` excludes the entire project
+settings source, which by construction should cover project-scoped
+customizations generally, but the harness only empirically verified
+`permissions.allow`, hooks, and `CLAUDE.md` — see README.md's "Working
+directory (`working_dir`)" section for what is measured versus
+mechanism-expected. It replaced `--safe-mode` rather than supplementing it.
+There is no `trusted_working_dirs` config surface for this any more; a prior version
 had one, gating a trust-dialog pre-acceptance write that turned out to be
 pre-accepting a dialog that never fired on this call path in the first
 place. A leftover `trusted_working_dirs` key in an existing `router.yaml` is

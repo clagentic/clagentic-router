@@ -370,7 +370,7 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 	// legitimate user-level customizations (permissions.allow entries in
 	// the operator's own user-scope settings, not project-scope) still
 	// apply, which --safe-mode would have discarded too.
-	// docs/lr-7871bb-verified-run.txt is the committed evidence for this
+	// docs/setting-sources-verification-run.txt is the committed evidence for this
 	// specific run (CLI version + repo SHA recorded in the artifact) —
 	// re-run the harness against a newer CLI to re-derive the claim rather
 	// than trusting this prose. See README.md's "Workspace trust is not a
