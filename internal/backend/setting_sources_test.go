@@ -1,8 +1,16 @@
-// internal/backend/safe_mode_test.go — asserts claude_cli and codex_subagent
-// invoke the claude CLI with --safe-mode, and that neither adapter writes a
-// per-project trust file anywhere. Both adapters share the same isolated
-// subprocess HOME's .claude.json; the second assertion proves the prior
-// trust-pre-acceptance write path is fully gone, not merely unused.
+// internal/backend/setting_sources_test.go — asserts claude_cli and
+// codex_subagent invoke the claude CLI with --setting-sources user, and
+// that neither adapter writes a per-project trust file anywhere. Both
+// adapters share the same isolated subprocess HOME's .claude.json; the
+// trust-file assertion proves the prior trust-pre-acceptance write path is
+// fully gone, not merely unused.
+//
+// --setting-sources user replaces an earlier --safe-mode-only approach:
+// --safe-mode suppressed project hooks/CLAUDE.md but left project
+// .claude/settings.json permissions.allow entries in effect (verified via
+// scripts/verify-safe-mode-permissions.sh, see docs/setting-sources-verification-run.txt
+// for the committed evidence). --setting-sources user closes that gap by
+// excluding the project settings source entirely.
 //
 // Uses the fake-binary argv-capture pattern from cli_model_passthrough_test.go.
 package backend
@@ -15,7 +23,7 @@ import (
 	"testing"
 )
 
-func TestClaudeCLI_SafeModeFlagPresent(t *testing.T) {
+func TestClaudeCLI_SettingSourcesUserFlagPresent(t *testing.T) {
 	dir := t.TempDir()
 	claudeSuccess := func() []byte {
 		out := claudeOutput{Type: "result", Result: "hello", CostUSD: 0.001}
@@ -32,19 +40,12 @@ func TestClaudeCLI_SafeModeFlagPresent(t *testing.T) {
 	}
 
 	args := readArgs(t, dir, "claude")
-	found := false
-	for _, a := range args {
-		if a == "--safe-mode" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Errorf("--safe-mode not present in claude_cli argv: %v", args)
+	if !argvHasFlagValue(args, "--setting-sources", "user") {
+		t.Errorf("--setting-sources user not present in claude_cli argv: %v", args)
 	}
 }
 
-func TestCodexSubagent_SafeModeFlagPresent(t *testing.T) {
+func TestCodexSubagent_SettingSourcesUserFlagPresent(t *testing.T) {
 	dir := t.TempDir()
 	claudeSuccess := func() []byte {
 		out := claudeOutput{Type: "result", Result: "hello from subagent"}
@@ -61,16 +62,20 @@ func TestCodexSubagent_SafeModeFlagPresent(t *testing.T) {
 	}
 
 	args := readArgs(t, dir, "claude")
-	found := false
-	for _, a := range args {
-		if a == "--safe-mode" {
-			found = true
-			break
+	if !argvHasFlagValue(args, "--setting-sources", "user") {
+		t.Errorf("--setting-sources user not present in codex_subagent argv: %v", args)
+	}
+}
+
+// argvHasFlagValue reports whether flag immediately followed by value
+// appears as adjacent tokens anywhere in args.
+func argvHasFlagValue(args []string, flag, value string) bool {
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == flag && args[i+1] == value {
+			return true
 		}
 	}
-	if !found {
-		t.Errorf("--safe-mode not present in codex_subagent argv: %v", args)
-	}
+	return false
 }
 
 // TestClaudeCLI_NoTrustFileWritten proves the isolated subprocess HOME's

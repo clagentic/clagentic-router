@@ -1,6 +1,6 @@
 // internal/backend/claude_cli.go — adapter for the claude CLI (OAuth auth).
 //
-// Invokes: claude --print --verbose --safe-mode --output-format stream-json --model <model> [--system-prompt <s>]
+// Invokes: claude --print --verbose --setting-sources user --output-format stream-json --model <model> [--system-prompt <s>]
 // Input: user prompt via stdin.
 // Output: newline-delimited JSON stream. The final "result" line carries the
 // response text and cost. Intermediate lines include rate_limit_event lines
@@ -61,10 +61,10 @@ import (
 // this file pre-accepted that dialog in the isolated HOME's .claude.json,
 // gated by an operator-configured allowlist; that machinery has been
 // removed because the dialog it was pre-accepting never fires in this call
-// path, so it was gating nothing real. --safe-mode below closes most of a
-// caller-supplied working_dir's .claude/settings.json / CLAUDE.md exposure,
-// but NOT all of it — see the Invoke doc comment for the confirmed gap
-// (permissions.allow entries still take effect under --safe-mode).
+// path, so it was gating nothing real. --setting-sources user below closes
+// a caller-supplied working_dir's .claude/settings.json / CLAUDE.md
+// exposure entirely, including the permissions.allow gap that --safe-mode
+// alone left open — see the Invoke doc comment for the full history.
 var claudeSubprocessHome = func() string {
 	// Operator override takes precedence.
 	if v := os.Getenv("CLAGENTIC_ROUTER_SUBPROCESS_HOME"); v != "" {
@@ -345,51 +345,45 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 	// the claude CLI (>=2.1.173) rejects the combination without it. The flag does
 	// not change the stream-json output format — it only unlocks the mode. (lr-1994)
 	//
-	// --safe-mode disables CLAUDE.md, skills, plugins, hooks, and MCP
-	// servers for the session (per the CLI's own --safe-mode help text,
-	// which also says "auth, model selection, built-in tools, and
-	// permissions work normally"). It stops a caller-supplied working_dir's
-	// .claude/settings.json hooks and project CLAUDE.md memory from
-	// executing inside this daemon's subprocess — real exposure, since
-	// "claude --print" shows no workspace trust dialog to gate it.
+	// --setting-sources user restricts the CLI to loading ONLY user-scope
+	// settings for the session — a caller-supplied working_dir's
+	// .claude/settings.json (hooks, permissions.allow) and project
+	// CLAUDE.md are never read, because the project settings source is
+	// excluded entirely, not merely masked. This is real exposure to close
+	// since "claude --print" shows no workspace trust dialog to gate any
+	// of it.
 	//
-	// It does NOT stop a caller-supplied working_dir's
-	// .claude/settings.json permissions.allow entries from taking effect —
-	// verified empirically (2x2 comparison with/without --safe-mode,
-	// with/without a project allow-rule; the allow-rule's effect on tool
-	// grants was identical in both --safe-mode states, and absent entirely
-	// without it, proving the grant came from the project file, not ambient
-	// user config). "Permissions work normally" in the CLI's help text
-	// means exactly that, including project-sourced permission rules. This
-	// is a real, currently open residual exposure: a caller-supplied
-	// working_dir can still widen the daemon subprocess's tool permissions
-	// via its own .claude/settings.json, --safe-mode notwithstanding.
-	// --setting-sources (which can exclude project/local setting sources)
-	// was considered as a fix but not added here — its interaction with
-	// --safe-mode has not been empirically verified in this environment,
-	// and shipping an unverified flag as a stated security boundary is
-	// worse than documenting the gap plainly.
-	// scripts/verify-safe-mode-permissions.sh (run via `make
-	// verify-safe-mode`) is the committed, reproducible harness for that
-	// verification — it derives a pass/fail matrix from a live claude CLI
-	// against a throwaway fixture rather than resting on prose. It is
-	// gated out of `make test` (real CLI invocation, costs tokens) and
-	// skips honestly if claude is absent/unauthenticated.
-	// TODO(lr-7871bb): once the harness's structural permission_denials
-	// output confirms --setting-sources user closes the permissions.allow
-	// gap, add it to both adapters and update the doc comment/README from
-	// that run's output. See README.md's "Workspace trust is not a
+	// --safe-mode was tried first and found INSUFFICIENT: empirically
+	// verified (scripts/verify-safe-mode-permissions.sh, run via `make
+	// verify-safe-mode`) that --safe-mode suppresses project hooks and
+	// CLAUDE.md auto-discovery, but a project .claude/settings.json
+	// permissions.allow entry still granted the tool it named — identical
+	// grant behavior with and without --safe-mode, absent entirely without
+	// the rule, proving the grant is project-sourced and --safe-mode does
+	// not touch it. --setting-sources user was then verified (same
+	// harness, causality matrix varying only --setting-sources with the
+	// rule held present: user -> denied, user,project -> granted,
+	// project -> granted) to close that gap, while ALSO covering
+	// everything --safe-mode covered (hooks/CLAUDE.md suppressed) — so
+	// --safe-mode is dropped here in favor of --setting-sources user
+	// alone, not stacked with it. Dropping --safe-mode also means
+	// legitimate user-level customizations (permissions.allow entries in
+	// the operator's own user-scope settings, not project-scope) still
+	// apply, which --safe-mode would have discarded too.
+	// docs/setting-sources-verification-run.txt is the committed evidence for this
+	// specific run (CLI version + repo SHA recorded in the artifact) —
+	// re-run the harness against a newer CLI to re-derive the claim rather
+	// than trusting this prose. See README.md's "Workspace trust is not a
 	// control this daemon can rely on" section for the full writeup.
 	//
 	// Unconditional, not config-gated: there is no safe reason for an
 	// operator to opt back into executing an arbitrary caller-chosen
-	// directory's hooks/CLAUDE.md inside a shared daemon process, even
-	// though the permissions.allow gap means --safe-mode alone is not a
-	// complete boundary. The trade-off is real and is not free: a caller
-	// wanting repo-aware behavior (project CLAUDE.md context, skills)
-	// loses it under --safe-mode — there is currently no way to give a
-	// caller that context without also giving their working_dir's config
-	// the ability to run inside this process.
+	// directory's hooks/CLAUDE.md/permissions inside a shared daemon
+	// process. The trade-off is real and is not free: a caller wanting
+	// repo-aware behavior (project CLAUDE.md context, skills) loses it —
+	// there is currently no way to give a caller that context without also
+	// giving their working_dir's config the ability to run inside this
+	// process.
 	//
 	// --bare was considered and rejected: its own help text states Anthropic
 	// auth under --bare is "strictly ANTHROPIC_API_KEY or apiKeyHelper ...
@@ -399,7 +393,7 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 	args := []string{
 		"--print",
 		"--verbose",
-		"--safe-mode",
+		"--setting-sources", "user",
 		"--output-format", "stream-json",
 		"--max-turns", "1",
 	}

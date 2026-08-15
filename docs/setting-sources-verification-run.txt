@@ -1,0 +1,71 @@
+clagentic-router --setting-sources user / permissions.allow verification run
+
+Produced by: scripts/verify-safe-mode-permissions.sh
+claude CLI: 2.1.232 (Claude Code)
+repo HEAD at run time: dde17ef (branch fix/lr-7871bb-verify-harness-bugs, PR #50)
+run date (UTC): 2026-08-15T18:37:47Z
+
+These behaviors can drift across claude CLI releases -- re-run the script
+against a newer CLI to re-derive the claim rather than trusting this file.
+
+=== clagentic-router: --safe-mode / permissions.allow verification harness ===
+
+--- Assert isolation: probe is gated ONLY by the project rule, not a user-level rule ---
+  PASS  rule ABSENT, no flags (isolation control)  [probe=deny hook_fired=yes]
+
+--- Baseline matrix ---
+  PASS  rule PRESENT, no flags (baseline: probe runs)  [probe=run hook_fired=yes]
+  PASS  rule PRESENT, --safe-mode (THE GAP: probe should still run)  [probe=run hook_fired=no]
+  PASS  rule PRESENT, --safe-mode --setting-sources user  [probe=deny hook_fired=no]
+  PASS  rule ABSENT,  --safe-mode --setting-sources user (control)  [probe=deny hook_fired=no]
+  PASS  rule PRESENT, --setting-sources user (isolates which flag does the work)  [probe=deny hook_fired=no]
+
+--- Causality check: rule PRESENT, vary --setting-sources only ---
+  PASS  rule PRESENT, --setting-sources user  [probe=deny hook_fired=no]
+  PASS  rule PRESENT, --setting-sources user,project  [probe=run hook_fired=yes]
+  PASS  rule PRESENT, --setting-sources project  [probe=run hook_fired=yes]
+
+--- Sentinel control: dedicated no-tool-use recall prompt (see SENTINEL CONTROL NOTE) ---
+  PASS  rule PRESENT, no flags (sentinel should be known)  [sentinel_in_output=yes]
+  PASS  rule PRESENT, --safe-mode (CLAUDE.md suppressed, sentinel unknown)  [sentinel_in_output=no]
+  PASS  rule PRESENT, --setting-sources user (project source excluded)  [sentinel_in_output=no]
+
+=== Results ===
+  Pass: 12   Fail: 0   Skip: 0   Inconclusive: 0
+
+=== What this establishes ===
+
+- --safe-mode alone leaves the permissions.allow gap OPEN (probe=run with
+  the rule present).
+- --setting-sources user CLOSES it (probe=deny), and the causality cells
+  prove the project source is the variable: user -> deny,
+  user,project -> run, project -> run.
+- --setting-sources user ALSO suppresses project hooks and CLAUDE.md
+  auto-discovery -- so it covers everything --safe-mode covers, plus the
+  gap --safe-mode misses.
+
+Decision: claude_cli and codex_subagent now ship --setting-sources user
+alone (--safe-mode dropped, not stacked). --setting-sources user covers
+everything --safe-mode covered and closes the gap it left open; dropping
+--safe-mode also means legitimate user-level customizations (e.g. the
+operator's own user-scope permissions.allow entries) still apply, where
+--safe-mode would have discarded those too.
+
+=== Caveats (carry honestly, do not drop) ===
+
+1. hook_fired is corroborating only, not a clean probe-execution signal:
+   the isolation control shows probe=deny hook_fired=yes, i.e. the hook
+   fired on some other tool call in the turn. Do not treat hook_fired as
+   independently confirming the probe ran -- the structural
+   permission_denials signal is the primary signal (see the harness's
+   methodology note).
+2. Baseline cell 5 ("rule PRESENT, --setting-sources user (isolates which
+   flag does the work)") and causality cell 1 ("rule PRESENT,
+   --setting-sources user") are the same configuration under different
+   labels. Both passed identically -- useful reproducibility, but 12 passes
+   is not 12 distinct configurations.
+
+Scope limits (unchanged): only `--setting-sources user` was tested (not
+`local`); `settings.local.json` is untested; project-scope MCP servers and
+subagent definitions are untested; interactive (non -p) sessions are
+untested.

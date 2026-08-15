@@ -102,14 +102,22 @@ files a subprocess can read/write* — that assumption was wrong for
 cwd. `claude --print`/`claude -p` (what these two adapters use) shows no
 workspace trust dialog to gate that read — the CLI's own `--print` help
 text says the dialog is skipped in non-interactive mode — so `working_dir`
-was, until `--safe-mode` was added to both adapters, also implicitly
-choosing *whose Claude Code config executes inside this daemon's process*
-for any caller who could reach `/v1/chat/completions` with that value. This
-is closed now (`--safe-mode`, unconditional on both adapters — see
-README.md's "Working directory (`working_dir`)" section for the full
-writeup and the capability trade-off it costs). There is no
-`trusted_working_dirs` config surface for this any more; a prior version had
-one, gating a trust-dialog pre-acceptance write that turned out to be
+was implicitly choosing *whose Claude Code config executes inside this
+daemon's process* for any caller who could reach `/v1/chat/completions`
+with that value. This is closed now: both adapters pass
+`--setting-sources user`, unconditionally — see README.md's "Working
+directory (`working_dir`)" section for the full writeup and the capability
+trade-off it costs. `--safe-mode` was tried first and found insufficient
+(it suppressed hooks/CLAUDE.md but left project `permissions.allow`
+entries in effect — see `docs/setting-sources-verification-run.txt` for the
+committed evidence); `--setting-sources user` excludes the entire project
+settings source, which by construction should cover project-scoped
+customizations generally, but the harness only empirically verified
+`permissions.allow`, hooks, and `CLAUDE.md` — see README.md's "Working
+directory (`working_dir`)" section for what is measured versus
+mechanism-expected. It replaced `--safe-mode` rather than supplementing it.
+There is no `trusted_working_dirs` config surface for this any more; a prior version
+had one, gating a trust-dialog pre-acceptance write that turned out to be
 pre-accepting a dialog that never fired on this call path in the first
 place. A leftover `trusted_working_dirs` key in an existing `router.yaml` is
 ignored, not fatal, on load.
@@ -132,7 +140,7 @@ set `cmd.Dir` as its sole layer (mirror `codex_cli`/`gemini_cli`). Adding a
 HOME override to `codex_cli`/`gemini_cli` is a separate, real hardening
 question — out of scope here, tracked as a follow-up, not assumed done.
 `codex_cli` and `gemini_cli` are different binaries with no
-`--safe-mode`-equivalent flag verified to exist; if either grows an
+`--setting-sources`-equivalent flag verified to exist; if either grows an
 analogous config-auto-discovery surface in the future, evaluate it against
 this same non-interactive-mode question before assuming a trust/permission
 gate protects it.

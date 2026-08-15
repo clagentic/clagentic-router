@@ -584,8 +584,8 @@ var unknownTopLevelKeyWarnings = map[string]string{
 	"trusted_working_dirs": "trusted_working_dirs was removed: the claude CLI shows no " +
 		"workspace trust dialog in the non-interactive (-p) mode this daemon uses, so the " +
 		"allowlist it gated was never enforcing anything. claude_cli/codex_subagent now pass " +
-		"--safe-mode instead, which is unconditional and has no config surface. Remove this " +
-		"key from router.yaml; it is ignored.",
+		"--setting-sources user instead, which is unconditional and has no config surface. " +
+		"Remove this key from router.yaml; it is ignored.",
 }
 
 // Load reads a Config from the YAML file at path.

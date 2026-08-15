@@ -47,10 +47,12 @@ clean:
 smoke: build
 	./scripts/smoke-test.sh
 
-## verify-safe-mode: reproduce the --safe-mode / permissions.allow evidence
-## in README.md and claude_cli.go against a live claude CLI. NOT part of
-## `make test` -- invokes a real CLI, costs tokens, and skips honestly if
-## claude is absent/unauthenticated. See scripts/verify-safe-mode-permissions.sh.
+## verify-safe-mode: reproduce the --setting-sources user / permissions.allow
+## evidence in README.md and claude_cli.go against a live claude CLI (also
+## covers the --safe-mode cells, kept as the historical record of the flag
+## that was tried first and rejected). NOT part of `make test` -- invokes a
+## real CLI, costs tokens, and skips honestly if claude is
+## absent/unauthenticated. See scripts/verify-safe-mode-permissions.sh.
 verify-safe-mode:
 	./scripts/verify-safe-mode-permissions.sh
 
