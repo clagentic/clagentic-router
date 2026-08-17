@@ -347,7 +347,17 @@ func syncSubprocessAWSSSOCache(subprocessHome string) {
 		return
 	}
 
-	newState := make(map[string]os.FileInfo, len(entries))
+	// newState is populated ONLY for entries that end this iteration in a
+	// known-good state on disk — either the confirmed-unchanged fast path or
+	// a completed write+rename. It must never record an entry on any failure
+	// branch (stat, read, write, or rename): doing so banks the fresh
+	// mtime+size before the destination actually reflects it, so the next
+	// Invoke's fast path (awsSSOCacheSyncLastState comparison above) would
+	// see a "match" and skip the file permanently, leaving a stale or
+	// missing rotating SSO token silently un-synced. A dropped entry here
+	// simply means the name is absent from next call's fast-path table, so
+	// the next Invoke re-stats and retries it — the safe outcome.
+	newState := make(map[string]os.FileInfo)
 	synced := 0
 	for _, entry := range entries {
 		if entry.IsDir() {
@@ -362,12 +372,13 @@ func syncSubprocessAWSSSOCache(subprocessHome string) {
 				"src", srcPath, "err", err)
 			continue
 		}
-		newState[name] = srcInfo
 
 		// Fast path: unchanged since last sync (mtime+size), same as
-		// syncSubprocessCreds's step 2.
+		// syncSubprocessCreds's step 2. The destination is already known
+		// good from a prior successful sync, so it is safe to re-record here.
 		if prev, ok := awsSSOCacheSyncLastState[name]; ok &&
 			prev.ModTime().Equal(srcInfo.ModTime()) && prev.Size() == srcInfo.Size() {
+			newState[name] = srcInfo
 			continue
 		}
 
@@ -391,6 +402,10 @@ func syncSubprocessAWSSSOCache(subprocessHome string) {
 			_ = os.Remove(tmp)
 			continue
 		}
+
+		// Write+rename succeeded — the destination now reflects srcInfo, so
+		// it is safe to record.
+		newState[name] = srcInfo
 		synced++
 	}
 

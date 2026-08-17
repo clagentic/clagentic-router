@@ -68,13 +68,19 @@ func (a *CodexSubagentAdapter) refreshBin() string {
 
 // Invoke calls claude -p --agent codex with CLAGENTIC_CODEX_TIER set.
 func (a *CodexSubagentAdapter) Invoke(ctx context.Context, req *Request) (*Response, error) {
-	// codex_subagent invokes the same claude binary, via the same isolated
-	// claudeSubprocessHome, as claude_cli — so it shares claude_cli's
-	// Bedrock-auth gaps identically: CLAUDE_CODE_USE_BEDROCK must survive
-	// buildCLIEnv's filter (env.go, shared by both adapters), and the
-	// isolated HOME needs the same AWS SSO cache mirror claude_cli.go
-	// provides, for the identical reason (lr-6572d5). No adapter-specific
-	// logic needed here beyond calling the shared sync functions.
+	// Verified, not assumed: this adapter's cmd (below) invokes bin — the
+	// same claude binary resolved the same way as claude_cli.go — via
+	// "-p --agent codex", passed through the identical buildCLIEnv(extra)
+	// call and the identical claudeSubprocessHome HOME override that
+	// claude_cli.go uses. There is no separate codex_subagent-specific auth
+	// path to check: whatever env/HOME claude_cli's subprocess sees, this
+	// adapter's subprocess sees too, because it is the same binary invoked
+	// through the same env-construction code. So CLAUDE_CODE_USE_BEDROCK
+	// must survive buildCLIEnv's filter (env.go, shared by both adapters),
+	// and the isolated HOME needs the same AWS SSO cache mirror
+	// claude_cli.go provides, for the identical reason (lr-6572d5). No
+	// adapter-specific logic needed here beyond calling the shared sync
+	// functions.
 	syncSubprocessCreds(claudeSubprocessHome)
 	syncSubprocessAWSSSOCache(claudeSubprocessHome)
 
