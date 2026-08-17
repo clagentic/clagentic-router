@@ -161,7 +161,7 @@ backends:
   # Credentials resolve via the standard AWS SDK chain (env vars, shared
   # config/credentials files, web identity, ECS, IMDS) — never from this file.
   # region is REQUIRED: Bedrock has no default region.
-  # See the "AWS Bedrock (bedrock_api)" section in README.md for the full
+  # See the "bedrock_api adapter" section in docs/BEDROCK.md for the full
   # model-ID-form caveat (bare vs. region-prefixed inference profile IDs)
   # and the known gap around exact OpenAI-family Bedrock model ID strings.
   #
@@ -228,9 +228,10 @@ chains:
 
   # --- POST /v1/messages "role:*" examples ---
   # Referenced via model: "role:reviewer-chain" / "role:auditor-chain" on the
-  # Anthropic Messages endpoint (see the "Anthropic Messages API" section in
-  # README.md). One-shot review/audit roles are a good fit for routed mode;
-  # tool-using builder roles are NOT — routed mode drops tool-calling.
+  # Anthropic Messages endpoint (see the "/v1/messages (Anthropic Messages
+  # API)" section in docs/AGENT-REFERENCE.md). One-shot review/audit roles
+  # are a good fit for routed mode; tool-using builder roles are NOT —
+  # routed mode drops tool-calling.
   reviewer-chain: [mid, high]
   auditor-chain:  [low, mid]
 
@@ -286,10 +287,10 @@ routing:
 # CLAUDE.md are never read, while auth and normal operation continue
 # unaffected. --safe-mode was tried first and found insufficient (it left
 # project permissions.allow entries in effect); --setting-sources user
-# closes that gap too. See the "Working directory (working_dir)" section
-# in README.md for the full writeup, including the capability trade-off
-# (a caller loses project CLAUDE.md context and skills) and the codex_cli/
-# gemini_cli exposure assessment.
+# closes that gap too. See the "working_dir wire field" section in
+# docs/AGENT-REFERENCE.md for the full writeup, including the capability
+# trade-off (a caller loses project CLAUDE.md context and skills) and the
+# codex_cli/gemini_cli exposure assessment.
 
 # --- Proxy ---
 proxy:
@@ -298,8 +299,9 @@ proxy:
   token: env:CLAGENTIC_ROUTER_TOKEN
 
 # --- Anthropic Messages API (POST /v1/messages) ---
-# See the "Anthropic Messages API" section in README.md for the full
-# passthrough-vs-routed design and auth matrix.
+# See the "/v1/messages (Anthropic Messages API)" section in
+# docs/AGENT-REFERENCE.md for the full passthrough-vs-routed design and
+# auth matrix.
 anthropic:
   upstream_url: ""        # default: https://api.anthropic.com
   # upstream_api_key: env:ANTHROPIC_API_KEY
@@ -308,7 +310,7 @@ anthropic:
   #   to forward each client's own Anthropic key unchanged.
 
 # --- AWS Bedrock InvokeModel API (POST /model/{modelId}/invoke[-with-response-stream]) ---
-# See the "AWS Bedrock InvokeModel API" section in README.md for the full
+# See the "Bedrock InvokeModel API" section in docs/BEDROCK.md for the full
 # passthrough-vs-routed design and auth matrix. Only needed for passthrough —
 # a deployment using only role:/chain:/backend: model IDs on this endpoint
 # can omit this block entirely.

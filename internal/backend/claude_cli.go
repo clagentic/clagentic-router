@@ -142,6 +142,25 @@ var credsSyncLastInfo os.FileInfo
 // every Invoke so that OAuth token rotations (which happen on the host, not in
 // the subprocess home) propagate before the next request is dispatched.
 //
+// Mirroring is additive, deliberately: this function has no delete/prune
+// step. If the source credentials file is removed from the daemon's real
+// HOME (e.g. "claude auth logout"), the previously-synced subprocess copy
+// remains in claudeSubprocessHome indefinitely — it is not proactively
+// wiped. This is an intentional, documented property, decided identically
+// for syncSubprocessAWSSSOCache below (lr-dbbcd3): the residual is a
+// credential written 0600 inside an isolated HOME whose only reader is this
+// daemon's own subprocess, and OAuth tokens expire on a timescale far
+// shorter than "operator forgot this file exists" — there is no known path
+// by which the stale copy grants access once it expires. The realistic cost
+// is a confusing debugging session, not an exposure, and a prune here risks
+// reintroducing the exact "subprocess authenticates with no valid token"
+// failure class this sync function exists to prevent if it ever runs ahead
+// of, or instead of, a refreshing write. See docs/BEDROCK.md's "Additive
+// mirroring is a deliberate, documented property" section for the full
+// analysis, which applies to this function and syncSubprocessAWSSSOCache
+// identically — if that decision is ever revisited, both functions must
+// change together, never just one.
+//
 // Algorithm:
 //  1. Stat the source (daemon HOME).  If absent, log and return — do not clobber
 //     a working copy with nothing.
@@ -298,6 +317,21 @@ var awsSSOCacheSyncLastState map[string]os.FileInfo
 // Safe to call unconditionally on every Invoke, same cadence as
 // syncSubprocessCreds: the hot path (unchanged files) costs one Stat per
 // cached filename.
+//
+// Mirroring is additive, deliberately, same as syncSubprocessCreds above:
+// no delete/prune step exists on this path either. A source token file
+// removed from the daemon's real HOME (e.g. an "aws sso logout" clearing
+// the cache entry) leaves its previously-synced copy in the isolated
+// subprocess HOME indefinitely. Decided intentional, not a defect
+// (lr-dbbcd3) — see docs/BEDROCK.md's "Additive mirroring is a deliberate,
+// documented property" section for the full analysis and why a prune was
+// evaluated and rejected here specifically: it would need to handle the
+// len(entries)==0 early return below (an entirely emptied srcDir — the
+// exact full-logout case an operator would most expect a prune to run in)
+// and must never risk removing a destination entry ahead of, or instead
+// of, a refreshing write — the missing-token hang PR #51 (lr-6572d5) fixed.
+// Any future change to this property must update syncSubprocessCreds
+// identically; the two are decided together, not one at a time.
 func syncSubprocessAWSSSOCache(subprocessHome string) {
 	if subprocessHome == "" {
 		return
