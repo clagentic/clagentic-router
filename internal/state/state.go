@@ -36,6 +36,11 @@ const (
 	ErrTypeNotFound  ErrorType = "not_found"
 	ErrTypeSchema    ErrorType = "schema"
 	ErrTypeUnknown   ErrorType = "unknown"
+	// ErrTypeMaxTurns mirrors backend.ErrTypeMaxTurns — a claude CLI exit
+	// whose terminal_reason was max_turns (--max-turns budget exhausted
+	// before a final text result). See backend.ErrTypeMaxTurns's doc for
+	// the full rationale (lr-39ed6b).
+	ErrTypeMaxTurns ErrorType = "max_turns"
 )
 
 // latencyEMAlpha is the EMA smoothing factor for call latency.

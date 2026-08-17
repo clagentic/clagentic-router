@@ -194,6 +194,23 @@ type BackendConfig struct {
 	// QuotaProbe configures the idle-quota probe loop.
 	// Only active for claude_cli backends with Enabled=true.
 	QuotaProbe QuotaProbeConfig `yaml:"quota_probe"`
+
+	// MaxTurns is the --max-turns ceiling passed to the claude CLI. Only
+	// used by claude_cli and codex_subagent — both invoke the same claude
+	// binary and share identical --max-turns resolution
+	// (backend.resolveMaxTurns). Unset or <= 0 resolves to
+	// backend.DefaultMaxTurns (currently 5); see that constant's doc for
+	// the full reasoning (lr-39ed6b). Ignored by all other adapter types.
+	//
+	// Claude Code counts a tool-use step as consuming a turn, so a backend
+	// used for multi-tool workloads (e.g. a reviewer/auditor chain that
+	// reads callers, imports, and tests before answering) may need a
+	// higher ceiling than a single-shot classification backend — this is
+	// deliberately per-backend, not a single shared constant, per
+	// CLAUDE.md's breadth principle. Explicit config always wins,
+	// byte-identically: a positive value here is passed to --max-turns
+	// verbatim, with no default ever substituted.
+	MaxTurns int `yaml:"max_turns"`
 }
 
 // CapacityPollingConfig configures a capacity poller for local backends (llama.cpp, Ollama).

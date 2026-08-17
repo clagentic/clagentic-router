@@ -16,23 +16,29 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 )
 
 // CodexSubagentAdapter calls codex via the claude -p --agent codex path.
 type CodexSubagentAdapter struct {
-	id   string
-	tier string // flagship | mini | spark
+	id       string
+	tier     string // flagship | mini | spark
+	maxTurns int
 
 	mu      sync.Mutex
 	binPath string
 }
 
 // NewCodexSubagentAdapter creates an adapter for the given tier.
-// tier should be one of: flagship, mini, spark.
-func NewCodexSubagentAdapter(id, tier, binPathOverride string) *CodexSubagentAdapter {
-	a := &CodexSubagentAdapter{id: id, tier: tier}
+// tier should be one of: flagship, mini, spark. maxTurns is the --max-turns
+// ceiling; <= 0 resolves to DefaultMaxTurns at Invoke time via
+// resolveMaxTurns — same resolution claude_cli.go uses, since this adapter
+// invokes the identical claude binary (lr-39ed6b: this backend had the same
+// hardcoded --max-turns 1 defect as claude_cli.go, fixed identically here).
+func NewCodexSubagentAdapter(id, tier, binPathOverride string, maxTurns int) *CodexSubagentAdapter {
+	a := &CodexSubagentAdapter{id: id, tier: tier, maxTurns: maxTurns}
 	// Resolve and log the binary path at construction time so misconfigurations
 	// surface in the startup log rather than silently at first invoke.
 	// codex_subagent invokes the claude CLI (not codex directly).
@@ -119,7 +125,10 @@ func (a *CodexSubagentAdapter) Invoke(ctx context.Context, req *Request) (*Respo
 		"--agent", "codex",
 		"--setting-sources", "user",
 		"--output-format", "json",
-		"--max-turns", "1",
+		// See claude_cli.go's DefaultMaxTurns doc for why this is not "1"
+		// and why it is not unbounded (lr-39ed6b) — this adapter invokes
+		// the identical claude binary and shares the identical resolution.
+		"--max-turns", strconv.Itoa(resolveMaxTurns(a.maxTurns)),
 	}
 
 	// buildCLIEnv filters the daemon environment to the allowlist — router tokens
@@ -198,10 +207,27 @@ func (a *CodexSubagentAdapter) Invoke(ctx context.Context, req *Request) (*Respo
 		}, nil
 	}
 
-	if out.Type == "error" || out.Error != "" {
+	// max_turns budget exhaustion (lr-39ed6b) — same shape and same
+	// --max-turns flag as claude_cli.go, since this adapter invokes the
+	// identical claude binary via "-p --agent codex". See
+	// isMaxTurnsTermination and claude_cli.go's parseStreamJSON for the
+	// full rationale; checked before the generic error branch below for the
+	// same reason (a max_turns exit is not necessarily type="error").
+	if isMaxTurnsTermination(&out) {
+		raw := strings.Join(out.Errors, "; ")
+		if raw == "" {
+			raw = fmt.Sprintf("codex subagent (claude CLI) terminated: terminal_reason=max_turns num_turns=%d", out.NumTurns)
+		}
+		return nil, &InvokeError{Type: ErrTypeMaxTurns, Raw: truncate(raw, 500)}
+	}
+
+	if out.Type == "error" || out.Error != "" || out.IsError {
 		raw := out.Error
 		if raw == "" {
 			raw = out.Message
+		}
+		if raw == "" && len(out.Errors) > 0 {
+			raw = strings.Join(out.Errors, "; ")
 		}
 		return nil, &InvokeError{Type: ClassifyError(raw, 0), Raw: truncate(raw, 500)}
 	}

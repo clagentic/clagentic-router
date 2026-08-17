@@ -922,7 +922,7 @@ func TestClaudeCLI_Invoke_BedrockEnvSurvivesFilter(t *testing.T) {
 		t.Fatalf("write fake claude bin: %v", err)
 	}
 
-	adapter := NewClaudeCLIAdapter("test", "", binPath, "", ThinkingOff)
+	adapter := NewClaudeCLIAdapter("test", "", binPath, "", ThinkingOff, 0)
 	req := &Request{Messages: []Message{{Role: "user", Content: "ping"}}}
 
 	if _, err := adapter.Invoke(context.Background(), req); err != nil {

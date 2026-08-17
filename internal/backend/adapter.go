@@ -134,6 +134,26 @@ const (
 	ErrTypeNotFound  ErrorType = "not_found"  // CLI binary not on PATH
 	ErrTypeSchema    ErrorType = "schema"     // Output failed validation
 	ErrTypeUnknown   ErrorType = "unknown"    // Unclassified failure
+
+	// ErrTypeMaxTurns marks a claude CLI exit whose terminal_reason (or a
+	// synonymous "errors" entry) is max_turns — the CLI's own --max-turns
+	// budget was exhausted before the model produced a final text result.
+	// This is distinct from ErrTypeUnknown deliberately (lr-39ed6b): before
+	// this type existed, budget exhaustion was logged as error_type=unknown
+	// with a truncated raw error, indistinguishable from auth failure,
+	// network error, or a crashed subprocess — the exact silent
+	// misattribution that cost this repo two full misdiagnosis cycles
+	// (lr-4abfe9, retro tome #800). It is treated as a hard failure, not a
+	// degraded success: a max_turns exit may carry a successful tool_result
+	// in its transcript, but the adapter has no reliable way to extract a
+	// final answer from an intermediate tool_result block (that assembly is
+	// exactly the step --max-turns cut off), so silently returning
+	// "success" here would fabricate a completion the model never actually
+	// produced. Giving it its own type — rather than leaving it inside
+	// ErrTypeUnknown — lets the router log and alert on it distinctly, and
+	// lets an operator raise max_turns for that backend instead of chasing
+	// an auth/network red herring.
+	ErrTypeMaxTurns ErrorType = "max_turns"
 )
 
 // InvokeError is returned by adapters when invocation fails.

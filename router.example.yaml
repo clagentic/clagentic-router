@@ -46,6 +46,16 @@ backends:
     model: claude-sonnet-4-6    # pin: claude-sonnet-4-6 | latest alias: claude-sonnet
     cost_weight: 0.8
     timeout_seconds: 240
+    # max_turns: 8
+    # ^ --max-turns ceiling passed to the claude CLI. Only used by claude_cli
+    #   and codex_subagent (both invoke the same claude binary). Unset or <= 0
+    #   defaults to 5 (backend.DefaultMaxTurns) — see that constant's doc
+    #   comment in internal/backend/claude_cli.go for the full reasoning
+    #   (lr-39ed6b). Claude Code counts a tool-use step as consuming a turn,
+    #   so a backend that a chain routes tool-using/multi-step prompts
+    #   through (e.g. reviewer-chain/auditor-chain below) may want a higher
+    #   ceiling than a single-shot classification backend — raise it here
+    #   per-backend rather than globally.
 
   # claude-fable: highest tier, above opus. Priciest — lowest cost_weight so
   # the scorer only reaches it when a chain explicitly includes it.
@@ -232,6 +242,14 @@ chains:
   # API)" section in docs/AGENT-REFERENCE.md). One-shot review/audit roles
   # are a good fit for routed mode; tool-using builder roles are NOT —
   # routed mode drops tool-calling.
+  #
+  # Reviewer/Auditor prompts instruct the model to check callers, imports,
+  # and tests — inherently multi-tool work, minimum ~2 turns by Claude
+  # Code's turn accounting (a tool call plus a final text answer). Any
+  # claude_cli/codex_subagent backend in these chains (mid/high/low above)
+  # should carry a max_turns high enough for that (see the max_turns comment
+  # on claude-mid above; default 5 already covers a handful of tool rounds —
+  # raise per-backend only if a specific chain member still exhausts it).
   reviewer-chain: [mid, high]
   auditor-chain:  [low, mid]
 

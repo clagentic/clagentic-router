@@ -378,7 +378,7 @@ func buildAdapter(id string, b *config.BackendConfig) (backend.Adapter, error) {
 	switch b.Adapter {
 	case config.AdapterClaudeCLI:
 		return backend.NewClaudeCLIAdapter(id, b.Model, b.BinPath,
-			backend.EffortLevel(b.Effort), backend.ThinkingMode(b.ThinkingMode)), nil
+			backend.EffortLevel(b.Effort), backend.ThinkingMode(b.ThinkingMode), b.MaxTurns), nil
 
 	case config.AdapterCodexCLI:
 		// Provider-id discovery is cached at construction time (never
@@ -409,7 +409,7 @@ func buildAdapter(id string, b *config.BackendConfig) (backend.Adapter, error) {
 		return backend.NewCodexCLIAdapter(id, model, b.ReasoningEffort, providerID, projectID, b.BinPath), nil
 
 	case config.AdapterCodexSubagent:
-		return backend.NewCodexSubagentAdapter(id, b.Tier, b.BinPath), nil
+		return backend.NewCodexSubagentAdapter(id, b.Tier, b.BinPath, b.MaxTurns), nil
 
 	case config.AdapterOllamaHTTP:
 		if b.URL == "" {
