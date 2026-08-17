@@ -16,33 +16,33 @@ A self-hosted LLM routing daemon with fallback chains, live quota intelligence, 
 
 ## What it does
 
-- Routes LLM calls across multiple backends (Claude CLI, Codex CLI, Ollama, Anthropic API, OpenAI API, AWS Bedrock)
+- Routes LLM calls across multiple backends (Claude CLI, Codex CLI, Gemini CLI, Ollama, Anthropic API, OpenAI API, AWS Bedrock)
 - Walks a fallback chain when backends are unavailable or rate-limited
 - Scores backends by health, quota pressure, latency EMA, and cost weight; near-ties broken by jitter
 - Tracks quota/rate-limit state persistently in SQLite; auto-recovers when windows reset
 - Parses `rate_limit_event` from the Claude CLI stream — captures live utilization, reset time, and bucket type on every response; persists to `quota_snapshots` table for historical analysis
-- Exposes an OpenAI-compatible `/v1/chat/completions` endpoint — any OpenAI SDK works without changes
+- Exposes an OpenAI-compatible `/v1/chat/completions` endpoint — any OpenAI SDK works without changes; also exposes Anthropic Messages (`/v1/messages`) and Bedrock InvokeModel-shaped endpoints
 - Delivers webhook alerts (HMAC-signed, exponential retry) on backend state changes
-- Runs as a daemon on any Linux host; CLI adapters (`claude_cli`, `codex_cli`) require OAuth sessions on that host; API adapters work anywhere
+- Runs as a daemon on any Linux host; CLI adapters (`claude_cli`, `codex_cli`, `codex_subagent`, `gemini_cli`) require OAuth sessions on that host; API adapters (`anthropic_api`, `openai_api`, `bedrock_api`) work anywhere, including containers
 
-## Design principle: breadth over single-path
+## Documentation
 
-Clagentic: Router exists to route across heterogeneous LLM backends, not to
-serve one provider well. A feature that only works for one provider, one auth
-mode, or one host is treated as incomplete. In practice this means:
+This README is an orientation and link hub, not the manual. Full
+documentation is split by audience so each stays focused:
 
-- **Discover, don't hardcode.** Model/provider/project identifiers are
-  resolved at runtime from the provider's own source of truth (e.g. the codex
-  CLI's local config and model catalog) rather than typed into `router.yaml`.
-  Static values remain available as explicit overrides.
-- **Explicit config always wins.** If you set a value, it is used
-  byte-identically and discovery is never attempted for it — safe to layer
-  onto an existing deployment.
-- **Named production paths stay stable.** The Claude brand account
-  (`claude_cli`) and ChatGPT-Plus (`codex_cli`) are load-bearing; changes that
-  improve one backend must not regress the others.
+| Doc | Audience | Covers |
+|---|---|---|
+| [docs/OPERATOR-GUIDE.md](docs/OPERATOR-GUIDE.md) | Human operator | Install, configure, add a backend, deploy (systemd/Docker/update), diagnose a failure, logging |
+| [docs/AGENT-REFERENCE.md](docs/AGENT-REFERENCE.md) | Agent/integrator calling the daemon | Full API surface, adapter capability matrix, wire-field semantics, error taxonomy, routing invariants |
+| [docs/BEDROCK.md](docs/BEDROCK.md) | Either | Every AWS Bedrock path: CLI-adapter Bedrock auth, `bedrock_api`, Bedrock InvokeModel HTTP endpoints |
+| [`router.example.yaml`](router.example.yaml) | Either | Every config key, annotated with defaults and examples |
+| [CLAUDE.md](CLAUDE.md) | Contributor editing this repo's Go source | Build-time contract: breadth principle, import graph, discovery-vs-hardcode rules, subprocess cwd/HOME contract |
+| [docs/smoke-test.md](docs/smoke-test.md) | Human operator | End-to-end validation procedure against a live daemon |
 
-See `CLAUDE.md` for the full principle and the reference implementations.
+`docs/AGENT-REFERENCE.md` states explicitly where its scope ends and
+`CLAUDE.md`'s begins — read its "Boundary with CLAUDE.md" section before
+adding to either, so the two contracts don't drift apart by duplicating
+the same claim twice.
 
 ## Quick start
 
@@ -68,6 +68,31 @@ export CLAGENTIC_ROUTER_TOKEN=mysecret
 ```
 
 **Requirements:** Go 1.25+. No CGO — pure Go SQLite via `modernc.org/sqlite`.
+
+Full install/configure/deploy walkthrough: [docs/OPERATOR-GUIDE.md](docs/OPERATOR-GUIDE.md).
+
+## Design principle: breadth over single-path
+
+Clagentic: Router exists to route across heterogeneous LLM backends, not to
+serve one provider well. A feature that only works for one provider, one auth
+mode, or one host is treated as incomplete. In practice this means:
+
+- **Discover, don't hardcode.** Model/provider/project identifiers are
+  resolved at runtime from the provider's own source of truth (e.g. the codex
+  CLI's local config and model catalog) rather than typed into `router.yaml`.
+  Static values remain available as explicit overrides.
+- **Explicit config always wins.** If you set a value, it is used
+  byte-identically and discovery is never attempted for it — safe to layer
+  onto an existing deployment.
+- **Named production paths stay stable.** The Claude brand account
+  (`claude_cli`) and ChatGPT-Plus (`codex_cli`) are load-bearing; changes that
+  improve one backend must not regress the others.
+
+See [CLAUDE.md](CLAUDE.md) for the full principle and the reference
+implementations; see [docs/AGENT-REFERENCE.md](docs/AGENT-REFERENCE.md) for
+the wire-visible consequences (discovery is invisible to a caller by
+design — this is repo-internal context, not something a client integrates
+against).
 
 ## Architecture
 
@@ -111,656 +136,22 @@ graph LR
     State --> Webhook
 ```
 
-## Model field syntax
-
-| Syntax | Example | Resolves to |
-|---|---|---|
-| Tier alias | `claude-haiku` | All backends in the `haiku` tier, scored |
-| Explicit chain | `chain:haiku,mini,sonnet` | Three-step fallback |
-| Named chain | `role:default` | Chain named `default` in config |
-| Direct backend | `backend:claude-haiku` | Exactly one backend, no scoring |
-
-## API
-
-| Method | Path | Description |
-|---|---|---|
-| POST | /v1/chat/completions | OpenAI-compatible inference |
-| POST | /v1/messages | Anthropic Messages API — passthrough or `role:*` routed (see below) |
-| POST | /model/{modelId}/invoke | AWS Bedrock Runtime InvokeModel — passthrough or `role:*` routed (see below) |
-| POST | /model/{modelId}/invoke-with-response-stream | AWS Bedrock Runtime InvokeModelWithResponseStream — passthrough or `role:*` routed (see below) |
-| GET | /v1/models | List all backends with status and capabilities |
-| GET | /v1/capacity | Per-backend capacity snapshot (utilization, reset time, score) |
-| GET | /health | Aggregated health (cached) |
-| GET | /doctor | Live probe of all backends |
-| GET | /quota | Per-backend quota and rate state |
-| GET | /metrics | Prometheus text format |
-| GET | /logs | Recent call log (`?from=RFC3339&to=RFC3339`) |
-| GET | /stats | Aggregated call statistics |
-| POST | /backends/{id}/reset | Clear error state, re-probe |
-| POST | /backends/{id}/disable | Force backend offline |
-| POST | /backends/{id}/enable | Re-enable a disabled backend |
-| POST | /webhooks | Register a webhook |
-| DELETE | /webhooks/{id} | Remove a webhook |
-| GET | /webhooks | List webhooks |
-| GET | /version | Version (no auth required) |
-
-All endpoints except `/version` require `Authorization: Bearer <token>` — with two
-exceptions: `/v1/messages` and `/model/{modelId}/invoke[-with-response-stream]` in
-passthrough mode, see below.
-
-## Anthropic Messages API
-
-`POST /v1/messages` lets `ANTHROPIC_BASE_URL`-configurable clients — Claude Code
-among them — point at the router directly. Because `ANTHROPIC_BASE_URL` is
-process-global in Claude Code (the whole session routes through it, orchestrator
-included), the endpoint has two modes, selected by the request's `model` field:
-
-| Model field | Mode | Behavior |
-|---|---|---|
-| Any normal Claude model (`claude-sonnet-4-6`, etc.) | **Passthrough** (default) | Transparent reverse proxy to `anthropic.upstream_url` (default `https://api.anthropic.com`). Request body and streamed SSE are forwarded byte-for-byte — tools, prompt caching, and multimodal content pass through untouched. |
-| `role:<chain>` / `chain:a,b,c` / `backend:<id>` | **Routed** | Translated to the router's internal request format, sent through the same fallback-chain machinery as `/v1/chat/completions`, translated back to Anthropic Messages format (including Anthropic-grammar SSE when `stream: true`). |
-
-### Auth matrix (deliberately asymmetric)
-
-- **Passthrough mode**: the router does **not** check its own inference token.
-  The client's own Anthropic credential (`x-api-key` or `Authorization: Bearer`)
-  travels through to the upstream Anthropic API unchanged — Anthropic
-  authenticates the call, not the router. This is what keeps an interactive
-  Claude Code session fully functional when pointed at the router: the client
-  only ever needs to know its own Anthropic key, not a separate router token.
-  Set `anthropic.upstream_api_key` to instead substitute a router-owned key for
-  every passthrough request, overriding whatever the client sent.
-- **Routed mode**: requires the router's own inference token, presented as
-  `x-api-key: <token>` OR `Authorization: Bearer <token>` — this is a real
-  router-owned invocation (chain selection, metering) and is gated exactly
-  like `/v1/chat/completions`.
-
-### Known limitation — routed mode only
-
-Routed models lose true token streaming — the router's CLI adapters are
-request/response, not streaming — and, as of this writing, no adapter
-round-trips tool_use/tool_result content on a routed *multi-turn* call. This
-makes routed mode suitable for **one-shot review/audit roles**
-(`role:reviewer-chain`, `role:auditor-chain` — see `router.example.yaml`).
-Passthrough mode has none of these limitations — it is a byte-for-byte proxy.
-
-**Tool-bearing requests are refused, never silently degraded.** If a routed
-request's `tools` field is present and the resolved chain has no
-tool-capable backend (see [Adapter capabilities](#adapter-capabilities)
-below), the router returns `422 no_tool_capable_backend` naming the reason —
-it never returns a `200` with the tools silently dropped. As of this
-writing, **no configured adapter declares `supports_tools: true`**: every
-adapter's own wire code sends plain-text messages and reads plain-text
-responses only, so every routed tool-bearing request is refused today,
-regardless of which chain it targets. Use passthrough mode for tool-using
-clients — it forwards tools untouched.
-
-**Working directory (`working_dir`).** Both `/v1/messages` (routed mode
-only) and `/v1/chat/completions` accept an optional `working_dir` field: an
-absolute path the four subprocess (CLI) adapters (`claude_cli`, `codex_cli`,
-`codex_subagent`, `gemini_cli`) use as the subprocess's working directory.
-It is opt-in and never inferred from server-side state — the router is a
-shared daemon serving arbitrary callers, so guessing a directory server-side
-would just be a different flavor of the bug this field exists to avoid.
-When omitted, all four subprocess adapters default to `/`. A supplied value
-is validated at the wire boundary and rejected with `400`
-(Anthropic-format `invalid_request_error` on `/v1/messages`,
-`invalid_request` on `/v1/chat/completions`) unless it is absolute, exists,
-and is a directory — an invalid path is refused outright rather than
-silently ignored or left to fail opaquely inside the subprocess exec.
-`backend.ResolveWorkingDir` itself still has **no path-containment
-allowlist** and there is still a TOCTOU window between its existence check
-and the subprocess actually starting; both remain known, accepted
-limitations of *cwd validation*, not gaps this field's validation claims to
-close. The three HTTP adapters (`anthropic_api`, `openai_api`,
-`bedrock_api`) have no subprocess and ignore this field entirely.
-
-**Workspace trust is not a control this daemon can rely on.** Claude Code's
-interactive per-project trust dialog gates hooks, `.claude/settings.json`
-`permissions.allow` entries, and CLAUDE.md memory in a normal terminal
-session — but `claude_cli` and `codex_subagent` both invoke the CLI in
-non-interactive print mode (`claude --print` / `claude -p`), and the CLI's
-own `--print` help text says plainly: the workspace trust dialog is skipped
-in non-interactive mode. It never fires on this call path at all. A prior
-version of this daemon added an operator-configured `trusted_working_dirs`
-allowlist and pre-accepted that dialog in the isolated subprocess HOME's
-`.claude.json` before invoking the CLI — that machinery has been removed,
-because the dialog it pre-accepted was never blocking anything in the first
-place. Trust and tool-permissions are two separate gates in Claude Code;
-this router's subprocess calls never go through the trust gate at all, in
-either direction.
-
-**The real exposure, and what closes it.**
-Because there is no trust dialog to skip past, a caller-supplied
-`working_dir` whose `.claude/settings.json` defines hooks,
-`permissions.allow` entries, or a project `CLAUDE.md` can get those
-executed/applied inside this daemon's subprocess on every invocation, by
-default — any caller who can reach `/v1/chat/completions` with a
-`working_dir` value effectively gets that directory's Claude Code config
-running with this daemon's privileges. This is the same shape of exposure
-as [GHSA-wpqr-6v78-jr5g](https://github.com/advisories/GHSA-wpqr-6v78-jr5g)
-(Gemini CLI auto-trusting workspace folders in headless/CI invocations).
-`claude_cli` and `codex_subagent` now pass `--setting-sources user` on
-every invocation, unconditionally — not config-gated, because there is no
-safe reason for an operator to opt back into running an arbitrary
-caller-chosen directory's hooks/CLAUDE.md/permissions inside a shared
-daemon process. `--setting-sources user` makes the CLI load only
-user-scope settings for the session, so a caller-supplied `working_dir`'s
-`.claude/settings.json` (`permissions.allow`, hooks) and `CLAUDE.md` do
-not take effect in the subprocess at all — the project settings source is
-excluded, not merely suppressed feature-by-feature.
-
-**`--safe-mode` was tried first and found insufficient.** Per the CLI's
-own `--safe-mode` help text, it "start[s] with all customizations
-(CLAUDE.md, skills, plugins, hooks, MCP servers, custom commands and
-agents, output styles, workflows, custom themes, keybindings, and more)
-disabled," while "auth, model selection, built-in tools, and permissions
-work normally." Empirically verified in this environment (a temp project
-directory with a hook, a `CLAUDE.md` sentinel, and a `permissions.allow`
-entry, run with and without `--safe-mode`) — **run `make verify-safe-mode`
-(or `./scripts/verify-safe-mode-permissions.sh` directly) to reproduce
-this result yourself**, including against a newer CLI version; the script
-is the evidence, not this prose. `docs/setting-sources-verification-run.txt` is a
-committed real run's output (claude CLI 2.1.232, repo SHA `dde17ef`) so
-the claim below rests on evidence in the diff, not memory:
-
-- **Suppressed by `--safe-mode`**: project hooks did not fire; project
-  `CLAUDE.md` auto-discovery did not load.
-- **NOT suppressed by `--safe-mode`**: a project `.claude/settings.json`
-  `permissions.allow` entry still grants the tool it names. A 2x2
-  comparison (rule present/absent, `--safe-mode` on/off, both against a
-  no-tools control) showed the grant firing identically with and without
-  `--safe-mode`, and the absent-rule rows denying identically in both
-  states — proving the grant is sourced from the project file, not ambient
-  user config, and that `--safe-mode` does not touch it. "Permissions work
-  normally" in the CLI's help text means exactly that, including
-  project-sourced permission rules. This was a real, then-open residual
-  exposure: a caller-supplied `working_dir` could widen the daemon
-  subprocess's tool permissions via its own `.claude/settings.json`
-  `permissions.allow`, `--safe-mode` notwithstanding.
-
-**`--setting-sources user` closes that gap.** The same harness's causality
-check — varying only `--setting-sources` with the rule held present —
-shows `user` denying the probe, `user,project` and `project` both granting
-it: `permission_denials` proves the project settings source is the
-variable, not `--safe-mode`. `--setting-sources user` also independently
-reproduces every suppression `--safe-mode` provided that the harness
-actually measured (project hooks did not fire, `CLAUDE.md` sentinel was
-unknown to the model) — see `docs/setting-sources-verification-run.txt`'s
-full matrix. `claude_cli.go` and `codex_subagent.go` now pass
-`--setting-sources user` alone; `--safe-mode` is dropped, not stacked with
-it.
-
-**What "excludes the project settings source" covers, and what of that is
-empirically verified.** `--setting-sources user` works by excluding the
-entire project settings source, not by suppressing individual features one
-at a time — by construction this should cover every project-scoped
-customization the CLI supports, not only the three the harness probes. The
-harness itself only exercises three: `permissions.allow`, hooks, and
-`CLAUDE.md` auto-discovery. It does not touch project-scope MCP servers or
-subagent definitions (see Scope limits in
-`docs/setting-sources-verification-run.txt`), and `--safe-mode`'s own help
-text names several more project-scoped surfaces neither flag's coverage was
-tested against here: skills, plugins, output styles, custom commands and
-agents, workflows, custom themes, keybindings. Those are **expected to be
-excluded by the same source-level mechanism, not separately measured** —
-treat that distinction as load-bearing when citing this claim elsewhere.
-Dropping `--safe-mode` also means legitimate user-scope customizations
-(e.g. the operator's own user-level `permissions.allow` entries) still
-apply, where `--safe-mode` would have discarded those too.
-
-Separately: the CLI's `-p`/`--print` help text notes that "Settings files
-that fail validation are silently ignored in this mode (no error
-dialog is shown)" — operationally relevant here because both adapters
-always run non-interactively, so a malformed caller-supplied
-`.claude/settings.json` fails open (ignored) rather than surfacing an
-error to the operator.
-
-`--bare` was considered first and rejected: its help text states Anthropic
-auth under `--bare` is "strictly `ANTHROPIC_API_KEY` or `apiKeyHelper` ...
-OAuth and keychain are never read" — both adapters authenticate purely via
-an OAuth credentials file synced into the isolated subprocess HOME, so
-`--bare` would break authentication outright rather than harden anything.
-
-**The capability trade-off is real, not free.** A caller whose `working_dir`
-points at a real project loses that project's `CLAUDE.md` context, skills,
-hooks, and project-scope `permissions.allow` entries under
-`--setting-sources user` — there is currently no way to give a caller
-repo-aware behavior without also giving that directory's config the
-ability to run inside this daemon's process. `working_dir` under
-`--setting-sources user` still selects *where the subprocess runs*
-(relevant for any tool that reads the filesystem relative to cwd); it no
-longer selects *whose CLAUDE.md/hooks/permissions* apply — that scope is
-now fixed to the daemon's own user-level settings for every caller.
-
-`codex_cli` and `gemini_cli` are different binaries — `--setting-sources`
-is claude-specific and does not apply to either. `codex_cli` reads
-`~/.codex/config.toml`/`auth.json` but has no equivalent
-hooks/settings/CLAUDE.md auto-discovery surface today, so there is no
-known analogous exposure to close for it. `gemini_cli`'s installed version
-in this deployment's build environment (0.47.0) is well past the version
-GHSA-wpqr-6v78-jr5g was fixed in (0.39.1) — not exposed to that specific
-advisory as verified here; operators running an older `gemini` binary
-should confirm their own installed version independently, since this
-daemon does not pin or vendor either CLI.
-
-Hook suppression against the *daemon's own* config differs by adapter and
-predates this field: `claude_cli` and `codex_subagent` also override
-`HOME` for the subprocess (a stub `~/.claude` with no hook-bearing
-`settings.json`), so `working_dir`/`cmd.Dir` is a second, narrower layer
-for them, on top of that HOME override. `codex_cli` and `gemini_cli` set no
-HOME override — `cmd.Dir` is their only layer. Defaulting `cmd.Dir` to `/`
-strengthens both pairs of adapters the same way regardless of that
-asymmetry: none of the four inherits the daemon's actual cwd anymore. See
-`CLAUDE.md`'s "Subprocess cwd contract" for the full per-adapter
-breakdown.
-
-**Upgrade note.** A `trusted_working_dirs` key left over in `router.yaml`
-from a prior version is ignored (logged at `Warn`, not a startup error) —
-remove it; it has no effect.
-
-### Adapter capabilities
-
-`GET /v1/models` includes a `capabilities` object per backend so a caller can
-check tool/streaming/image support **before** sending a request:
-
-```json
-{
-  "id": "claude-api",
-  "capabilities": {
-    "supports_tools": false,
-    "supports_streaming": false,
-    "supports_images": false
-  }
-}
-```
-
-Every adapter today declares `supports_tools: false` and
-`supports_images: false` — not because the underlying provider APIs lack
-tool/vision support, but because none of this router's adapters currently
-marshal a `tools` field or a non-text content block on the request, or parse
-one back out of the response (each adapter's `Capabilities()` doc explains
-its specific gap). `Capabilities()` exists as the honest, queryable signal
-of that state and the seam a future adapter would flip to `true` once it
-actually wires tool passthrough — not a router-level translation flag.
-
-### Config
-
-```yaml
-anthropic:
-  upstream_url: ""        # default: https://api.anthropic.com
-  # upstream_api_key: env:ANTHROPIC_API_KEY   # optional router-owned key override
-```
-
-## AWS Bedrock InvokeModel API
-
-`POST /model/{modelId}/invoke` and `POST /model/{modelId}/invoke-with-response-stream`
-let Bedrock-mode Claude Code (`CLAUDE_CODE_USE_BEDROCK=1`, `ANTHROPIC_BEDROCK_BASE_URL`
-pointed at the router) work the same way `/v1/messages` works for direct-API mode.
-The key difference from `/v1/messages`: **the model identifier is carried entirely by
-the URL path segment, never the request body** — there is no `model` field in a Bedrock
-InvokeModel request. That path segment (`{modelId}`) is the routing key, exactly as with
-`/v1/messages`'s body `model` field:
-
-| `{modelId}` | Mode | Behavior |
-|---|---|---|
-| A real Bedrock model/inference-profile ID (`anthropic.claude-...`, `us.anthropic.claude-...`) | **Passthrough** (default) | SigV4-signed reverse proxy to the real AWS Bedrock Runtime endpoint for `bedrock.region`. Request body and response (including AWS event-stream-framed responses) are forwarded byte-for-byte. |
-| `role:<chain>` / `chain:a,b,c` / `backend:<id>` | **Routed** | Translated to the router's internal request format, sent through the same fallback-chain machinery as `/v1/chat/completions` and `/v1/messages`, translated back into the Bedrock InvokeModel response envelope — which is byte-identical in shape to the direct Anthropic Messages response for Anthropic models on Bedrock. |
-
-### Auth matrix
-
-Same asymmetric shape as `/v1/messages`:
-
-- **Passthrough mode**: the router does **not** check its own inference token — Bedrock
-  passthrough is authenticated by SigV4 signing with AWS credentials the router itself
-  resolves (see Config below), not by any credential the client presents.
-- **Routed mode**: requires the router's own inference token, presented as
-  `x-api-key: <token>` OR `Authorization: Bearer <token>`.
-
-### Tools
-
-Same refusal behavior as `/v1/messages` routed mode: if the request body's
-`tools` field is present and the resolved chain has no tool-capable backend
-(see [Adapter capabilities](#adapter-capabilities)), the router returns
-`422` (Bedrock error envelope: `{"message": "..."}`) rather than a `200`
-with tools silently dropped. Passthrough forwards `tools` untouched — this
-check only applies to `role:*`/`chain:*`/`backend:*` model IDs.
-
-### Config
-
-```yaml
-bedrock:
-  region: us-east-1        # required for passthrough; routed-mode-only deployments may omit
-  # profile: my-aws-profile  # optional named AWS profile for passthrough credential resolution
-```
-
-Credentials for passthrough are resolved via the same standard AWS SDK credential chain
-the `bedrock_api` adapter uses (env vars → web identity → shared credentials file →
-shared config file → ECS → IMDS) — see [AWS Bedrock (`bedrock_api`)](#aws-bedrock-bedrock_api)
-below for the full credential/region discussion. A passthrough request with no
-`bedrock.region` configured fails with `503` rather than attempting to sign with an
-empty region.
-
-### Streaming framing
-
-The streaming variant emits **AWS event-stream framing**
-(`Content-Type: application/vnd.amazon.eventstream`) — a third response-framing scheme
-distinct from both plain SSE (`/v1/chat/completions`) and the Anthropic Messages SSE
-grammar (`/v1/messages` routed mode). Passthrough forwards the upstream event-stream
-bytes unmodified; routed mode constructs event-stream frames itself (via the AWS SDK's
-own `aws/protocol/eventstream` codec, not hand-rolled), one frame per Anthropic-grammar
-event (`message_start`, `content_block_delta`, etc.) — same known routed-mode limitation
-as `/v1/messages`: the full response arrives in one `content_block_delta` frame rather
-than true token-by-token streaming.
-
-### Verification status
-
-The routed-mode path (path extraction, request/response translation, event-stream
-encode/decode) is unit-tested deterministically and requires no AWS account. The
-passthrough path's request-building and SigV4 signing are unit-tested against an
-`httptest` stand-in with injected stub credentials — this verifies the signing call
-shape and header production, but **does not** verify AWS itself accepts the signed
-request end-to-end. No live AWS Bedrock account was available during this endpoint's
-development (same caveat as the `bedrock_api` adapter below); live verification against
-a real Bedrock endpoint is left to the operator enabling Bedrock passthrough.
-
-### Streaming
-
-`/v1/chat/completions` accepts `"stream": true`. The response is delivered as
-Server-Sent Events (SSE) in OpenAI wire format and is compatible with the OpenAI
-Python SDK, openai-node, and any standard SSE client.
-
-**Note:** the current implementation delivers the complete response as a single SSE
-event (one content chunk followed by `[DONE]`). Token-by-token streaming is planned.
-
-### Tools
-
-`/v1/chat/completions` accepts an OpenAI-shaped `tools` field. If `tools` is
-present and non-empty and the resolved chain has no tool-capable backend
-(see [Adapter capabilities](#adapter-capabilities)), the request is refused
-with `422 no_tool_capable_backend` rather than routed to a backend that would
-silently drop the tools.
-
-## Response headers
-
-Every `/v1/chat/completions` response includes:
+## Import graph (no cycles allowed)
 
 ```
-X-Router-Backend: claude-haiku
-X-Router-Chain-Position: 0
-X-Router-Latency-Ms: 1234
-X-Router-Fallback-Reason: rate_limit   # only when chain was advanced
+config  → (stdlib)
+state   → (stdlib)
+store   → state
+backend → config
+webhook → state, store
+router  → backend, config, state, store, webhook
+server  → router, state, store
+cmd/clagentic-router → config, backend, router, server, store, webhook
 ```
 
-## Adapters
-
-| Type | Auth | Notes |
-|---|---|---|
-| `claude_cli` | OAuth (keychain) or AWS Bedrock (`CLAUDE_CODE_USE_BEDROCK=1`) | Requires `claude` binary on PATH; emits `rate_limit_event` with live utilization on every response — captured and persisted automatically; supports `quota_probe` config block to poll utilization on a configurable interval when idle. Bedrock auth: see "AWS Bedrock auth for `claude_cli`/`codex_subagent`" below — this row is a stopgap pointer, not the full writeup (tracked for a fuller pass in lr-8453ba) |
-| `codex_cli` | OAuth (keychain) | Requires `codex` binary on PATH |
-| `codex_subagent` | OAuth (via Claude) or AWS Bedrock (via Claude) | Requires Claude with codex agent installed; shares `claude_cli`'s Bedrock auth path since it invokes the same `claude` binary through the same isolated subprocess HOME |
-| `gemini_cli` | OAuth (keychain) or `GEMINI_API_KEY` | Requires `gemini` binary on PATH; run `gemini auth login` |
-| `ollama_http` | None | Local or remote Ollama server |
-| `anthropic_api` | API key | Direct Anthropic Messages API |
-| `openai_api` | API key | OpenAI Chat Completions API; optional `openai_api_key` enables usage polling |
-| `bedrock_api` | AWS SDK credential chain | AWS Bedrock Converse API — see [AWS Bedrock (`bedrock_api`)](#aws-bedrock-bedrock_api) below |
-
-CLI adapters (`claude_cli`, `codex_cli`, `codex_subagent`, `gemini_cli`) must run on the host where the OAuth sessions are stored. They cannot run in a container. For containerized deployment, use only API-based adapters.
-
-### AWS Bedrock auth for `claude_cli`/`codex_subagent`
-
-`claude_cli` and `codex_subagent` both invoke the `claude` binary, which supports
-authenticating via AWS Bedrock as an alternative to OAuth
-(`CLAUDE_CODE_USE_BEDROCK=1`, standard AWS SDK credential chain). Two things must
-both be true for this to work through the router's isolated subprocess HOME
-(`claudeSubprocessHome`, see `CLAUDE.md`'s "Subprocess cwd contract"):
-
-1. **`CLAUDE_CODE_USE_BEDROCK` must reach the subprocess.** It is in
-   `cliEnvAllowlistLiterals` (`internal/backend/env.go`) alongside the AWS SDK
-   standard credential/config vars — set it in the daemon's own environment (not
-   `router.yaml`) the same way any other AWS SDK var is set.
-2. **An SSO-based Bedrock-fronting AWS profile needs its cached token mirrored
-   into the isolated HOME.** `AWS_PROFILE`/`AWS_REGION` only *name* a profile;
-   resolving an SSO profile into short-lived credentials requires
-   `~/.aws/sso/cache/*.json` — a file, not an env var — which the isolated
-   subprocess HOME does not have by default. `syncSubprocessAWSSSOCache`
-   (`internal/backend/claude_cli.go`) mirrors that one directory from the
-   daemon's real HOME into the isolated HOME on every Invoke, the same way
-   `syncSubprocessCreds` keeps OAuth credentials current. It syncs **only**
-   `~/.aws/sso/cache/` — never `~/.aws/config`, `~/.aws/credentials`, or any
-   other real-HOME state — to preserve the isolation property. A
-   static-credential Bedrock profile (`AWS_ACCESS_KEY_ID`/
-   `AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN`, already allowlisted) needs only
-   item 1; item 2 is SSO-specific.
-
-**Verified no-op for every other deployment shape.** A host with no
-`~/.aws/sso/cache` directory (OAuth hosts, static-credential Bedrock hosts — the
-majority deployment) hits `syncSubprocessAWSSSOCache`'s absent-source path: it
-logs at `Debug` and returns without creating anything in the subprocess HOME.
-`codex_cli` and `gemini_cli` set no HOME override at all, so they already read
-the daemon's real `~/.aws` directly — no code change touches either. `bedrock_api`
-is an in-process AWS SDK call with no subprocess — structurally unaffected.
-`anthropic_api`/`openai_api`/`ollama_http` have no subprocess and no AWS
-involvement at all.
-
-**Operator-dependent verification.** This was built and tested with unit
-coverage against a temp-directory fake HOME (`internal/backend/claude_cli_test.go`)
-and is not verified end-to-end against a live Bedrock-fronted SSO profile from
-this build environment — the same caveat the `bedrock_api` adapter below
-already carries for its own Bedrock path. If you enable this and the router
-still cannot authenticate on your host, capture the CLI's stderr/exit code and
-file it.
-
-### AWS Bedrock (`bedrock_api`)
-
-Calls the [Bedrock Runtime Converse API](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html),
-which is uniform across model families for text-only, non-streaming
-invocation — the same adapter covers both the Anthropic and OpenAI families
-hosted on Bedrock with no model-family-specific config. Image input,
-streaming, and tool-use content blocks are out of scope for this adapter;
-text-only requests/responses only. Non-text response content blocks (tool
-use, reasoning, etc.) are skipped rather than causing an error.
-
-```yaml
-backends:
-  bedrock-claude:
-    adapter: bedrock_api
-    region: us-east-1                      # required — Bedrock has no SDK default region
-    model: anthropic.claude-sonnet-4-6-v1:0  # confirm the exact ID in the Bedrock console
-    # profile: my-aws-profile              # optional named AWS profile
-    timeout_seconds: 180
-```
-
-**Credentials.** Resolved exclusively via the standard AWS SDK credential
-chain (env vars → web identity → shared credentials file → shared config
-file → ECS → IMDS) — the same chain `aws-cli` and every other AWS SDK use.
-There is no `api_key` field for this adapter and router.yaml must never
-carry AWS credentials; set `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (or
-better, a role) in the environment, or use `profile` to select a named
-profile from `~/.aws/config` / `~/.aws/credentials`.
-
-**Region.** Required — Bedrock has no default region in the SDK. An empty
-`region` fails config validation at startup rather than failing on the
-first call.
-
-**Model ID semantics.** Two ID forms exist and they are *not*
-interchangeable:
-- **Bare model IDs** (e.g. `anthropic.claude-sonnet-4-6-v1:0`) are
-  region-specific — the model must be enabled for that exact region in your
-  account.
-- **Region-prefixed inference profile IDs** (e.g. `us.anthropic.claude-...`,
-  `eu.anthropic.claude-...`) enable cross-region routing with failover, and
-  some models are reachable *only* via an inference profile.
-
-Check the Bedrock console for your target model to determine which form it
-requires. The Anthropic family's Bedrock IDs are well-documented; **the
-exact ID strings for the OpenAI family hosted on Bedrock were not confirmed
-during this adapter's development** — do not copy an ID from this README
-for an OpenAI-family model without first verifying it in the console for
-your account/region.
-
-**Error classification.** Bedrock Runtime SDK exceptions are mapped onto
-the router's existing `ErrorType` enum via `errors.As` (never string
-matching): `ThrottlingException`/`ModelNotReadyException` → rate limit,
-`AccessDeniedException` → auth (covers both missing/expired credentials
-*and* a model not enabled for your account — both surface as the same SDK
-exception type), `ValidationException`/`ResourceNotFoundException` →
-schema, `ModelTimeoutException` → timeout, and
-`ModelErrorException`/`InternalServerException`/`ServiceUnavailableException`
-→ network (retriable downstream failure).
-
-**Operator-verifiable, not verified here.** This adapter was built and
-tested entirely against a mocked Bedrock client — no live AWS account was
-available in the build environment. Live end-to-end verification against a
-real Bedrock endpoint (credential resolution, an actual Converse call
-succeeding, and the OpenAI-family model ID question above) is left to the
-operator enabling this backend against their own AWS account.
-
-## Webhook events
-
-Webhooks are called via HTTP POST with a JSON body. Register endpoints in config or at runtime via `/webhooks`. Each delivery includes:
-
-- `X-Clagentic-Event` — event name
-- `X-Clagentic-Delivery` — unique delivery UUID
-- `X-Clagentic-Signature` — `sha256=<hmac>` when `secret` is configured
-
-| Event | Fired when |
-|---|---|
-| `backend_offline` | Backend exceeds `offline_failure_threshold` consecutive failures |
-| `backend_degraded` | Backend exceeds `degraded_failure_threshold` consecutive failures |
-| `backend_recovered` | Backend succeeds after being degraded or offline |
-| `quota_exhausted` | Backend reports quota exhaustion (429 + quota header, or `QuotaExhausted` set) |
-| `quota_low` | Estimated remaining quota drops below `quota_warning_threshold` (edge-triggered) |
-| `auth_failure` | Backend returns 401/403 |
-| `chain_exhausted` | All backends in the chain failed for a single request |
-
-Delivery uses exponential backoff (default: 5 retries, initial 500 ms). Failed deliveries are logged and dropped after `webhook_max_retry` attempts.
-
-## Logging
-
-Every HTTP request is logged at `Info` level with `method`, `path`, `status`, `latency_ms`, and `request_id`. 5xx responses are logged at `Warn`. Backend state changes are logged at `Warn`. Verbose adapter traces are at `Debug`.
-
-Every routed call is persisted to the `call_log` SQLite table with: `backend_id`, `model`, `outcome`, `prompt_tokens_est`, `completion_tokens_est`, `latency_ms`, `cost_usd_est`, `score` (router score at selection time), `request_id` (correlates to HTTP logs), `rate_limit_type` (active quota bucket), `utilization` (account utilization at routing time, if known), and `fallback_count` (backends tried before this hop). Query via `GET /logs`.
-
-Quota events from `claude_cli` are additionally persisted to `quota_snapshots` with full `rate_limit_info` payload including `status`, `utilization`, `resets_at`, `surpassed_threshold`, and raw JSON for forward compatibility.
-
-Configure log level and format in `router.yaml`:
-
-```yaml
-log:
-  level: info    # debug|info|warn|error
-  format: text   # text|json
-```
-
-Or at runtime via environment variables (override config):
-- `CLAGENTIC_ROUTER_LOG_LEVEL=debug`
-- `CLAGENTIC_ROUTER_LOG_FORMAT=json`
-
-Use `format: json` for structured log ingestion (Loki, CloudWatch, Datadog).
-
-## Configuration
-
-See `router.example.yaml` for a fully annotated example.
-
-Key concepts:
-- **Backends**: one LLM invocation path each
-- **Tiers**: named groups of backends at the same capability level (scored, pick best)
-- **Chains**: ordered list of tiers to try in sequence on failure
-
-### quota_probe (claude_cli backends)
-
-When the router is idle, quota utilization and reset times for `claude_cli` backends go
-stale. The `quota_probe` block activates a background loop that fires a minimal claude
-CLI call when no organic `rate_limit_event` has been received within the configured window.
-
-```yaml
-backends:
-  claude-low:
-    adapter: claude_cli
-    model: claude-haiku-4-5
-    quota_probe:
-      enabled: true       # false by default; must opt in
-      interval: 30m       # probe if no organic data in this window (default: 30m)
-      model: claude-haiku-4-5  # model to use for the probe ping (default: claude-haiku-4-5)
-```
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `enabled` | bool | `false` | Activate the probe loop |
-| `interval` | duration string | `30m` | How long to wait without organic data before probing |
-| `model` | string | `claude-haiku-4-5` | Model to use for the probe call (use the cheapest available) |
-
-Probe calls are not recorded in `/logs` or `/stats` — they are maintenance traffic, not
-routed requests. On a `rejected` status (quota exhausted), the prober backs off to a
-5-minute retry interval until it receives a non-rejected response.
-
-## Deployment
-
-### Systemd
-
-A fully annotated sample unit is in [`deploy/clagentic-router.service`](deploy/clagentic-router.service).
-
-**HOME is required.** The `claude_cli` adapter resolves OAuth credentials from
-`$HOME/.claude/.credentials.json`. Systemd does not set `HOME` for service units by
-default. If it is unset, credential sync fails with an ERROR log and all `claude_cli`
-backends are permanently unauthenticated. Set `HOME` to the home directory of the user
-the service runs as:
-
-```ini
-[Unit]
-Description=Clagentic: Router LLM routing daemon
-After=network.target
-
-[Service]
-User=router
-# HOME must match the User above so the claude_cli adapter can locate OAuth credentials.
-# Adjust to /root, /home/ubuntu, etc. depending on which user owns the Claude session.
-Environment=HOME=/home/router
-ExecStart=/usr/local/bin/clagentic-router serve --config /etc/clagentic/router/router.yaml
-Restart=on-failure
-EnvironmentFile=/etc/clagentic/router/env
-
-[Install]
-WantedBy=multi-user.target
-```
-
-If you use only API-based adapters (`anthropic_api`, `openai_api`) and do not configure
-any `claude_cli` backends, this requirement does not apply.
-
-### Redeploying: `clagentic-router update`
-
-The router is a long-running daemon — landing a change in git does not make it live.
-`clagentic-router update` rebuilds the binary from source, installs it atomically (stage
-+ rename, never an in-place copy over the running binary — avoids "text file busy"), and
-restarts the service. It reuses the same config file `serve` uses (no second config
-surface); every setting is optional and defaults to a stock systemd install:
-
-```yaml
-deploy:
-  source_dir: .                                   # module root to build from (default: cwd)
-  install_path: /usr/local/bin/clagentic-router    # path the running service execs
-  service_name: clagentic-router                   # systemd unit name, without .service
-  service_manager: systemd                         # systemd | none (install only, no restart)
-```
-
-```bash
-clagentic-router update                # uses the resolved config (see "Configuration")
-clagentic-router update --config PATH   # explicit config path
-```
-
-This is the command a project's `.crew/naomi.yaml` `post_merge_steps` should invoke as a
-bare, environment-agnostic verb — all host-specific detail lives in `router.yaml`'s
-`[deploy]` block, not in the committed post-merge step.
-
-### Docker (API-only mode)
-
-```bash
-docker run -p 8765:8765 \
-  -v /etc/clagentic/router/router.yaml:/etc/clagentic/router/router.yaml:ro \
-  -e CLAGENTIC_ROUTER_TOKEN=secret \
-  -e ANTHROPIC_API_KEY=sk-... \
-  clagentic-router
-```
+Full contributor-facing detail (adding an import, error classification
+internals, scoring formula, quota-alert edge-trigger mechanics) is in
+[CLAUDE.md](CLAUDE.md).
 
 ## Build
 
