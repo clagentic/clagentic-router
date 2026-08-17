@@ -251,6 +251,172 @@ func syncSubprocessCreds(subprocessHome string) {
 		"src", src, "dst", dst, "size", srcInfo.Size())
 }
 
+// awsSSOCacheSyncMu guards concurrent AWS SSO cache resync calls, mirroring
+// credsSyncMu's role for .credentials.json. A separate mutex from
+// credsSyncMu because the two syncs touch unrelated source/dest trees and
+// serializing them together would only add contention with no correctness
+// benefit.
+var awsSSOCacheSyncMu sync.Mutex
+
+// awsSSOCacheSyncLastState caches, per source filename, the mtime+size seen
+// on the most recent successful sync — the directory analogue of
+// credsSyncLastInfo. Guarded by awsSSOCacheSyncMu.
+var awsSSOCacheSyncLastState map[string]os.FileInfo
+
+// syncSubprocessAWSSSOCache mirrors ~/.aws/sso/cache/ from the daemon's real
+// HOME into the isolated subprocess HOME, so a Bedrock-fronting AWS profile
+// that resolves via SSO (sso_start_url/sso_session in ~/.aws/config) can
+// resolve short-lived credentials inside the subprocess (lr-6572d5). Without
+// this, the isolated HOME has no .aws directory at all, profile resolution
+// falls through the AWS SDK credential chain to IMDS, and that hangs
+// indefinitely on any non-EC2 host.
+//
+// This syncs ONLY ~/.aws/sso/cache/ — never ~/.aws/config, ~/.aws/credentials,
+// or any other real-HOME state — to avoid regressing the isolation property
+// claudeSubprocessHome exists to provide. AWS_PROFILE/AWS_REGION (env vars,
+// already allowlisted in env.go) still carry which profile/region to use;
+// this sync supplies only the cached token file that profile resolution
+// needs to turn a profile NAME into credentials.
+//
+// Full-directory sync, not single-file: the SDK resolves the cache filename
+// by hashing the profile's sso_start_url, which this function has no reason
+// to duplicate — .claude/.credentials.json above is not selectively synced
+// file-by-file either, and a partial reimplementation of the SDK's hashing
+// scheme would be a second, drifting source of truth for something the SDK
+// already owns.
+//
+// Verified no-op cases (majority deployment):
+//   - OAuth hosts and static-credential Bedrock hosts (AWS_ACCESS_KEY_ID /
+//     AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN) have no ~/.aws/sso/cache at
+//     all — this function stats the source dir, finds it absent, logs at
+//     Debug (not Warn/Error — this is the expected, common case, not a
+//     misconfiguration), and returns without creating anything or touching
+//     the subprocess HOME.
+//   - A source dir that exists but is empty syncs zero files — also a no-op
+//     on the destination.
+//
+// Safe to call unconditionally on every Invoke, same cadence as
+// syncSubprocessCreds: the hot path (unchanged files) costs one Stat per
+// cached filename.
+func syncSubprocessAWSSSOCache(subprocessHome string) {
+	if subprocessHome == "" {
+		return
+	}
+
+	awsSSOCacheSyncMu.Lock()
+	defer awsSSOCacheSyncMu.Unlock()
+
+	daemonHome, err := resolveDaemonHomeFunc()
+	if err != nil {
+		// Same hard-misconfiguration posture as syncSubprocessCreds: HOME is
+		// unresolvable, so there is no source to sync from. Already logged
+		// at ERROR by syncSubprocessCreds in the same Invoke call — avoid a
+		// duplicate ERROR log here for the identical root cause.
+		return
+	}
+	if !filepath.IsAbs(daemonHome) {
+		// Same guard as syncSubprocessCreds — already logged there.
+		return
+	}
+
+	srcDir := filepath.Join(daemonHome, ".aws", "sso", "cache")
+	dstDir := filepath.Join(subprocessHome, ".aws", "sso", "cache")
+
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// The majority-deployment no-op: OAuth hosts and
+			// static-credential Bedrock hosts have no SSO cache at all.
+			// Debug, not Warn — this is expected, not a misconfiguration.
+			slog.Debug("claude_cli: no AWS SSO cache in daemon home; subprocess SSO cache sync skipped",
+				"src", srcDir)
+			return
+		}
+		slog.Warn("claude_cli: could not read AWS SSO cache dir; subprocess copy unchanged",
+			"src", srcDir, "err", err)
+		return
+	}
+
+	if len(entries) == 0 {
+		return
+	}
+
+	if err := os.MkdirAll(dstDir, 0700); err != nil {
+		slog.Warn("claude_cli: could not create subprocess AWS SSO cache dir",
+			"dst", dstDir, "err", err)
+		return
+	}
+
+	// newState is populated ONLY for entries that end this iteration in a
+	// known-good state on disk — either the confirmed-unchanged fast path or
+	// a completed write+rename. It must never record an entry on any failure
+	// branch (stat, read, write, or rename): doing so banks the fresh
+	// mtime+size before the destination actually reflects it, so the next
+	// Invoke's fast path (awsSSOCacheSyncLastState comparison above) would
+	// see a "match" and skip the file permanently, leaving a stale or
+	// missing rotating SSO token silently un-synced. A dropped entry here
+	// simply means the name is absent from next call's fast-path table, so
+	// the next Invoke re-stats and retries it — the safe outcome.
+	newState := make(map[string]os.FileInfo)
+	synced := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue // SSO cache is a flat directory of *.json token files
+		}
+		name := entry.Name()
+
+		srcPath := filepath.Join(srcDir, name)
+		srcInfo, err := os.Stat(srcPath)
+		if err != nil {
+			slog.Warn("claude_cli: could not stat AWS SSO cache entry; skipped",
+				"src", srcPath, "err", err)
+			continue
+		}
+
+		// Fast path: unchanged since last sync (mtime+size), same as
+		// syncSubprocessCreds's step 2. The destination is already known
+		// good from a prior successful sync, so it is safe to re-record here.
+		if prev, ok := awsSSOCacheSyncLastState[name]; ok &&
+			prev.ModTime().Equal(srcInfo.ModTime()) && prev.Size() == srcInfo.Size() {
+			newState[name] = srcInfo
+			continue
+		}
+
+		srcData, err := os.ReadFile(srcPath)
+		if err != nil {
+			slog.Warn("claude_cli: could not read AWS SSO cache entry; skipped",
+				"src", srcPath, "err", err)
+			continue
+		}
+
+		dstPath := filepath.Join(dstDir, name)
+		tmp := dstPath + ".tmp"
+		if err := os.WriteFile(tmp, srcData, 0600); err != nil {
+			slog.Warn("claude_cli: could not write temp AWS SSO cache entry",
+				"tmp", tmp, "err", err)
+			continue
+		}
+		if err := os.Rename(tmp, dstPath); err != nil {
+			slog.Warn("claude_cli: could not rename AWS SSO cache entry into place",
+				"tmp", tmp, "dst", dstPath, "err", err)
+			_ = os.Remove(tmp)
+			continue
+		}
+
+		// Write+rename succeeded — the destination now reflects srcInfo, so
+		// it is safe to record.
+		newState[name] = srcInfo
+		synced++
+	}
+
+	if synced > 0 {
+		slog.Info("claude_cli: refreshed subprocess AWS SSO cache",
+			"src", srcDir, "dst", dstDir, "files_synced", synced)
+	}
+
+	awsSSOCacheSyncLastState = newState
+}
+
 // claudeOutput is the JSON shape of one line in claude --output-format stream-json stdout,
 // and also of the single JSON object from --output-format json (used by codex_subagent).
 // The "result" type carries the final response; "error" carries failure details.
@@ -330,6 +496,12 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 	// error and the backend is marked offline.  syncSubprocessCreds is a no-op when
 	// the source is unchanged (mtime+size fast path).
 	syncSubprocessCreds(claudeSubprocessHome)
+
+	// Mirror the daemon's AWS SSO token cache into the isolated subprocess
+	// HOME (lr-6572d5). No-op on the majority deployment (OAuth hosts and
+	// static-credential Bedrock hosts have no ~/.aws/sso/cache); see
+	// syncSubprocessAWSSSOCache's doc for the full rationale.
+	syncSubprocessAWSSSOCache(claudeSubprocessHome)
 
 	bin := a.resolveBin()
 	if bin == "" {

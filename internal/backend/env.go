@@ -112,6 +112,18 @@ var cliEnvAllowlistLiterals = []string{
 	"CLAUDE_BIN",
 	"CLAUDE_CONFIG_DIR",
 
+	// claude CLI: auth-mode switch. CLAUDE_CODE_USE_BEDROCK=1 tells the CLI
+	// to authenticate via the AWS Bedrock credential chain instead of OAuth.
+	// Its absence here previously caused buildCLIEnv to strip it silently,
+	// so a Bedrock-fronted host's claude_cli/codex_subagent subprocess fell
+	// through to OAuth auth and failed with "Failed to authenticate: OAuth
+	// session expired and could not be refreshed" — a message that reads
+	// like a stale token but is actually wrong-auth-mode (lr-6572d5). Not
+	// secret-shaped (a boolean mode switch, not a credential), so literal
+	// admission carries the same exposure profile as the AWS_* set below,
+	// which this var's presence is meaningless without.
+	"CLAUDE_CODE_USE_BEDROCK",
+
 	// codex CLI: binary override (binpath.go) and auth/config home
 	// (codex_discovery.go's codexConfigPath, ~/.codex/config.toml and
 	// auth.json resolution for both OAuth-session and Bedrock-env auth).

@@ -496,9 +496,9 @@ X-Router-Fallback-Reason: rate_limit   # only when chain was advanced
 
 | Type | Auth | Notes |
 |---|---|---|
-| `claude_cli` | OAuth (keychain) | Requires `claude` binary on PATH; emits `rate_limit_event` with live utilization on every response — captured and persisted automatically; supports `quota_probe` config block to poll utilization on a configurable interval when idle |
+| `claude_cli` | OAuth (keychain) or AWS Bedrock (`CLAUDE_CODE_USE_BEDROCK=1`) | Requires `claude` binary on PATH; emits `rate_limit_event` with live utilization on every response — captured and persisted automatically; supports `quota_probe` config block to poll utilization on a configurable interval when idle. Bedrock auth: see "AWS Bedrock auth for `claude_cli`/`codex_subagent`" below — this row is a stopgap pointer, not the full writeup (tracked for a fuller pass in lr-8453ba) |
 | `codex_cli` | OAuth (keychain) | Requires `codex` binary on PATH |
-| `codex_subagent` | OAuth (via Claude) | Requires Claude with codex agent installed |
+| `codex_subagent` | OAuth (via Claude) or AWS Bedrock (via Claude) | Requires Claude with codex agent installed; shares `claude_cli`'s Bedrock auth path since it invokes the same `claude` binary through the same isolated subprocess HOME |
 | `gemini_cli` | OAuth (keychain) or `GEMINI_API_KEY` | Requires `gemini` binary on PATH; run `gemini auth login` |
 | `ollama_http` | None | Local or remote Ollama server |
 | `anthropic_api` | API key | Direct Anthropic Messages API |
@@ -506,6 +506,50 @@ X-Router-Fallback-Reason: rate_limit   # only when chain was advanced
 | `bedrock_api` | AWS SDK credential chain | AWS Bedrock Converse API — see [AWS Bedrock (`bedrock_api`)](#aws-bedrock-bedrock_api) below |
 
 CLI adapters (`claude_cli`, `codex_cli`, `codex_subagent`, `gemini_cli`) must run on the host where the OAuth sessions are stored. They cannot run in a container. For containerized deployment, use only API-based adapters.
+
+### AWS Bedrock auth for `claude_cli`/`codex_subagent`
+
+`claude_cli` and `codex_subagent` both invoke the `claude` binary, which supports
+authenticating via AWS Bedrock as an alternative to OAuth
+(`CLAUDE_CODE_USE_BEDROCK=1`, standard AWS SDK credential chain). Two things must
+both be true for this to work through the router's isolated subprocess HOME
+(`claudeSubprocessHome`, see `CLAUDE.md`'s "Subprocess cwd contract"):
+
+1. **`CLAUDE_CODE_USE_BEDROCK` must reach the subprocess.** It is in
+   `cliEnvAllowlistLiterals` (`internal/backend/env.go`) alongside the AWS SDK
+   standard credential/config vars — set it in the daemon's own environment (not
+   `router.yaml`) the same way any other AWS SDK var is set.
+2. **An SSO-based Bedrock-fronting AWS profile needs its cached token mirrored
+   into the isolated HOME.** `AWS_PROFILE`/`AWS_REGION` only *name* a profile;
+   resolving an SSO profile into short-lived credentials requires
+   `~/.aws/sso/cache/*.json` — a file, not an env var — which the isolated
+   subprocess HOME does not have by default. `syncSubprocessAWSSSOCache`
+   (`internal/backend/claude_cli.go`) mirrors that one directory from the
+   daemon's real HOME into the isolated HOME on every Invoke, the same way
+   `syncSubprocessCreds` keeps OAuth credentials current. It syncs **only**
+   `~/.aws/sso/cache/` — never `~/.aws/config`, `~/.aws/credentials`, or any
+   other real-HOME state — to preserve the isolation property. A
+   static-credential Bedrock profile (`AWS_ACCESS_KEY_ID`/
+   `AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN`, already allowlisted) needs only
+   item 1; item 2 is SSO-specific.
+
+**Verified no-op for every other deployment shape.** A host with no
+`~/.aws/sso/cache` directory (OAuth hosts, static-credential Bedrock hosts — the
+majority deployment) hits `syncSubprocessAWSSSOCache`'s absent-source path: it
+logs at `Debug` and returns without creating anything in the subprocess HOME.
+`codex_cli` and `gemini_cli` set no HOME override at all, so they already read
+the daemon's real `~/.aws` directly — no code change touches either. `bedrock_api`
+is an in-process AWS SDK call with no subprocess — structurally unaffected.
+`anthropic_api`/`openai_api`/`ollama_http` have no subprocess and no AWS
+involvement at all.
+
+**Operator-dependent verification.** This was built and tested with unit
+coverage against a temp-directory fake HOME (`internal/backend/claude_cli_test.go`)
+and is not verified end-to-end against a live Bedrock-fronted SSO profile from
+this build environment — the same caveat the `bedrock_api` adapter below
+already carries for its own Bedrock path. If you enable this and the router
+still cannot authenticate on your host, capture the CLI's stderr/exit code and
+file it.
 
 ### AWS Bedrock (`bedrock_api`)
 
