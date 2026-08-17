@@ -68,6 +68,16 @@ func (a *CodexSubagentAdapter) refreshBin() string {
 
 // Invoke calls claude -p --agent codex with CLAGENTIC_CODEX_TIER set.
 func (a *CodexSubagentAdapter) Invoke(ctx context.Context, req *Request) (*Response, error) {
+	// codex_subagent invokes the same claude binary, via the same isolated
+	// claudeSubprocessHome, as claude_cli — so it shares claude_cli's
+	// Bedrock-auth gaps identically: CLAUDE_CODE_USE_BEDROCK must survive
+	// buildCLIEnv's filter (env.go, shared by both adapters), and the
+	// isolated HOME needs the same AWS SSO cache mirror claude_cli.go
+	// provides, for the identical reason (lr-6572d5). No adapter-specific
+	// logic needed here beyond calling the shared sync functions.
+	syncSubprocessCreds(claudeSubprocessHome)
+	syncSubprocessAWSSSOCache(claudeSubprocessHome)
+
 	bin := a.resolveBin()
 	if bin == "" {
 		return nil, &InvokeError{Type: ErrTypeNotFound, Raw: "claude binary not found (required for codex_subagent adapter)"}
