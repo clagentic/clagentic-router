@@ -32,7 +32,7 @@ func TestClaudeCLI_SettingSourcesUserFlagPresent(t *testing.T) {
 	}
 	binPath := writeFakeBin(t, dir, "claude", string(claudeSuccess()))
 
-	adapter := NewClaudeCLIAdapter("test", "", binPath, "", ThinkingOff)
+	adapter := NewClaudeCLIAdapter("test", "", binPath, "", ThinkingOff, 0)
 	req := &Request{Messages: []Message{{Role: "user", Content: "ping"}}}
 
 	if _, err := adapter.Invoke(context.Background(), req); err != nil {
@@ -54,7 +54,7 @@ func TestCodexSubagent_SettingSourcesUserFlagPresent(t *testing.T) {
 	}
 	binPath := writeFakeBin(t, dir, "claude", string(claudeSuccess()))
 
-	adapter := NewCodexSubagentAdapter("test", "flagship", binPath)
+	adapter := NewCodexSubagentAdapter("test", "flagship", binPath, 0)
 	req := &Request{Messages: []Message{{Role: "user", Content: "ping"}}}
 
 	if _, err := adapter.Invoke(context.Background(), req); err != nil {
@@ -105,7 +105,7 @@ func TestClaudeCLI_NoTrustFileWritten(t *testing.T) {
 	}
 	binPath := writeFakeBin(t, dir, "claude", string(claudeSuccess()))
 
-	adapter := NewClaudeCLIAdapter("test", "", binPath, "", ThinkingOff)
+	adapter := NewClaudeCLIAdapter("test", "", binPath, "", ThinkingOff, 0)
 	req := &Request{
 		Messages:   []Message{{Role: "user", Content: "ping"}},
 		WorkingDir: t.TempDir(),

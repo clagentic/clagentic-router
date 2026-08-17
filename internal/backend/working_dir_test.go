@@ -63,7 +63,7 @@ func TestClaudeCLI_WorkingDir(t *testing.T) {
 		cwdFile := filepath.Join(dir, "cwd.txt")
 		binPath := writeFakeBinWithCwd(t, dir, "claude", string(claudeSuccess()), cwdFile)
 
-		adapter := NewClaudeCLIAdapter("test", "", binPath, "", ThinkingOff)
+		adapter := NewClaudeCLIAdapter("test", "", binPath, "", ThinkingOff, 0)
 		req := &Request{Messages: []Message{{Role: "user", Content: "ping"}}, WorkingDir: wantCwd}
 
 		if _, err := adapter.Invoke(context.Background(), req); err != nil {
@@ -80,7 +80,7 @@ func TestClaudeCLI_WorkingDir(t *testing.T) {
 		cwdFile := filepath.Join(dir, "cwd.txt")
 		binPath := writeFakeBinWithCwd(t, dir, "claude", string(claudeSuccess()), cwdFile)
 
-		adapter := NewClaudeCLIAdapter("test", "", binPath, "", ThinkingOff)
+		adapter := NewClaudeCLIAdapter("test", "", binPath, "", ThinkingOff, 0)
 		req := &Request{Messages: []Message{{Role: "user", Content: "ping"}}}
 
 		if _, err := adapter.Invoke(context.Background(), req); err != nil {
@@ -143,7 +143,7 @@ func TestCodexSubagent_WorkingDir(t *testing.T) {
 		cwdFile := filepath.Join(dir, "cwd.txt")
 		binPath := writeFakeBinWithCwd(t, dir, "claude", string(claudeSuccess()), cwdFile)
 
-		adapter := NewCodexSubagentAdapter("test", "flagship", binPath)
+		adapter := NewCodexSubagentAdapter("test", "flagship", binPath, 0)
 		req := &Request{Messages: []Message{{Role: "user", Content: "ping"}}, WorkingDir: wantCwd}
 
 		if _, err := adapter.Invoke(context.Background(), req); err != nil {
@@ -160,7 +160,7 @@ func TestCodexSubagent_WorkingDir(t *testing.T) {
 		cwdFile := filepath.Join(dir, "cwd.txt")
 		binPath := writeFakeBinWithCwd(t, dir, "claude", string(claudeSuccess()), cwdFile)
 
-		adapter := NewCodexSubagentAdapter("test", "flagship", binPath)
+		adapter := NewCodexSubagentAdapter("test", "flagship", binPath, 0)
 		req := &Request{Messages: []Message{{Role: "user", Content: "ping"}}}
 
 		if _, err := adapter.Invoke(context.Background(), req); err != nil {
