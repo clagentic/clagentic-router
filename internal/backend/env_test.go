@@ -194,6 +194,11 @@ func TestCLIEnvAllowed_PrefixMatch(t *testing.T) {
 		// blocked — proves this is literal matching, not a disguised
 		// AWS_ prefix.
 		{"AWS_UNLISTED_MADE_UP_VAR=x", false},
+		// claude CLI auth-mode switch (lr-6572d5): must survive the filter
+		// or a Bedrock-fronted claude_cli/codex_subagent host silently falls
+		// through to OAuth auth and fails with a misleading "OAuth session
+		// expired" error.
+		{"CLAUDE_CODE_USE_BEDROCK=1", true},
 		// Google Cloud SDK / Vertex AI credential vars: kept because
 		// gemini_cli is a live adapter and none of these is raw secret
 		// material (file paths / project ids only).
