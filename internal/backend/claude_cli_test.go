@@ -616,6 +616,277 @@ func TestSyncSubprocessAWSSSOCache_SubprocessHomeEmpty(t *testing.T) {
 	syncSubprocessAWSSSOCache("")
 }
 
+// TestSyncSubprocessAWSSSOCache_TransientFailureThenRecovery is the
+// regression test for the fold-in blocking defect (lr-6572d5, PEACHES PR #51
+// comment 5316767900, corrected mechanism per HOLDEN's lr-6572d5 comment #2):
+// newState was previously recorded at the os.Stat step, before the
+// write+rename that actually updates the destination. Every failure branch
+// after that point (ReadFile, WriteFile, Rename) did a bare `continue` with
+// the fresh mtime+size already banked, so a transient failure caused the
+// next call's fast path to treat the file as "already synced" and skip it
+// forever — even though the destination was never actually written.
+//
+// This test forces a transient failure at the write step on the FIRST sync
+// — via a filename collision (the destination's "<name>.tmp" path
+// pre-occupied by a directory, so os.WriteFile fails with EISDIR
+// regardless of process privilege, unlike a permission-bit-based failure
+// which root bypasses) — then clears the collision and calls again. It
+// asserts on observable destination file content, not on internal
+// bookkeeping (awsSSOCacheSyncLastState) — a passing assertion on the
+// internal map would not have caught the original bug, since the bug was
+// precisely that the map disagreed with the filesystem.
+func TestSyncSubprocessAWSSSOCache_TransientFailureThenRecovery(t *testing.T) {
+	resetAWSSSOCacheSyncState()
+
+	daemonHome := t.TempDir()
+	subprocessHome := t.TempDir()
+
+	srcDir := filepath.Join(daemonHome, ".aws", "sso", "cache")
+	if err := os.MkdirAll(srcDir, 0700); err != nil {
+		t.Fatalf("mkdir src dir: %v", err)
+	}
+	tokenFile := filepath.Join(srcDir, "token.json")
+	freshContent := []byte(`{"accessToken":"fresh-after-recovery"}`)
+	if err := os.WriteFile(tokenFile, freshContent, 0600); err != nil {
+		t.Fatalf("write src token: %v", err)
+	}
+
+	t.Setenv("HOME", daemonHome)
+
+	dstDir := filepath.Join(subprocessHome, ".aws", "sso", "cache")
+	if err := os.MkdirAll(dstDir, 0700); err != nil {
+		t.Fatalf("mkdir dst dir: %v", err)
+	}
+	// Pre-create token.json's tmp path AS A DIRECTORY so its os.WriteFile
+	// (into "token.json.tmp") fails on the first sync, isolating the
+	// write+rename failure branch specifically.
+	tmpAsDir := filepath.Join(dstDir, "token.json.tmp")
+	if err := os.MkdirAll(tmpAsDir, 0700); err != nil {
+		t.Fatalf("mkdir tmp collision dir: %v", err)
+	}
+
+	syncSubprocessAWSSSOCache(subprocessHome)
+
+	dst := filepath.Join(dstDir, "token.json")
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatalf("precondition failed: dst should not exist after a forced write failure, stat err=%v", err)
+	}
+
+	// Clear the collision and resync — the fix under test requires this
+	// second call to actually write the file, because the first call must
+	// NOT have recorded it into newState/awsSSOCacheSyncLastState.
+	if err := os.RemoveAll(tmpAsDir); err != nil {
+		t.Fatalf("remove tmp collision dir: %v", err)
+	}
+
+	syncSubprocessAWSSSOCache(subprocessHome)
+
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read dst after recovery sync: %v — the transient-failure entry was permanently skipped (the fold-in defect)", err)
+	}
+	if string(got) != string(freshContent) {
+		t.Errorf("dst content after recovery = %q, want %q", got, freshContent)
+	}
+}
+
+// TestSyncSubprocessAWSSSOCache_StaleEntryCleanup verifies that when one
+// source file is deleted from the daemon's real HOME while a sibling
+// remains (so srcDir is non-empty and the sync loop actually runs), the
+// deleted name's stale awsSSOCacheSyncLastState entry does not persist
+// across calls in a way that would mask a later re-appearance of a
+// differently-timestamped file of the same name. The destination copy from
+// the prior sync is not deleted (this function has no delete/prune step —
+// full-directory sync mirrors additively) but the internal state for the
+// removed name must not wedge future syncs of that name.
+//
+// A sibling file is kept present throughout so srcDir never goes fully
+// empty — an all-deleted srcDir hits the pre-existing "len(entries) == 0"
+// early return (claude_cli.go), which is separate, pre-existing behavior
+// this fold-in does not change and is out of scope here.
+func TestSyncSubprocessAWSSSOCache_StaleEntryCleanup(t *testing.T) {
+	resetAWSSSOCacheSyncState()
+
+	daemonHome := t.TempDir()
+	subprocessHome := t.TempDir()
+
+	srcDir := filepath.Join(daemonHome, ".aws", "sso", "cache")
+	if err := os.MkdirAll(srcDir, 0700); err != nil {
+		t.Fatalf("mkdir src dir: %v", err)
+	}
+	tokenFile := filepath.Join(srcDir, "token.json")
+	originalContent := []byte(`{"accessToken":"will-be-deleted"}`)
+	if err := os.WriteFile(tokenFile, originalContent, 0600); err != nil {
+		t.Fatalf("write src token: %v", err)
+	}
+	siblingFile := filepath.Join(srcDir, "sibling.json")
+	siblingContent := []byte(`{"accessToken":"sibling-stays"}`)
+	if err := os.WriteFile(siblingFile, siblingContent, 0600); err != nil {
+		t.Fatalf("write sibling src token: %v", err)
+	}
+
+	t.Setenv("HOME", daemonHome)
+	syncSubprocessAWSSSOCache(subprocessHome)
+
+	dst := filepath.Join(subprocessHome, ".aws", "sso", "cache", "token.json")
+	if _, err := os.Stat(dst); err != nil {
+		t.Fatalf("expected dst present after first sync: %v", err)
+	}
+
+	// Delete the source file, simulating an SSO profile removed from the
+	// daemon HOME (e.g. "aws sso logout" clearing the cache entry), while
+	// the sibling remains so srcDir is non-empty on the next call.
+	if err := os.Remove(tokenFile); err != nil {
+		t.Fatalf("remove src token: %v", err)
+	}
+
+	syncSubprocessAWSSSOCache(subprocessHome)
+
+	awsSSOCacheSyncMu.Lock()
+	_, stillTracked := awsSSOCacheSyncLastState["token.json"]
+	awsSSOCacheSyncMu.Unlock()
+	if stillTracked {
+		t.Error("deleted source entry still present in awsSSOCacheSyncLastState after resync; " +
+			"a same-name file reappearing with a coincidentally matching mtime+size could be masked")
+	}
+
+	// Re-create the source file with genuinely different content and mtime
+	// and confirm it is picked up as a fresh sync, not skipped as "already
+	// current" from stale bookkeeping.
+	newContent := []byte(`{"accessToken":"re-added-after-delete"}`)
+	if err := os.WriteFile(tokenFile, newContent, 0600); err != nil {
+		t.Fatalf("re-write src token: %v", err)
+	}
+
+	syncSubprocessAWSSSOCache(subprocessHome)
+
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read dst after re-add: %v", err)
+	}
+	if string(got) != string(newContent) {
+		t.Errorf("dst content after re-add = %q, want %q", got, newContent)
+	}
+}
+
+// TestSyncSubprocessAWSSSOCache_MultiFileErrorScatter verifies that when N
+// source files sync and exactly one fails (via an unwritable destination
+// filename collision — see below), the failed entry is retried on the next
+// call while the successful ones are not spuriously rewritten in the
+// meantime. This is the multi-file analogue of
+// TestSyncSubprocessAWSSSOCache_TransientFailureThenRecovery and guards
+// against a fix that only handles the single-file case.
+func TestSyncSubprocessAWSSSOCache_MultiFileErrorScatter(t *testing.T) {
+	resetAWSSSOCacheSyncState()
+
+	daemonHome := t.TempDir()
+	subprocessHome := t.TempDir()
+
+	srcDir := filepath.Join(daemonHome, ".aws", "sso", "cache")
+	if err := os.MkdirAll(srcDir, 0700); err != nil {
+		t.Fatalf("mkdir src dir: %v", err)
+	}
+
+	goodAContent := []byte(`{"accessToken":"good-a"}`)
+	goodBContent := []byte(`{"accessToken":"good-b"}`)
+	failContent := []byte(`{"accessToken":"fail-c-first-attempt"}`)
+	if err := os.WriteFile(filepath.Join(srcDir, "good-a.json"), goodAContent, 0600); err != nil {
+		t.Fatalf("write good-a: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "good-b.json"), goodBContent, 0600); err != nil {
+		t.Fatalf("write good-b: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "fail-c.json"), failContent, 0600); err != nil {
+		t.Fatalf("write fail-c: %v", err)
+	}
+
+	t.Setenv("HOME", daemonHome)
+
+	dstDir := filepath.Join(subprocessHome, ".aws", "sso", "cache")
+	if err := os.MkdirAll(dstDir, 0700); err != nil {
+		t.Fatalf("mkdir dst dir: %v", err)
+	}
+	// Pre-create fail-c.json's tmp path AS A DIRECTORY so its os.WriteFile
+	// (into "<name>.tmp") fails with EISDIR, while good-a/good-b's tmp
+	// writes succeed normally — isolating one failing entry among several
+	// successful ones in the same sync pass.
+	failTmpAsDir := filepath.Join(dstDir, "fail-c.json.tmp")
+	if err := os.MkdirAll(failTmpAsDir, 0700); err != nil {
+		t.Fatalf("mkdir fail-c tmp collision dir: %v", err)
+	}
+
+	syncSubprocessAWSSSOCache(subprocessHome)
+
+	goodADst := filepath.Join(dstDir, "good-a.json")
+	goodBDst := filepath.Join(dstDir, "good-b.json")
+	failDst := filepath.Join(dstDir, "fail-c.json")
+
+	gotA, err := os.ReadFile(goodADst)
+	if err != nil {
+		t.Fatalf("read good-a after first sync: %v", err)
+	}
+	if string(gotA) != string(goodAContent) {
+		t.Errorf("good-a content = %q, want %q", gotA, goodAContent)
+	}
+	gotB, err := os.ReadFile(goodBDst)
+	if err != nil {
+		t.Fatalf("read good-b after first sync: %v", err)
+	}
+	if string(gotB) != string(goodBContent) {
+		t.Errorf("good-b content = %q, want %q", gotB, goodBContent)
+	}
+	if _, err := os.Stat(failDst); !os.IsNotExist(err) {
+		t.Fatalf("precondition failed: fail-c.json should not exist as a regular file yet, stat err=%v", err)
+	}
+
+	// Record good-a/good-b dst mtimes so we can assert they are not
+	// spuriously rewritten by the second call (fast path should hold for
+	// them; only fail-c should actually be retried).
+	infoA1, err := os.Stat(goodADst)
+	if err != nil {
+		t.Fatalf("stat good-a after first sync: %v", err)
+	}
+	infoB1, err := os.Stat(goodBDst)
+	if err != nil {
+		t.Fatalf("stat good-b after first sync: %v", err)
+	}
+
+	// Clear the collision so fail-c.json's write can succeed on retry.
+	if err := os.RemoveAll(failTmpAsDir); err != nil {
+		t.Fatalf("remove fail-c tmp collision dir: %v", err)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	syncSubprocessAWSSSOCache(subprocessHome)
+
+	// fail-c must now be retried and present.
+	gotFail, err := os.ReadFile(failDst)
+	if err != nil {
+		t.Fatalf("read fail-c after retry sync: %v — the failed entry was not retried (fold-in defect)", err)
+	}
+	if string(gotFail) != string(failContent) {
+		t.Errorf("fail-c content after retry = %q, want %q", gotFail, failContent)
+	}
+
+	// good-a/good-b must NOT have been rewritten (mtime unchanged) — the
+	// fast path should have held for them since their source files never
+	// changed.
+	infoA2, err := os.Stat(goodADst)
+	if err != nil {
+		t.Fatalf("stat good-a after second sync: %v", err)
+	}
+	if !infoA1.ModTime().Equal(infoA2.ModTime()) {
+		t.Error("good-a mtime changed on second sync; expected fast-path no-op for an unchanged, already-synced entry")
+	}
+	infoB2, err := os.Stat(goodBDst)
+	if err != nil {
+		t.Fatalf("stat good-b after second sync: %v", err)
+	}
+	if !infoB1.ModTime().Equal(infoB2.ModTime()) {
+		t.Error("good-b mtime changed on second sync; expected fast-path no-op for an unchanged, already-synced entry")
+	}
+}
+
 // TestClaudeCLI_Invoke_BedrockEnvSurvivesFilter proves, at the actual Invoke
 // call site (not buildCLIEnv in isolation), that CLAUDE_CODE_USE_BEDROCK
 // survives into the real claude_cli subprocess env — the gap this task
