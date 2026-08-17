@@ -35,6 +35,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -463,6 +464,87 @@ type claudeOutput struct {
 	// Error fields (when type="error")
 	Error   string `json:"error"`
 	Message string `json:"message"`
+
+	// IsError, TerminalReason, NumTurns, and Errors surface a --max-turns
+	// budget exhaustion (lr-39ed6b): the CLI still emits a "result" line in
+	// this case (not a bare "error" line), with IsError=true,
+	// TerminalReason="max_turns", and Errors containing a human-readable
+	// "Reached maximum number of turns (N)" message — the model's answer,
+	// if it had one, is stranded in an unreturned tool_result and never
+	// reaches Result. Before this field set existed, nothing in this
+	// adapter read terminal_reason/errors/num_turns at all, so this exit
+	// shape fell through to ErrTypeUnknown identically to an auth failure,
+	// a network error, or a crashed subprocess (HOLDEN's grep against
+	// merged main found zero matches for any of these field names).
+	IsError        bool     `json:"is_error"`
+	TerminalReason string   `json:"terminal_reason"`
+	NumTurns       int      `json:"num_turns"`
+	Errors         []string `json:"errors"`
+}
+
+// DefaultMaxTurns is the --max-turns ceiling used by claude_cli and
+// codex_subagent when a backend's config leaves max_turns unset (0). Both
+// adapters invoke the same claude binary and share this default.
+//
+// Why 5, not 1: Claude Code counts a tool-use step as consuming a turn, so
+// --max-turns 1 spends the entire budget on a single tool call and leaves
+// zero turns for the model to turn that tool_result into a final text
+// answer — the CLI exits is_error:true / terminal_reason:max_turns with a
+// correct answer stranded, unreturned, in a tool_result block (lr-39ed6b
+// live-host reproduction: identical call succeeds at num_turns:2 with
+// --max-turns 3). 1 is not "tight but workable" for any tool-using prompt;
+// it is categorically broken for one.
+//
+// Why 5, not unbounded: this repo's Reviewer/Auditor chain prompts
+// (router.yaml) instruct the model to check callers, imports, and tests —
+// inherently multi-tool work. A handful of read/grep-style tool calls plus
+// a final text answer is the expected shape for that workload; 5 gives
+// headroom for several such rounds without adopting a policy of "however
+// many turns the model wants." The router already bounds the cost and
+// duration of a runaway loop through mechanisms independent of this flag:
+// BackendConfig.TimeoutSeconds (per-call wall-clock timeout, default 3
+// minutes) caps how long any single Invoke can run regardless of how many
+// turns it consumes, and the wire request body itself is bounded by
+// MaxBytesReader at the HTTP boundary. So the marginal risk of raising this
+// ceiling is more API calls billed per invocation (bounded by the timeout
+// long before it becomes "unbounded"), not an unbounded loop — a materially
+// different, and much smaller, risk than the ceiling's absence implied.
+//
+// Per-backend override (BackendConfig.MaxTurns) exists because a
+// reviewer-chain backend and a quick-classification backend want different
+// ceilings — CLAUDE.md's breadth principle argues against baking one
+// workload's assumption into a shared daemon serving heterogeneous chains.
+// Explicit config always wins, byte-identically: resolveMaxTurns only
+// applies this default when the configured value is <= 0.
+const DefaultMaxTurns = 5
+
+// resolveMaxTurns returns configured when it is a positive value, else
+// DefaultMaxTurns. Shared by claude_cli and codex_subagent so both adapters'
+// --max-turns resolution is identical by construction, not by convention.
+func resolveMaxTurns(configured int) int {
+	if configured > 0 {
+		return configured
+	}
+	return DefaultMaxTurns
+}
+
+// isMaxTurnsTermination reports whether a claudeOutput result line represents
+// a --max-turns budget exhaustion rather than a normal completion or a
+// different kind of error. Checked via TerminalReason first (the CLI's own
+// structured field); Errors is a fallback for CLI versions/shapes where
+// TerminalReason may be absent but the human-readable message is still
+// present, matching the reporter's live capture
+// ("Reached maximum number of turns (1)").
+func isMaxTurnsTermination(o *claudeOutput) bool {
+	if o.TerminalReason == "max_turns" {
+		return true
+	}
+	for _, e := range o.Errors {
+		if strings.Contains(strings.ToLower(e), "maximum number of turns") {
+			return true
+		}
+	}
+	return false
 }
 
 // ClaudeCLIAdapter calls the claude CLI subprocess.
@@ -471,6 +553,7 @@ type ClaudeCLIAdapter struct {
 	model        string
 	effort       EffortLevel
 	thinkingMode ThinkingMode
+	maxTurns     int
 	timeout      func() interface{} // unused; timeout via context
 
 	mu      sync.Mutex
@@ -480,8 +563,13 @@ type ClaudeCLIAdapter struct {
 // NewClaudeCLIAdapter creates a new adapter for the given backend ID and model.
 // binPathOverride is the explicit path to the binary (empty = auto-resolve).
 // effort and thinkingMode are noted at construction; see Invoke for current support status.
-func NewClaudeCLIAdapter(id, model, binPathOverride string, effort EffortLevel, thinkingMode ThinkingMode) *ClaudeCLIAdapter {
-	a := &ClaudeCLIAdapter{id: id, model: model, effort: effort, thinkingMode: thinkingMode}
+// maxTurns is the --max-turns ceiling; <= 0 resolves to DefaultMaxTurns at
+// Invoke time via resolveMaxTurns — see DefaultMaxTurns's doc for the full
+// reasoning and CLAUDE.md's "explicit config always wins" guarantee this
+// mirrors (a positive configured value is honored byte-identically, no
+// default ever substituted).
+func NewClaudeCLIAdapter(id, model, binPathOverride string, effort EffortLevel, thinkingMode ThinkingMode, maxTurns int) *ClaudeCLIAdapter {
+	a := &ClaudeCLIAdapter{id: id, model: model, effort: effort, thinkingMode: thinkingMode, maxTurns: maxTurns}
 	// Resolve and log the binary path at construction time so misconfigurations
 	// surface in the startup log rather than silently at first invoke.
 	a.binPath = ResolveBinPath("claude", binPathOverride, "CLAUDE_BIN")
@@ -601,7 +689,11 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 		"--verbose",
 		"--setting-sources", "user",
 		"--output-format", "stream-json",
-		"--max-turns", "1",
+		// See DefaultMaxTurns's doc for why this is not "1" and why it is
+		// not unbounded (lr-39ed6b). a.maxTurns is per-backend config
+		// (BackendConfig.MaxTurns); <= 0 resolves to DefaultMaxTurns —
+		// explicit config always wins, byte-identically.
+		"--max-turns", strconv.Itoa(resolveMaxTurns(a.maxTurns)),
 	}
 	if a.model != "" {
 		args = append(args, "--model", a.model)
@@ -742,11 +834,33 @@ func parseStreamJSON(data []byte, req *Request, backendID string) (*Response, er
 		}, nil
 	}
 
+	// max_turns budget exhaustion (lr-39ed6b): checked before the generic
+	// error-type branch below because a max_turns exit is not necessarily
+	// carried as type="error" — the reporter's live capture showed
+	// is_error:true, terminal_reason:max_turns on an otherwise normal
+	// "result" line. Classified as ErrTypeMaxTurns rather than falling
+	// through to ClassifyError's generic pattern match (which has no
+	// max_turns pattern and would return ErrTypeUnknown) or being silently
+	// treated as success — the model may have produced a correct answer in
+	// an intermediate tool_result, but that result was never returned as
+	// text, so this is a real, distinctly-labeled failure, not a degraded
+	// success.
+	if isMaxTurnsTermination(resultLine) {
+		raw := strings.Join(resultLine.Errors, "; ")
+		if raw == "" {
+			raw = fmt.Sprintf("claude CLI terminated: terminal_reason=max_turns num_turns=%d", resultLine.NumTurns)
+		}
+		return nil, &InvokeError{Type: ErrTypeMaxTurns, Raw: truncate(raw, 500)}
+	}
+
 	// Handle error type carried in the result line itself
-	if resultLine.Type == "error" || resultLine.Error != "" {
+	if resultLine.Type == "error" || resultLine.Error != "" || resultLine.IsError {
 		raw := resultLine.Error
 		if raw == "" {
 			raw = resultLine.Message
+		}
+		if raw == "" && len(resultLine.Errors) > 0 {
+			raw = strings.Join(resultLine.Errors, "; ")
 		}
 		errType := ClassifyError(raw, 0)
 		return nil, &InvokeError{Type: errType, Raw: truncate(raw, 500)}
