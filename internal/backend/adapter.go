@@ -56,6 +56,15 @@ type Request struct {
 	// this field exists to fix for the next caller. It is set only from an
 	// explicit, validated wire request field (see ResolveWorkingDir).
 	WorkingDir string
+	// HasTools records only whether the wire request carried a non-empty
+	// tools field — never the tool definitions themselves. Set by the server
+	// layer's hasTools() presence check (handlers.go / messages.go) before
+	// backend.Request is constructed. The router forwards this bit into
+	// call_log (store.CallLogInput.ToolsPresent) so "who is sending tools at
+	// routed chains" is answerable without persisting tool names, schemas,
+	// or any other request body content (lr-4aaf2a). Adapters ignore this
+	// field entirely today — it exists for observability, not dispatch.
+	HasTools bool
 }
 
 // DefaultWorkingDir is the cmd.Dir every subprocess adapter uses when the

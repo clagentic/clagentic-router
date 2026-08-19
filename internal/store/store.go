@@ -60,7 +60,13 @@ CREATE TABLE IF NOT EXISTS call_log (
     request_id            TEXT NOT NULL DEFAULT '',     -- HTTP request_id for correlation
     rate_limit_type       TEXT NOT NULL DEFAULT '',     -- active bucket at routing time (seven_day, five_hour, etc.)
     utilization           REAL,                         -- utilization at routing time; NULL if unknown
-    fallback_count        INTEGER NOT NULL DEFAULT 0    -- number of backends tried before this one
+    fallback_count        INTEGER NOT NULL DEFAULT 0,   -- number of backends tried before this one
+    -- tools_present is a presence bit ONLY (0/1) — never tool names, schemas,
+    -- or request body content. Added lr-4aaf2a so routed-mode tool-bearing
+    -- traffic is distinguishable in call_log, including the 422-refusal path
+    -- (outcome='refused_no_tool_capable_backend') where Route() is never
+    -- called and no other row would otherwise be written for the request.
+    tools_present         INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS call_log_ts      ON call_log(ts);
@@ -125,6 +131,8 @@ func migrateCallLog(db *sql.DB) error {
 		`ALTER TABLE call_log ADD COLUMN rate_limit_type TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE call_log ADD COLUMN utilization REAL`,
 		`ALTER TABLE call_log ADD COLUMN fallback_count INTEGER NOT NULL DEFAULT 0`,
+		// tools_present (lr-4aaf2a) — presence bit only, see schema comment above.
+		`ALTER TABLE call_log ADD COLUMN tools_present INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, m := range migrations {
 		if _, err := db.Exec(m); err != nil {
@@ -255,6 +263,9 @@ type CallLogInput struct {
 	RateLimitType string   // active quota bucket at routing time
 	Utilization   *float64 // utilization at routing time; nil if unknown
 	FallbackCount int      // backends tried before this one succeeded/failed
+	// ToolsPresent records only whether the request carried a non-empty tools
+	// field — never tool names, schemas, or request body content (lr-4aaf2a).
+	ToolsPresent bool
 }
 
 // LogCall appends one row to the call log.
@@ -262,12 +273,14 @@ func (s *Store) LogCall(in CallLogInput) {
 	_, err := s.db.Exec(`
 		INSERT INTO call_log (ts, backend_id, tier_alias, chain_position, outcome, error_type,
 		                      prompt_tokens_est, completion_tokens_est, latency_ms, cost_usd_est,
-		                      model, score, request_id, rate_limit_type, utilization, fallback_count)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		                      model, score, request_id, rate_limit_type, utilization, fallback_count,
+		                      tools_present)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		time.Now().UTC().Format(time.RFC3339),
 		in.BackendID, in.TierAlias, in.ChainPosition, in.Outcome, in.ErrorType,
 		in.PromptTokensEst, in.CompletionTokensEst, in.LatencyMS, in.CostUSD,
 		in.Model, in.Score, in.RequestID, in.RateLimitType, in.Utilization, in.FallbackCount,
+		boolToInt(in.ToolsPresent),
 	)
 	if err != nil {
 		slog.Warn("store: log_call failed", "err", err)
@@ -297,7 +310,8 @@ func (s *Store) RecentCalls(f CallLogFilter) ([]CallLogRow, error) {
 
 	q := `SELECT ts, backend_id, tier_alias, chain_position, outcome, error_type,
 	             prompt_tokens_est, completion_tokens_est, latency_ms, cost_usd_est,
-	             model, score, request_id, rate_limit_type, utilization, fallback_count
+	             model, score, request_id, rate_limit_type, utilization, fallback_count,
+	             tools_present
 	      FROM call_log`
 	args := []interface{}{}
 	var where []string
@@ -329,14 +343,17 @@ func (s *Store) RecentCalls(f CallLogFilter) ([]CallLogRow, error) {
 	var result []CallLogRow
 	for rows.Next() {
 		var r CallLogRow
+		var toolsPresent int
 		if err := rows.Scan(
 			&r.TS, &r.BackendID, &r.TierAlias, &r.ChainPosition,
 			&r.Outcome, &r.ErrorType, &r.PromptTokensEst, &r.CompletionTokensEst,
 			&r.LatencyMS, &r.CostUSD,
 			&r.Model, &r.Score, &r.RequestID, &r.RateLimitType, &r.Utilization, &r.FallbackCount,
+			&toolsPresent,
 		); err != nil {
 			continue
 		}
+		r.ToolsPresent = toolsPresent != 0
 		result = append(result, r)
 	}
 	return result, nil
@@ -451,6 +468,9 @@ type CallLogRow struct {
 	RateLimitType string
 	Utilization   *float64
 	FallbackCount int
+	// ToolsPresent records only whether the request carried a non-empty tools
+	// field — never tool names, schemas, or request body content (lr-4aaf2a).
+	ToolsPresent bool
 }
 
 // SaveWebhook upserts a webhook registration.

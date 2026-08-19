@@ -341,6 +341,7 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 					RateLimitType:       routingRateLimitType,
 					Utilization:         routingUtilization,
 					FallbackCount:       i,
+					ToolsPresent:        req.HasTools,
 				})
 			}
 
@@ -372,6 +373,7 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 				RateLimitType: routingRateLimitType,
 				Utilization:   routingUtilization,
 				FallbackCount: i,
+				ToolsPresent:  req.HasTools,
 			})
 		}
 
@@ -403,6 +405,7 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 				Model:         r.cfg.Backends[bid].Model,
 				RequestID:     reqID,
 				FallbackCount: len(tried),
+				ToolsPresent:  req.HasTools,
 			})
 			break // one degraded row for the whole call
 		}
@@ -515,6 +518,33 @@ func (r *Router) FilterChainForTools(chain []string) ([]string, error) {
 		return nil, ErrNoToolCapableBackend
 	}
 	return filtered, nil
+}
+
+// LogToolRefusal records one call_log row for a routed-mode request that was
+// refused with 422 no_tool_capable_backend before Route was ever invoked
+// (see FilterChainForTools / ErrNoToolCapableBackend).
+//
+// Without this, a refused tools-bearing request produces NO call_log row at
+// all — Route's three LogCall sites are all inside the walk this refusal
+// short-circuits, so the very question this instrumentation exists to answer
+// ("who is sending tools at routed chains") would still be unanswerable for
+// the common case, since routed mode refuses every tool-bearing request
+// outright (see FilterChainForTools doc). ctx carries the request ID the
+// same way Route does (backend.RequestIDFromCtx); model is the caller's
+// original model string, recorded so a refused row is attributable the same
+// way a routed row's Model field is. No-op when store is nil.
+func (r *Router) LogToolRefusal(ctx context.Context, chain []string, model string) {
+	if r.store == nil {
+		return
+	}
+	r.store.LogCall(store.CallLogInput{
+		TierAlias:    strings.Join(chain, ","),
+		Outcome:      "refused_no_tool_capable_backend",
+		ErrorType:    ErrNoToolCapableBackend.Error(),
+		Model:        model,
+		RequestID:    backend.RequestIDFromCtx(ctx),
+		ToolsPresent: true,
+	})
 }
 
 // BackendIDs returns the IDs of all configured backends.

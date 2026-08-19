@@ -297,10 +297,15 @@ func (h *Handler) messagesRouted(w http.ResponseWriter, r *http.Request, req *an
 		return
 	}
 
-	if hasTools(req.Tools) {
+	reqHasTools := hasTools(req.Tools)
+	if reqHasTools {
 		filtered, err := h.router.FilterChainForTools(chain)
 		if err != nil {
 			if err == router.ErrNoToolCapableBackend {
+				// Refused before Route is ever called — Route's own call_log
+				// writes never fire for this request, so record the refusal
+				// explicitly (presence only; see LogToolRefusal doc).
+				h.router.LogToolRefusal(r.Context(), chain, req.Model)
 				writeAnthropicError(w, http.StatusUnprocessableEntity,
 					fmt.Sprintf("request carries tools but model %q resolves to no tool-capable backend in routed mode; "+
 						"remove tools, or send this request to %s directly (passthrough forwards tools intact)",
@@ -330,6 +335,7 @@ func (h *Handler) messagesRouted(w http.ResponseWriter, r *http.Request, req *an
 		Messages:   msgs,
 		MaxTokens:  req.MaxTokens,
 		WorkingDir: workingDir,
+		HasTools:   reqHasTools,
 	}
 
 	resp, meta, err := h.router.Route(r.Context(), routerReq, chain)
