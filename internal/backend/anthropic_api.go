@@ -49,11 +49,42 @@ type anthropicRequest struct {
 	Messages     []anthropicMessage     `json:"messages"`
 	OutputConfig *anthropicOutputConfig `json:"output_config,omitempty"`
 	Thinking     *anthropicThinking     `json:"thinking,omitempty"`
+	// Tools carries backend.ToolDef translated to the Anthropic Messages API
+	// envelope (input_schema). Omitted entirely when the request carries no
+	// tools — matches the neutral IR contract in adapter.go.
+	Tools []anthropicToolDef `json:"tools,omitempty"`
+}
+
+// anthropicToolDef is the Anthropic Messages API's tool definition envelope
+// — same name/description/schema trio as backend.ToolDef, wire field named
+// "input_schema" per the Anthropic API reference.
+type anthropicToolDef struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	InputSchema json.RawMessage `json:"input_schema,omitempty"`
+}
+
+// toAnthropicTools translates the neutral backend.ToolDef slice into the
+// Anthropic wire envelope. Returns nil for an empty input so the "tools"
+// field is omitted entirely (omitempty) rather than sent as [].
+func toAnthropicTools(defs []ToolDef) []anthropicToolDef {
+	if len(defs) == 0 {
+		return nil
+	}
+	out := make([]anthropicToolDef, len(defs))
+	for i, d := range defs {
+		out[i] = anthropicToolDef{Name: d.Name, Description: d.Description, InputSchema: d.InputSchema}
+	}
+	return out
 }
 
 type anthropicContentBlock struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
+	// tool_use fields — present only when Type == "tool_use".
+	ID    string          `json:"id,omitempty"`
+	Name  string          `json:"name,omitempty"`
+	Input json.RawMessage `json:"input,omitempty"`
 }
 
 type anthropicUsage struct {
@@ -62,11 +93,12 @@ type anthropicUsage struct {
 }
 
 type anthropicResponse struct {
-	ID      string                  `json:"id"`
-	Type    string                  `json:"type"`
-	Content []anthropicContentBlock `json:"content"`
-	Model   string                  `json:"model"`
-	Usage   anthropicUsage          `json:"usage"`
+	ID         string                  `json:"id"`
+	Type       string                  `json:"type"`
+	Content    []anthropicContentBlock `json:"content"`
+	Model      string                  `json:"model"`
+	StopReason string                  `json:"stop_reason"`
+	Usage      anthropicUsage          `json:"usage"`
 	// Error fields
 	Error struct {
 		Type    string `json:"type"`
@@ -108,15 +140,13 @@ func NewAnthropicAPIAdapter(id, model, apiKey, apiURL string, timeout time.Durat
 func (a *AnthropicAPIAdapter) ID() string { return a.id }
 
 // Capabilities reports the Anthropic Messages API adapter's wire protocol
-// support. Although the underlying Anthropic API supports tool use and
-// multimodal content, this adapter's own Invoke sends plain-text messages
-// only (anthropicMessage.Content is a string, no tools field is ever
-// marshaled) and its response parsing keeps only "text" content blocks (see
-// Invoke below) — so SupportsTools/SupportsImages are false here, matching
-// what this adapter actually does on the wire today, not the provider's
-// theoretical ceiling.
+// support. Invoke marshals req.Tools into the Anthropic "tools" field
+// (toAnthropicTools) and parses "tool_use" content blocks back out of the
+// response (see Invoke below), so SupportsTools is true. Images remain
+// unsupported: anthropicMessage.Content is still a plain string, so no
+// multimodal content block is ever marshaled or parsed.
 func (a *AnthropicAPIAdapter) Capabilities() Capabilities {
-	return Capabilities{SupportsTools: false, SupportsStreaming: false, SupportsImages: false}
+	return Capabilities{SupportsTools: true, SupportsStreaming: false, SupportsImages: false}
 }
 
 // Invoke sends a request to the Anthropic Messages API.
@@ -149,6 +179,7 @@ func (a *AnthropicAPIAdapter) Invoke(ctx context.Context, req *Request) (*Respon
 		MaxTokens: maxTokens,
 		System:    system,
 		Messages:  msgs,
+		Tools:     toAnthropicTools(req.Tools),
 	}
 	if a.effort != "" {
 		body.OutputConfig = &anthropicOutputConfig{Effort: string(a.effort)}
@@ -203,18 +234,26 @@ func (a *AnthropicAPIAdapter) Invoke(ctx context.Context, req *Request) (*Respon
 	}
 
 	var content strings.Builder
+	var toolUses []ToolUse
 	for _, block := range out.Content {
-		if block.Type == "text" {
+		switch block.Type {
+		case "text":
 			content.WriteString(block.Text)
+		case "tool_use":
+			toolUses = append(toolUses, ToolUse{ID: block.ID, Name: block.Name, Input: block.Input})
 		}
 	}
 	text := strings.TrimSpace(content.String())
-	if text == "" {
+	// A tool_use-only turn legitimately carries no text block (out.StopReason
+	// == "tool_use") — only treat empty text as a schema error when there is
+	// also no tool_use to report, matching the "no usable content at all"
+	// case this check exists to catch.
+	if text == "" && len(toolUses) == 0 {
 		return nil, &InvokeError{Type: ErrTypeSchema, Raw: "empty content blocks in Anthropic response"}
 	}
 
 	slog.Debug("anthropic_api invoke ok", "backend", a.id, "model", a.model, "content_len", len(text),
-		"request_id", RequestIDFromCtx(ctx))
+		"tool_uses", len(toolUses), "stop_reason", out.StopReason, "request_id", RequestIDFromCtx(ctx))
 
 	rl := RateLimitInfo{
 		TokensRemaining:   parseIntHeader(resp.Header, "anthropic-ratelimit-tokens-remaining"),
@@ -228,6 +267,7 @@ func (a *AnthropicAPIAdapter) Invoke(ctx context.Context, req *Request) (*Respon
 		PromptTokensEst:     out.Usage.InputTokens,
 		CompletionTokensEst: out.Usage.OutputTokens,
 		RateLimitInfo:       rl,
+		ToolUses:            toolUses,
 	}, nil
 }
 

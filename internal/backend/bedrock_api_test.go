@@ -153,16 +153,15 @@ func TestBedrockAPI_NonTextBlockSkipped(t *testing.T) {
 	}
 }
 
-// TestBedrockAPI_EmptyTextContent verifies an all-non-text response (e.g. tool
-// use only) is a schema error, not a panic or silent empty success.
-func TestBedrockAPI_EmptyTextContent(t *testing.T) {
+// TestBedrockAPI_EmptyContent verifies a response with neither text nor
+// tool_use content blocks is a schema error, not a panic or silent empty
+// success.
+func TestBedrockAPI_EmptyContent(t *testing.T) {
 	client := &mockConverseClient{
 		fn: func(_ context.Context, _ *bedrockruntime.ConverseInput, _ ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseOutput, error) {
 			return &bedrockruntime.ConverseOutput{
 				Output: &types.ConverseOutputMemberMessage{
-					Value: types.Message{
-						Content: []types.ContentBlock{&types.ContentBlockMemberToolUse{Value: types.ToolUseBlock{}}},
-					},
+					Value: types.Message{Content: nil},
 				},
 			}, nil
 		},
@@ -172,6 +171,44 @@ func TestBedrockAPI_EmptyTextContent(t *testing.T) {
 	var ie *InvokeError
 	if !errors.As(err, &ie) || ie.Type != ErrTypeSchema {
 		t.Fatalf("expected ErrTypeSchema, got %v", err)
+	}
+}
+
+// TestBedrockAPI_ToolUseOnlyContent_Succeeds verifies a response carrying
+// only a tool_use content block (no text) is a SUCCESS, not a schema error
+// (lr-add405). This supersedes the pre-lr-add405 assumption
+// (TestBedrockAPI_EmptyTextContent) that an all-non-text response was
+// always an error — a tool_use-only turn is now the expected shape of a
+// single-shot tool call, and Content=="" is legitimate when ToolUses is
+// non-empty.
+func TestBedrockAPI_ToolUseOnlyContent_Succeeds(t *testing.T) {
+	client := &mockConverseClient{
+		fn: func(_ context.Context, _ *bedrockruntime.ConverseInput, _ ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseOutput, error) {
+			return &bedrockruntime.ConverseOutput{
+				Output: &types.ConverseOutputMemberMessage{
+					Value: types.Message{
+						Content: []types.ContentBlock{&types.ContentBlockMemberToolUse{Value: types.ToolUseBlock{
+							ToolUseId: aws.String("tu_1"),
+							Name:      aws.String("get_weather"),
+						}}},
+					},
+				},
+			}, nil
+		},
+	}
+	adapter := newBedrockAPIAdapterWithClient("test", "m", client)
+	resp, err := adapter.Invoke(context.Background(), &Request{Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Content != "" {
+		t.Errorf("expected empty Content for a tool_use-only turn, got %q", resp.Content)
+	}
+	if len(resp.ToolUses) != 1 {
+		t.Fatalf("expected 1 ToolUse, got %d", len(resp.ToolUses))
+	}
+	if resp.ToolUses[0].ID != "tu_1" || resp.ToolUses[0].Name != "get_weather" {
+		t.Errorf("unexpected ToolUse: %+v", resp.ToolUses[0])
 	}
 }
 
