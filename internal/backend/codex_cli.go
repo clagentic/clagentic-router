@@ -79,7 +79,9 @@ func (a *CodexCLIAdapter) ID() string { return a.id }
 
 // Capabilities reports the codex CLI adapter's wire protocol support.
 // The subprocess path pipes a flat prompt string to stdin — no tool,
-// streaming, or image passthrough.
+// streaming, or image passthrough. Invoke never reads Request.Tools and
+// never populates Response.ToolUses (lr-add405); see ClaudeCLIAdapter's
+// Capabilities doc for the shared "no structured wire field" rationale.
 func (a *CodexCLIAdapter) Capabilities() Capabilities {
 	return Capabilities{SupportsTools: false, SupportsStreaming: false, SupportsImages: false}
 }

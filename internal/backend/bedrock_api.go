@@ -1,10 +1,11 @@
 // internal/backend/bedrock_api.go — adapter for AWS Bedrock's Converse API.
 //
 // Uses the AWS Bedrock Runtime Converse API, which is uniform across model
-// families for text-only, non-streaming invocation (both the Anthropic and
-// OpenAI families hosted on Bedrock use the same Converse call shape). This
-// is why one adapter covers both families with no model-family-specific
-// config — see CLAUDE.md's "Design constraint" note for bedrock_api.
+// families for non-streaming invocation, text content, and tool calling
+// (both the Anthropic and OpenAI families hosted on Bedrock use the same
+// Converse call shape). This is why one adapter covers both families with
+// no model-family-specific config — see CLAUDE.md's "Design constraint"
+// note for bedrock_api. Image content remains out of scope (lr-add405).
 //
 // Credentials come exclusively from the standard AWS SDK credential chain
 // (env vars, shared config/credentials files, web identity, ECS, IMDS) via
@@ -27,6 +28,7 @@ package backend
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -35,6 +37,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
+	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/document"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 )
 
@@ -91,14 +94,48 @@ func newBedrockAPIAdapterWithClient(id, model string, client bedrockConverseClie
 func (a *BedrockAPIAdapter) ID() string { return a.id }
 
 // Capabilities reports the Bedrock Converse API adapter's wire protocol
-// support. Unlike AnthropicAPIAdapter/OpenAIAPIAdapter, this adapter's own
-// Invoke implementation builds text-only content blocks and never sends a
-// ToolConfig — tool use and image content are genuinely out of scope for
-// this adapter today (see Invoke and bedrockOutputText), not merely
-// untranslated by the router layer above it. Declaring true here would be
-// inaccurate.
+// support. Invoke marshals req.Tools into a Converse ToolConfiguration
+// (toBedrockToolConfig) and parses ToolUseBlock members back out of the
+// response (see Invoke and bedrockOutputContent), so SupportsTools is true.
+// Images remain unsupported: Invoke still builds only
+// ContentBlockMemberText members, never an image content block.
 func (a *BedrockAPIAdapter) Capabilities() Capabilities {
-	return Capabilities{SupportsTools: false, SupportsStreaming: false, SupportsImages: false}
+	return Capabilities{SupportsTools: true, SupportsStreaming: false, SupportsImages: false}
+}
+
+// toBedrockToolConfig translates the neutral backend.ToolDef slice into a
+// Bedrock Converse ToolConfiguration. Returns nil for an empty input so
+// ConverseInput.ToolConfig is left unset entirely, matching the neutral IR
+// contract (omit rather than send an empty tool list).
+//
+// InputSchema is carried as json.RawMessage in the neutral type but the
+// Converse API's ToolInputSchema wants a smithy document.Interface, not raw
+// bytes — document.NewLazyDocument (this service's own document package,
+// not smithy-go's, since ToolInputSchema's union member is sealed to the
+// bedrockruntime-generated Interface) accepts the raw JSON bytes directly
+// and round-trips them losslessly (smithy documents are this SDK's typed
+// wrapper for provider-agnostic JSON payloads), so no schema information is
+// lost or reinterpreted in the translation.
+func toBedrockToolConfig(defs []ToolDef) *types.ToolConfiguration {
+	if len(defs) == 0 {
+		return nil
+	}
+	tools := make([]types.Tool, 0, len(defs))
+	for _, d := range defs {
+		spec := types.ToolSpecification{
+			Name: aws.String(d.Name),
+		}
+		if d.Description != "" {
+			spec.Description = aws.String(d.Description)
+		}
+		if len(d.InputSchema) > 0 {
+			spec.InputSchema = &types.ToolInputSchemaMemberJson{
+				Value: document.NewLazyDocument(d.InputSchema),
+			}
+		}
+		tools = append(tools, &types.ToolMemberToolSpec{Value: spec})
+	}
+	return &types.ToolConfiguration{Tools: tools}
 }
 
 // Invoke sends a request to the Bedrock Converse API.
@@ -138,13 +175,16 @@ func (a *BedrockAPIAdapter) Invoke(ctx context.Context, req *Request) (*Response
 	if len(systemPrompts) > 0 {
 		input.System = systemPrompts
 	}
+	if toolCfg := toBedrockToolConfig(req.Tools); toolCfg != nil {
+		input.ToolConfig = toolCfg
+	}
 
 	out, err := a.client.Converse(ctx, input)
 	if err != nil {
 		return nil, &InvokeError{Type: classifyBedrockError(err), Raw: truncate(err.Error(), 500)}
 	}
 
-	text, textErr := bedrockOutputText(out)
+	text, toolUses, textErr := bedrockOutputContent(out)
 	if textErr != nil {
 		return nil, textErr
 	}
@@ -160,43 +200,66 @@ func (a *BedrockAPIAdapter) Invoke(ctx context.Context, req *Request) (*Response
 	}
 
 	slog.Debug("bedrock_api invoke ok", "backend", a.id, "model", a.model, "content_len", len(text),
-		"request_id", RequestIDFromCtx(ctx))
+		"tool_uses", len(toolUses), "request_id", RequestIDFromCtx(ctx))
 
 	return &Response{
 		Content:             text,
 		PromptTokensEst:     promptTokens,
 		CompletionTokensEst: completionTokens,
+		ToolUses:            toolUses,
 	}, nil
 }
 
-// bedrockOutputText extracts the text content from a ConverseOutput.
-// Output.Content is a union type (types.ContentBlock); non-text member
-// types (tool use, reasoning, etc.) are skipped rather than causing a
-// panic on a failed type assertion — image/tool content is out of scope
-// for this adapter but must not crash the router if the model emits it.
-func bedrockOutputText(out *bedrockruntime.ConverseOutput) (string, error) {
+// bedrockOutputContent extracts the text and tool_use content from a
+// ConverseOutput. Output.Content is a union type (types.ContentBlock);
+// member types this adapter does not carry (reasoning, image, etc.) are
+// skipped rather than causing a panic on a failed type assertion — image
+// content is out of scope for this adapter but must not crash the router if
+// the model emits it.
+func bedrockOutputContent(out *bedrockruntime.ConverseOutput) (string, []ToolUse, error) {
 	if out == nil || out.Output == nil {
-		return "", &InvokeError{Type: ErrTypeSchema, Raw: "bedrock_api: empty output in response"}
+		return "", nil, &InvokeError{Type: ErrTypeSchema, Raw: "bedrock_api: empty output in response"}
 	}
 	msgMember, ok := out.Output.(*types.ConverseOutputMemberMessage)
 	if !ok {
-		return "", &InvokeError{Type: ErrTypeSchema, Raw: "bedrock_api: unexpected output member type"}
+		return "", nil, &InvokeError{Type: ErrTypeSchema, Raw: "bedrock_api: unexpected output member type"}
 	}
 
 	var sb strings.Builder
+	var toolUses []ToolUse
 	for _, block := range msgMember.Value.Content {
-		if textBlock, ok := block.(*types.ContentBlockMemberText); ok {
-			sb.WriteString(textBlock.Value)
+		switch b := block.(type) {
+		case *types.ContentBlockMemberText:
+			sb.WriteString(b.Value)
+		case *types.ContentBlockMemberToolUse:
+			toolUses = append(toolUses, bedrockToolUseBlockToToolUse(b.Value))
 		}
-		// Unknown/non-text block types (tool use, reasoning, image, etc.) are
-		// intentionally skipped — Invoke never panics on an unrecognized union
-		// member.
+		// Unknown/other block types (reasoning, image, etc.) are intentionally
+		// skipped — Invoke never panics on an unrecognized union member.
 	}
 	text := strings.TrimSpace(sb.String())
-	if text == "" {
-		return "", &InvokeError{Type: ErrTypeSchema, Raw: "bedrock_api: no text content blocks in response"}
+	if text == "" && len(toolUses) == 0 {
+		return "", nil, &InvokeError{Type: ErrTypeSchema, Raw: "bedrock_api: no text or tool_use content blocks in response"}
 	}
-	return text, nil
+	return text, toolUses, nil
+}
+
+// bedrockToolUseBlockToToolUse translates a Converse ToolUseBlock into the
+// neutral backend.ToolUse type. Input is a smithy document.Interface;
+// MarshalSmithyDocument round-trips it back to the same JSON bytes that
+// went in via toBedrockToolConfig's document.NewLazyDocument, so this is a
+// lossless translation, not a reinterpretation of the payload.
+func bedrockToolUseBlockToToolUse(b types.ToolUseBlock) ToolUse {
+	tu := ToolUse{Name: aws.ToString(b.Name)}
+	if b.ToolUseId != nil {
+		tu.ID = aws.ToString(b.ToolUseId)
+	}
+	if b.Input != nil {
+		if raw, err := b.Input.MarshalSmithyDocument(); err == nil {
+			tu.Input = json.RawMessage(raw)
+		}
+	}
+	return tu
 }
 
 // classifyBedrockError maps typed Bedrock Runtime SDK errors onto the

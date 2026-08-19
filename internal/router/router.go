@@ -279,10 +279,35 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 	var lastErr error
 	tried := make([]string, 0, len(chain))
 
+	// reqHasTools gates the sticky-through-fallback tool-capability filter
+	// below. Gated on req.HasTools (the presence bit every routed entry
+	// point sets — see backend.Request.HasTools doc), not len(req.Tools),
+	// because req.Tools may be nil even when the wire request carried tools:
+	// today's server-layer translation (anthropicToBackendMessages /
+	// chatCompletions) does not decode tool definitions into backend.ToolDef
+	// at all, only detects presence. Gating on len(req.Tools) would silently
+	// stop enforcing the moment a caller sends tools that never get decoded
+	// into the neutral IR — exactly backwards for a safety filter.
+	//
+	// FilterChainForTools (called by the server layer before Route) only
+	// screens entries out at the chain-resolution level — a tier-alias or
+	// role-chain entry whose candidate set MIXES capable and incapable
+	// backends is deliberately kept as-is by that filter (see its doc), on
+	// the understanding that Route's own per-candidate walk enforces
+	// capability from here on. Without the filter below, a tools-bearing
+	// request against such a mixed entry could select an incapable backend
+	// when the capable one is unavailable/degraded — silently dropping the
+	// tools at the fallback boundary, the exact defect class lr-be9454's
+	// refusal was built to close, just relocated one level deeper (lr-add405).
+	reqHasTools := req.HasTools
+
 	for i, entry := range chain {
 		candidates := r.resolveChainEntry(entry)
+		if reqHasTools {
+			candidates = r.filterToolCapable(candidates)
+		}
 		if len(candidates) == 0 {
-			slog.Debug("router: chain entry resolved to no backends", "entry", entry, "request_id", reqID)
+			slog.Debug("router: chain entry resolved to no backends", "entry", entry, "request_id", reqID, "tools_present", reqHasTools)
 			continue
 		}
 
@@ -701,6 +726,26 @@ func (r *Router) resolveChainEntry(entry string) []string {
 		return []string{entry}
 	}
 	return nil
+}
+
+// filterToolCapable narrows candidates to backends whose adapter declares
+// Capabilities().SupportsTools. Called from Route (not just
+// FilterChainForTools) so tool-capability is enforced per-candidate, at
+// every chain position, including inside a single tier-alias/role-chain
+// entry whose candidate set mixes capable and incapable backends — see the
+// sticky-through-fallback comment at Route's call site (lr-add405).
+func (r *Router) filterToolCapable(candidates []string) []string {
+	filtered := make([]string, 0, len(candidates))
+	for _, bid := range candidates {
+		adp, ok := r.adapters[bid]
+		if !ok {
+			continue
+		}
+		if adp.Capabilities().SupportsTools {
+			filtered = append(filtered, bid)
+		}
+	}
+	return filtered
 }
 
 // nearTieEpsilon is the fractional score difference within which backends are

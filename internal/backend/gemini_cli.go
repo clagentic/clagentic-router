@@ -84,7 +84,9 @@ func (a *GeminiCLIAdapter) ID() string { return a.id }
 
 // Capabilities reports the gemini CLI adapter's wire protocol support.
 // The subprocess path passes a flat prompt via the -p flag — no tool,
-// streaming, or image passthrough.
+// streaming, or image passthrough. Invoke never reads Request.Tools and
+// never populates Response.ToolUses (lr-add405); see ClaudeCLIAdapter's
+// Capabilities doc for the shared "no structured wire field" rationale.
 func (a *GeminiCLIAdapter) Capabilities() Capabilities {
 	return Capabilities{SupportsTools: false, SupportsStreaming: false, SupportsImages: false}
 }

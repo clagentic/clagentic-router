@@ -22,18 +22,70 @@ import (
 const openaiDefaultURL = "https://api.openai.com"
 
 type openaiMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role      string           `json:"role"`
+	Content   string           `json:"content"`
+	ToolCalls []openaiToolCall `json:"tool_calls,omitempty"`
 }
 
 type openaiRequest struct {
-	Model     string          `json:"model"`
-	MaxTokens int             `json:"max_tokens"`
-	Messages  []openaiMessage `json:"messages"`
+	Model     string           `json:"model"`
+	MaxTokens int              `json:"max_tokens"`
+	Messages  []openaiMessage  `json:"messages"`
+	Tools     []openaiToolSpec `json:"tools,omitempty"`
+}
+
+// openaiToolSpec is the OpenAI Chat Completions "tools" entry envelope —
+// same name/description/schema trio as backend.ToolDef, wrapped in a
+// {"type":"function","function":{...}} wire shape per the OpenAI API
+// reference (function.parameters carries the JSON Schema).
+type openaiToolSpec struct {
+	Type     string             `json:"type"`
+	Function openaiToolFunction `json:"function"`
+}
+
+type openaiToolFunction struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
+}
+
+// openaiToolCall is one entry of message.tool_calls in a Chat Completions
+// response — the OpenAI wire shape for a model-requested tool invocation.
+type openaiToolCall struct {
+	ID       string                 `json:"id"`
+	Type     string                 `json:"type"`
+	Function openaiToolCallFunction `json:"function"`
+}
+
+type openaiToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+// toOpenAITools translates the neutral backend.ToolDef slice into the OpenAI
+// wire envelope. Returns nil for an empty input so "tools" is omitted
+// entirely (omitempty) rather than sent as [].
+func toOpenAITools(defs []ToolDef) []openaiToolSpec {
+	if len(defs) == 0 {
+		return nil
+	}
+	out := make([]openaiToolSpec, len(defs))
+	for i, d := range defs {
+		out[i] = openaiToolSpec{
+			Type: "function",
+			Function: openaiToolFunction{
+				Name:        d.Name,
+				Description: d.Description,
+				Parameters:  d.InputSchema,
+			},
+		}
+	}
+	return out
 }
 
 type openaiChoice struct {
-	Message openaiMessage `json:"message"`
+	Message      openaiMessage `json:"message"`
+	FinishReason string        `json:"finish_reason"`
 }
 
 type openaiUsage struct {
@@ -80,15 +132,13 @@ func NewOpenAIAPIAdapter(id, model, apiKey, apiURL string, timeout time.Duration
 func (a *OpenAIAPIAdapter) ID() string { return a.id }
 
 // Capabilities reports the OpenAI Chat Completions API adapter's wire
-// protocol support. Although the underlying OpenAI API supports tool calling
-// and vision, this adapter's own Invoke sends plain-text messages only
-// (openaiMessage.Content is a string, no tools field is ever marshaled) and
-// reads only the first choice's plain-text content back — so
-// SupportsTools/SupportsImages are false here, matching what this adapter
-// actually does on the wire today. See AnthropicAPIAdapter's Capabilities
-// doc for the same reasoning.
+// protocol support. Invoke marshals req.Tools into the OpenAI "tools" field
+// (toOpenAITools) and parses message.tool_calls back out of the first
+// choice (see Invoke below), so SupportsTools is true. Images remain
+// unsupported: openaiMessage.Content is still a plain string, so no vision
+// content part is ever marshaled or parsed.
 func (a *OpenAIAPIAdapter) Capabilities() Capabilities {
-	return Capabilities{SupportsTools: false, SupportsStreaming: false, SupportsImages: false}
+	return Capabilities{SupportsTools: true, SupportsStreaming: false, SupportsImages: false}
 }
 
 // Invoke sends a request to the OpenAI Chat Completions API.
@@ -115,6 +165,7 @@ func (a *OpenAIAPIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 		Model:     a.model,
 		MaxTokens: maxTokens,
 		Messages:  msgs,
+		Tools:     toOpenAITools(req.Tools),
 	}
 
 	data, err := json.Marshal(body)
@@ -165,13 +216,27 @@ func (a *OpenAIAPIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 		return nil, &InvokeError{Type: ErrTypeSchema, Raw: "openai_api: empty choices in response"}
 	}
 
-	text := strings.TrimSpace(out.Choices[0].Message.Content)
-	if text == "" {
+	msg := out.Choices[0].Message
+	text := strings.TrimSpace(msg.Content)
+
+	var toolUses []ToolUse
+	for _, tc := range msg.ToolCalls {
+		toolUses = append(toolUses, ToolUse{
+			ID:    tc.ID,
+			Name:  tc.Function.Name,
+			Input: json.RawMessage(tc.Function.Arguments),
+		})
+	}
+
+	// A tool_calls-only turn legitimately carries no text content
+	// (finish_reason == "tool_calls") — only treat empty content as a
+	// schema error when there is also no tool call to report.
+	if text == "" && len(toolUses) == 0 {
 		return nil, &InvokeError{Type: ErrTypeSchema, Raw: "openai_api: empty content in response"}
 	}
 
 	slog.Debug("openai_api invoke ok", "backend", a.id, "model", a.model, "content_len", len(text),
-		"request_id", RequestIDFromCtx(ctx))
+		"tool_uses", len(toolUses), "finish_reason", out.Choices[0].FinishReason, "request_id", RequestIDFromCtx(ctx))
 
 	rl := RateLimitInfo{
 		TokensRemaining:   parseIntHeader(resp.Header, "x-ratelimit-remaining-tokens"),
@@ -185,5 +250,6 @@ func (a *OpenAIAPIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 		PromptTokensEst:     out.Usage.PromptTokens,
 		CompletionTokensEst: out.Usage.CompletionTokens,
 		RateLimitInfo:       rl,
+		ToolUses:            toolUses,
 	}, nil
 }

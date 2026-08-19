@@ -38,7 +38,7 @@ import (
 
 // anthropicMsgRequest is decoded just enough to make the passthrough-vs-routed
 // decision and, for routed mode, to translate into backend.Request. Unknown
-// fields (tools, metadata, top_k, etc.) are preserved via RawBody for the
+// fields (metadata, top_k, etc.) are preserved via RawBody for the
 // passthrough path, which forwards the original bytes unmodified.
 type anthropicMsgRequest struct {
 	Model     string                `json:"model"`
@@ -46,13 +46,17 @@ type anthropicMsgRequest struct {
 	System    json.RawMessage       `json:"system,omitempty"`
 	MaxTokens int                   `json:"max_tokens"`
 	Stream    bool                  `json:"stream,omitempty"`
-	// Tools is decoded only far enough to detect presence — routed mode
-	// (messagesRouted) does not translate tool definitions to the backend
-	// (see anthropicToBackendMessages). A tools-bearing request must be
-	// refused when the resolved chain has no tool-capable backend rather
-	// than silently dropped; see messagesRouted's tool-capability check.
-	// Passthrough mode is unaffected: it forwards the original request
-	// bytes (including tools) unmodified, never decoding this field.
+	// Tools is decoded only far enough to detect presence and, in routed
+	// mode, into []anthropicMsgToolDef by decodeAnthropicTools (see
+	// messagesRouted). Kept as json.RawMessage at THIS struct level
+	// (rather than a typed slice) deliberately: this struct's json.Unmarshal
+	// runs unconditionally for both passthrough and routed requests
+	// (messages()), and passthrough must keep forwarding a malformed-per-our-
+	// typed-shape (but validly-Anthropic) tools array unmodified rather than
+	// 400ing on a decode error that only routed mode's stricter translation
+	// needs to care about (lr-add405). Passthrough never decodes this field
+	// at all — it forwards the original request bytes (including tools)
+	// unmodified.
 	Tools json.RawMessage `json:"tools,omitempty"`
 	// WorkingDir is an opt-in absolute directory subprocess (CLI) adapters
 	// use as their cmd.Dir, honored only in routed mode (messagesRouted).
@@ -64,15 +68,78 @@ type anthropicMsgRequest struct {
 	WorkingDir string `json:"working_dir,omitempty"`
 }
 
+// anthropicMsgToolDef is the wire shape of one entry in the Anthropic
+// Messages API "tools" array — same trio backend.ToolDef carries neutrally
+// (name/description/input_schema), decoded here only far enough to
+// translate into that neutral IR (toBackendToolDefs). Server-side tool
+// types (Anthropic computer/text_editor) decode into this same shape
+// (their name/description come from Anthropic's builtin catalog, not this
+// request) but the router's translation does not special-case them — they
+// are carried through as an ordinary ToolDef and rejected or accepted by
+// the provider exactly as a client sending them directly would see.
+type anthropicMsgToolDef struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	InputSchema json.RawMessage `json:"input_schema,omitempty"`
+}
+
+// decodeAnthropicTools decodes req.Tools (json.RawMessage, presence-checked
+// separately by hasTools) into []anthropicMsgToolDef for routed mode. Called
+// only after hasTools(req.Tools) is true, so raw being empty/null/[] here
+// would itself be a bug upstream — but this function still handles it
+// gracefully (returns nil, nil) rather than assuming the caller's
+// precondition holds.
+func decodeAnthropicTools(raw json.RawMessage) ([]anthropicMsgToolDef, error) {
+	if !hasTools(raw) {
+		return nil, nil
+	}
+	var tools []anthropicMsgToolDef
+	if err := json.Unmarshal(raw, &tools); err != nil {
+		return nil, fmt.Errorf("tools: %w", err)
+	}
+	return tools, nil
+}
+
+// toBackendToolDefs translates decoded Anthropic tool definitions into the
+// neutral backend.ToolDef IR. Returns nil for an empty input, matching the
+// "absent means no tools" contract of backend.Request.Tools.
+func toBackendToolDefs(tools []anthropicMsgToolDef) []backend.ToolDef {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]backend.ToolDef, len(tools))
+	for i, t := range tools {
+		out[i] = backend.ToolDef{Name: t.Name, Description: t.Description, InputSchema: t.InputSchema}
+	}
+	return out
+}
+
 type anthropicMsgMessage struct {
 	Role    string          `json:"role"`
 	Content json.RawMessage `json:"content"`
 }
 
-// anthropicMsgContentBlock is one element of a Messages API content array.
+// anthropicMsgContentBlock is one element of a Messages API content array,
+// covering "text", "tool_use", and "tool_result" block shapes. tool_use is
+// the one this router actually produces in routed-mode responses and
+// decodes on input (prior-turn history — see anthropicToBackendMessages);
+// tool_result is decode-only, rendered as readable text on input since the
+// router never executes a tool itself and has no InvokeError-equivalent
+// carrier for "this was actually a tool result, not model prose" in the
+// flat backend.Message.Content string single-shot carriage uses. Fields for
+// a Type this block does not represent are omitted, matching the real
+// Anthropic wire grammar.
 type anthropicMsgContentBlock struct {
 	Type string `json:"type"`
-	Text string `json:"text"`
+	Text string `json:"text,omitempty"`
+	// tool_use fields.
+	ID    string          `json:"id,omitempty"`
+	Name  string          `json:"name,omitempty"`
+	Input json.RawMessage `json:"input,omitempty"`
+	// tool_result fields (decode-only — this router never emits tool_result
+	// blocks itself, only reads them out of caller-supplied history).
+	ToolUseID string          `json:"tool_use_id,omitempty"`
+	Content   json.RawMessage `json:"content,omitempty"`
 }
 
 type anthropicMsgUsage struct {
@@ -90,6 +157,28 @@ type anthropicMsgResponse struct {
 	StopReason   string                     `json:"stop_reason"`
 	StopSequence *string                    `json:"stop_sequence"`
 	Usage        anthropicMsgUsage          `json:"usage"`
+}
+
+// toolUsesToAnthropicBlocks translates backend.ToolUse results into
+// Anthropic "tool_use" content blocks for the routed-mode response.
+func toolUsesToAnthropicBlocks(uses []backend.ToolUse) []anthropicMsgContentBlock {
+	blocks := make([]anthropicMsgContentBlock, len(uses))
+	for i, u := range uses {
+		blocks[i] = anthropicMsgContentBlock{Type: "tool_use", ID: u.ID, Name: u.Name, Input: u.Input}
+	}
+	return blocks
+}
+
+// anthropicStopReason returns the Anthropic Messages API stop_reason for a
+// routed-mode response: "tool_use" when the backend returned any tool_use
+// blocks (lr-add405 — previously hardcoded to "end_turn" unconditionally,
+// documented as a known limitation since tool calls were always dropped in
+// translation), "end_turn" otherwise.
+func anthropicStopReason(resp *backend.Response) string {
+	if len(resp.ToolUses) > 0 {
+		return "tool_use"
+	}
+	return "end_turn"
 }
 
 // anthropicMsgError is the Anthropic-format error envelope.
@@ -298,6 +387,7 @@ func (h *Handler) messagesRouted(w http.ResponseWriter, r *http.Request, req *an
 	}
 
 	reqHasTools := hasTools(req.Tools)
+	var toolDefs []backend.ToolDef
 	if reqHasTools {
 		filtered, err := h.router.FilterChainForTools(chain)
 		if err != nil {
@@ -317,6 +407,13 @@ func (h *Handler) messagesRouted(w http.ResponseWriter, r *http.Request, req *an
 			return
 		}
 		chain = filtered
+
+		anthropicTools, err := decodeAnthropicTools(req.Tools)
+		if err != nil {
+			writeAnthropicError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		toolDefs = toBackendToolDefs(anthropicTools)
 	}
 
 	msgs, err := anthropicToBackendMessages(req)
@@ -336,6 +433,7 @@ func (h *Handler) messagesRouted(w http.ResponseWriter, r *http.Request, req *an
 		MaxTokens:  req.MaxTokens,
 		WorkingDir: workingDir,
 		HasTools:   reqHasTools,
+		Tools:      toolDefs,
 	}
 
 	resp, meta, err := h.router.Route(r.Context(), routerReq, chain)
@@ -365,12 +463,12 @@ func (h *Handler) messagesRouted(w http.ResponseWriter, r *http.Request, req *an
 		Type:    "message",
 		Role:    "assistant",
 		Model:   req.Model,
-		Content: []anthropicMsgContentBlock{{Type: "text", Text: resp.Content}},
-		// end_turn is the general-purpose Anthropic stop_reason for a normal
-		// completion; the router's backends never surface a distinct reason
-		// (tool_use, max_tokens, stop_sequence) since tool calls are dropped
-		// in translation — documented as a known limitation.
-		StopReason: "end_turn",
+		Content: anthropicResponseContentBlocks(resp),
+		// tool_use when the backend returned tool_use blocks (lr-add405),
+		// end_turn otherwise. max_tokens/stop_sequence are still never
+		// surfaced — no adapter reports which stop condition it hit beyond
+		// tool_use vs. a normal completion.
+		StopReason: anthropicStopReason(resp),
 		Usage: anthropicMsgUsage{
 			InputTokens:  resp.PromptTokensEst,
 			OutputTokens: resp.CompletionTokensEst,
@@ -378,11 +476,30 @@ func (h *Handler) messagesRouted(w http.ResponseWriter, r *http.Request, req *an
 	})
 }
 
+// anthropicResponseContentBlocks builds the routed-mode response content
+// array: a text block when resp.Content is non-empty, followed by any
+// tool_use blocks (lr-add405). A tool_use-only turn (resp.Content=="")
+// omits the text block entirely rather than emitting an empty one, matching
+// real Anthropic API behavior.
+func anthropicResponseContentBlocks(resp *backend.Response) []anthropicMsgContentBlock {
+	blocks := make([]anthropicMsgContentBlock, 0, 1+len(resp.ToolUses))
+	if resp.Content != "" {
+		blocks = append(blocks, anthropicMsgContentBlock{Type: "text", Text: resp.Content})
+	}
+	blocks = append(blocks, toolUsesToAnthropicBlocks(resp.ToolUses)...)
+	return blocks
+}
+
 // anthropicToBackendMessages converts Anthropic Messages request fields
 // (system + messages, with content as either a plain string or a content
-// block array) into backend.Message. Only "text" content blocks are kept —
-// tool_use/tool_result/image blocks are dropped, which is the documented
-// routed-mode limitation (no tool-calling, no multimodal).
+// block array) into backend.Message. "text" content blocks are kept as-is;
+// tool_use/tool_result blocks are rendered as a readable text marker (see
+// decodeAnthropicContent) rather than silently dropped (lr-add405) — a
+// caller replaying prior-turn history that includes a tool call/result
+// still gets that turn represented in the flattened prompt, even though the
+// router itself never executes tools or accepts a fresh tool_result. image
+// blocks remain out of scope and are still dropped — multimodal carriage is
+// not part of this task.
 func anthropicToBackendMessages(req *anthropicMsgRequest) ([]backend.Message, error) {
 	var out []backend.Message
 
@@ -407,8 +524,20 @@ func anthropicToBackendMessages(req *anthropicMsgRequest) ([]backend.Message, er
 }
 
 // decodeAnthropicContent decodes an Anthropic "content" field, which is
-// either a plain JSON string or an array of content blocks. Non-text blocks
-// (tool_use, tool_result, image, etc.) are skipped.
+// either a plain JSON string or an array of content blocks, into a single
+// flattened text string (the shape every backend.Message.Content is).
+//
+//   - "text" blocks are appended verbatim.
+//   - "tool_use" blocks are rendered as a "[Tool call: <name>(<input>)]"
+//     marker (lr-add405) — the model's own prior tool call is real
+//     conversational content a backend should see when replaying history,
+//     even though this router cannot re-issue it as a structured block on
+//     a text-only CLI backend or reconstruct the original response's exact
+//     content-array shape.
+//   - "tool_result" blocks are rendered as a "[Tool result for <id>:
+//     <content>]" marker, same rationale.
+//   - "image" blocks are still skipped entirely — multimodal carriage is
+//     out of scope for this task (single-shot TOOL carriage only).
 func decodeAnthropicContent(raw json.RawMessage) (string, error) {
 	if len(raw) == 0 {
 		return "", nil
@@ -424,12 +553,24 @@ func decodeAnthropicContent(raw json.RawMessage) (string, error) {
 		return "", fmt.Errorf("content: expected string or block array: %w", err)
 	}
 	var sb strings.Builder
+	appendPart := func(part string) {
+		if part == "" {
+			return
+		}
+		if sb.Len() > 0 {
+			sb.WriteString("\n\n")
+		}
+		sb.WriteString(part)
+	}
 	for _, b := range blocks {
-		if b.Type == "text" && b.Text != "" {
-			if sb.Len() > 0 {
-				sb.WriteString("\n\n")
-			}
-			sb.WriteString(b.Text)
+		switch b.Type {
+		case "text":
+			appendPart(b.Text)
+		case "tool_use":
+			appendPart(fmt.Sprintf("[Tool call: %s(%s)]", b.Name, string(b.Input)))
+		case "tool_result":
+			appendPart(fmt.Sprintf("[Tool result for %s: %s]", b.ToolUseID, string(b.Content)))
+			// image and any other block type are intentionally skipped.
 		}
 	}
 	return sb.String(), nil
@@ -441,11 +582,21 @@ func decodeAnthropicContent(raw json.RawMessage) (string, error) {
 // complete (non-token-streamed) backend response, mirroring the OpenAI
 // handler's writeSSEStream approach but in Anthropic event grammar:
 // message_start -> content_block_start -> content_block_delta ->
-// content_block_stop -> message_delta -> message_stop.
+// content_block_stop (repeated per content block) -> message_delta ->
+// message_stop.
 //
 // Like the OpenAI streaming path, this is NOT true token streaming — backends
-// return complete responses, so the full text is emitted in one delta event.
-// This is the documented routed-mode limitation.
+// return complete responses, so each block's full content is emitted in one
+// delta event. This is the documented routed-mode limitation.
+//
+// Content blocks (lr-add405): a text block (if resp.Content is non-empty) at
+// index 0, followed by one tool_use block per resp.ToolUses at incrementing
+// indices — same block set and ordering as the non-streaming response
+// (anthropicResponseContentBlocks), just each one framed as its own
+// start/delta/stop event triplet instead of a single JSON array. A tool_use
+// block's delta uses Anthropic's "input_json_delta" shape (partial_json is
+// the JSON-encoded input as one string chunk, matching the "NOT true token
+// streaming" constraint above — the whole input arrives in one delta).
 func writeAnthropicSSEStream(w http.ResponseWriter, model string, resp *backend.Response) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -481,26 +632,48 @@ func writeAnthropicSSEStream(w http.ResponseWriter, model string, resp *backend.
 		},
 	})
 
-	writeEvent("content_block_start", map[string]interface{}{
-		"type":          "content_block_start",
-		"index":         0,
-		"content_block": map[string]interface{}{"type": "text", "text": ""},
-	})
+	index := 0
+	if resp.Content != "" {
+		writeEvent("content_block_start", map[string]interface{}{
+			"type":          "content_block_start",
+			"index":         index,
+			"content_block": map[string]interface{}{"type": "text", "text": ""},
+		})
+		writeEvent("content_block_delta", map[string]interface{}{
+			"type":  "content_block_delta",
+			"index": index,
+			"delta": map[string]interface{}{"type": "text_delta", "text": resp.Content},
+		})
+		writeEvent("content_block_stop", map[string]interface{}{
+			"type":  "content_block_stop",
+			"index": index,
+		})
+		index++
+	}
 
-	writeEvent("content_block_delta", map[string]interface{}{
-		"type":  "content_block_delta",
-		"index": 0,
-		"delta": map[string]interface{}{"type": "text_delta", "text": resp.Content},
-	})
-
-	writeEvent("content_block_stop", map[string]interface{}{
-		"type":  "content_block_stop",
-		"index": 0,
-	})
+	for _, tu := range resp.ToolUses {
+		writeEvent("content_block_start", map[string]interface{}{
+			"type":  "content_block_start",
+			"index": index,
+			"content_block": map[string]interface{}{
+				"type": "tool_use", "id": tu.ID, "name": tu.Name, "input": map[string]interface{}{},
+			},
+		})
+		writeEvent("content_block_delta", map[string]interface{}{
+			"type":  "content_block_delta",
+			"index": index,
+			"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": string(tu.Input)},
+		})
+		writeEvent("content_block_stop", map[string]interface{}{
+			"type":  "content_block_stop",
+			"index": index,
+		})
+		index++
+	}
 
 	writeEvent("message_delta", map[string]interface{}{
 		"type":  "message_delta",
-		"delta": map[string]interface{}{"stop_reason": "end_turn", "stop_sequence": nil},
+		"delta": map[string]interface{}{"stop_reason": anthropicStopReason(resp), "stop_sequence": nil},
 		"usage": map[string]interface{}{"output_tokens": resp.CompletionTokensEst},
 	})
 

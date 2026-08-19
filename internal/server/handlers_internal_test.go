@@ -22,14 +22,21 @@ import (
 // stubAdapter is a no-op backend.Adapter used to register a backend with the
 // router without requiring any real LLM credentials. supportsTools controls
 // the value returned by Capabilities().SupportsTools (zero value: false,
-// matching the CLI-adapter default used by most tests).
+// matching the CLI-adapter default used by most tests). response, when
+// non-nil, is returned verbatim by Invoke instead of the default
+// {Content: "stub"} — used by lr-add405's tool-carriage tests to script a
+// response carrying ToolUses.
 type stubAdapter struct {
 	id            string
 	supportsTools bool
+	response      *backend.Response
 }
 
 func (s *stubAdapter) ID() string { return s.id }
 func (s *stubAdapter) Invoke(_ context.Context, _ *backend.Request) (*backend.Response, error) {
+	if s.response != nil {
+		return s.response, nil
+	}
 	return &backend.Response{Content: "stub"}, nil
 }
 func (s *stubAdapter) Capabilities() backend.Capabilities {

@@ -51,7 +51,9 @@ func (a *CodexSubagentAdapter) ID() string { return a.id }
 // Capabilities reports the codex-subagent adapter's wire protocol support.
 // Like the direct codex CLI path, this pipes a flat prompt through the
 // claude -p --agent codex invocation — no tool, streaming, or image
-// passthrough.
+// passthrough. Invoke never reads Request.Tools and never populates
+// Response.ToolUses (lr-add405); see ClaudeCLIAdapter's Capabilities doc
+// for the shared "no structured wire field" rationale.
 func (a *CodexSubagentAdapter) Capabilities() Capabilities {
 	return Capabilities{SupportsTools: false, SupportsStreaming: false, SupportsImages: false}
 }

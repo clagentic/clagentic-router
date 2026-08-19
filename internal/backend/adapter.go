@@ -8,6 +8,7 @@ package backend
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -40,10 +41,62 @@ type Message struct {
 	Content string `json:"content"`
 }
 
+// ToolDef is one tool definition carried outbound to a tool-capable adapter
+// (lr-add405). Its three fields — name, description, JSON Schema parameters —
+// are genuinely neutral across the Anthropic, OpenAI, and Bedrock Converse
+// families; only the wire envelope differs per family (Anthropic
+// "input_schema", OpenAI "function.parameters", Bedrock
+// "toolSpec.inputSchema.json"). InputSchema is carried as json.RawMessage
+// rather than parsed into a Go struct: the router never validates or
+// interprets a tool's parameter schema, it only relays it, and RawMessage is
+// the only representation that guarantees no information loss (and no
+// dialect leakage — a struct would have to pick a shape, and any shape
+// picked is one brand's shape) when translating from one family's envelope
+// to another's.
+//
+// Explicitly NOT represented here, because they are not commensurable across
+// providers (see CLAUDE.md "Verify per-provider assumptions" and this task's
+// lore record, lr-add405): tool-choice forcing, parallel-tool-call controls,
+// and server-side/built-in tool types (Anthropic computer/text_editor,
+// OpenAI built-ins). A caller sending those gets them ignored by adapters
+// that marshal Tools, exactly as any other field this struct does not carry.
+type ToolDef struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	InputSchema json.RawMessage `json:"input_schema,omitempty"`
+}
+
+// ToolUse is one tool invocation the model asked the caller to perform,
+// carried inbound from a tool-capable adapter's response (lr-add405). ID,
+// Name, and a JSON arguments blob are the neutral core present across
+// Anthropic tool_use blocks, OpenAI tool_calls entries, and Bedrock
+// Converse toolUse content blocks; Input is RawMessage for the same
+// no-information-loss/no-dialect-leakage reason as ToolDef.InputSchema.
+//
+// The router never executes a tool and never accepts a corresponding
+// tool_result back in a later turn — see this package's doc and
+// CLAUDE.md's "Single-shot tool carriage" scope note. The caller that sent
+// Tools on the request owns running the tool and continuing the
+// conversation itself, in a separate request.
+type ToolUse struct {
+	ID    string          `json:"id"`
+	Name  string          `json:"name"`
+	Input json.RawMessage `json:"input"`
+}
+
 // Request is the input to an adapter invocation.
 type Request struct {
 	Messages  []Message
 	MaxTokens int
+	// Tools carries tool definitions outbound to an adapter whose
+	// Capabilities().SupportsTools is true (lr-add405). Adapters that do not
+	// support tools ignore this field entirely — the router-layer capability
+	// filter (see router.FilterChainForTools and its sticky-through-fallback
+	// enforcement in Route) is what prevents a tools-bearing request from
+	// ever reaching one of those adapters in routed mode; this field itself
+	// carries no enforcement. nil/empty means no tools on this request,
+	// matching HasTools below.
+	Tools []ToolDef
 	// WorkingDir is the validated, absolute directory a subprocess adapter
 	// sets as its cmd.Dir. Empty means "not specified by the caller" — see
 	// DefaultWorkingDir for the fallback every subprocess adapter applies in
@@ -128,6 +181,13 @@ type Response struct {
 	// rate_limit_event stream-json line. nil when the CLI did not emit one
 	// (below threshold or not a claude_cli adapter).
 	RateLimitEvent *RateLimitEvent
+	// ToolUses carries any tool_use-equivalent blocks a tool-capable adapter
+	// parsed out of the provider's response (lr-add405). Empty for every
+	// adapter whose Capabilities().SupportsTools is false, and empty for a
+	// tool-capable adapter's response when the model did not choose to call
+	// a tool this turn. The router never executes these and never expects a
+	// corresponding tool_result on a later call — see Request.Tools doc.
+	ToolUses []ToolUse
 }
 
 // ErrorType classifies why an invocation failed.

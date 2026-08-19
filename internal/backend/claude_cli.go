@@ -588,7 +588,12 @@ func (a *ClaudeCLIAdapter) ID() string { return a.id }
 
 // Capabilities reports the claude CLI adapter's wire protocol support.
 // The subprocess path formats messages into a flat prompt string (see
-// FormatMessages) with no tool, streaming, or image passthrough.
+// FormatMessages) with no tool, streaming, or image passthrough — Invoke
+// never reads Request.Tools (FormatMessages only ever sees req.Messages)
+// and never populates Response.ToolUses. This is a genuine transport gap,
+// not merely an unimplemented translation: a subprocess CLI invoked via
+// stdin/argv has no structured wire field to attach a tool schema to and no
+// structured channel to parse a tool_use back out of (lr-add405).
 func (a *ClaudeCLIAdapter) Capabilities() Capabilities {
 	return Capabilities{SupportsTools: false, SupportsStreaming: false, SupportsImages: false}
 }

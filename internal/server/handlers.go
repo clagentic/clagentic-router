@@ -77,11 +77,16 @@ type chatCompletionRequest struct {
 	Messages  []backend.Message `json:"messages"`
 	MaxTokens int               `json:"max_tokens,omitempty"`
 	Stream    bool              `json:"stream,omitempty"`
-	// Tools is decoded only far enough to detect presence (any non-null,
-	// non-empty-array JSON value) — the router's routed-mode translation
-	// does not carry tool definitions through to a backend today. A
-	// non-empty Tools value must route only to a tool-capable backend or be
-	// refused outright; see chatCompletions' tool-capability check.
+	// Tools is decoded only far enough to detect presence at THIS struct
+	// level (any non-null, non-empty-array JSON value) — kept as
+	// json.RawMessage rather than a typed slice so a malformed tools array
+	// only fails when routed mode's stricter decodeOpenAITools actually
+	// needs it, not on every request regardless of whether tools are
+	// present. A non-empty Tools value must route only to a tool-capable
+	// backend or be refused outright; see chatCompletions' tool-capability
+	// check. When present and a tool-capable backend is available,
+	// decodeOpenAITools translates it into backend.Request.Tools
+	// (lr-add405).
 	Tools json.RawMessage `json:"tools,omitempty"`
 	// WorkingDir is an opt-in absolute directory subprocess (CLI) adapters
 	// use as their cmd.Dir. Empty (the default) falls through to
@@ -89,6 +94,87 @@ type chatCompletionRequest struct {
 	// server-side state. Validated at this boundary via
 	// backend.ResolveWorkingDir; ignored entirely by HTTP adapters.
 	WorkingDir string `json:"working_dir,omitempty"`
+}
+
+// openAIToolDef is the wire shape of one entry in the OpenAI Chat
+// Completions "tools" array:
+// {"type":"function","function":{name,description,parameters}}. Decoded
+// only far enough to translate into the neutral backend.ToolDef IR
+// (decodeOpenAITools/toBackendToolDefsFromOpenAI) — see messages.go's
+// anthropicMsgToolDef for the Anthropic-side equivalent.
+type openAIToolDef struct {
+	Type     string `json:"type"`
+	Function struct {
+		Name        string          `json:"name"`
+		Description string          `json:"description,omitempty"`
+		Parameters  json.RawMessage `json:"parameters,omitempty"`
+	} `json:"function"`
+}
+
+// decodeOpenAITools decodes req.Tools (json.RawMessage, presence-checked
+// separately by hasTools) into []openAIToolDef, called only after
+// hasTools(req.Tools) is true.
+func decodeOpenAITools(raw json.RawMessage) ([]openAIToolDef, error) {
+	if !hasTools(raw) {
+		return nil, nil
+	}
+	var tools []openAIToolDef
+	if err := json.Unmarshal(raw, &tools); err != nil {
+		return nil, fmt.Errorf("tools: %w", err)
+	}
+	return tools, nil
+}
+
+// toBackendToolDefsFromOpenAI translates decoded OpenAI tool definitions
+// into the neutral backend.ToolDef IR. Returns nil for an empty input,
+// matching the "absent means no tools" contract of backend.Request.Tools.
+func toBackendToolDefsFromOpenAI(tools []openAIToolDef) []backend.ToolDef {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]backend.ToolDef, len(tools))
+	for i, t := range tools {
+		out[i] = backend.ToolDef{Name: t.Function.Name, Description: t.Function.Description, InputSchema: t.Function.Parameters}
+	}
+	return out
+}
+
+// toOpenAIToolCalls translates backend.ToolUse results into OpenAI
+// message.tool_calls entries for the chat completion response.
+func toOpenAIToolCalls(uses []backend.ToolUse) []openAIToolCall {
+	if len(uses) == 0 {
+		return nil
+	}
+	out := make([]openAIToolCall, len(uses))
+	for i, u := range uses {
+		out[i] = openAIToolCall{ID: u.ID, Type: "function"}
+		out[i].Function.Name = u.Name
+		out[i].Function.Arguments = string(u.Input)
+	}
+	return out
+}
+
+// openAIToolCall is one entry of message.tool_calls in a chat completion
+// response — the OpenAI wire shape for a model-requested tool invocation.
+// Function.Arguments is a JSON-encoded string (not a raw object), matching
+// the real OpenAI API's wire contract.
+type openAIToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+// chatCompletionFinishReason returns "tool_calls" when the backend returned
+// any tool_use blocks (lr-add405), "stop" otherwise — the OpenAI
+// finish_reason taxonomy's tool-calling value.
+func chatCompletionFinishReason(resp *backend.Response) string {
+	if len(resp.ToolUses) > 0 {
+		return "tool_calls"
+	}
+	return "stop"
 }
 
 // hasTools reports whether raw is a present, non-null, non-empty-array JSON
@@ -112,9 +198,19 @@ type chatCompletionResponse struct {
 }
 
 type choice struct {
-	Index        int             `json:"index"`
-	Message      backend.Message `json:"message"`
-	FinishReason string          `json:"finish_reason"`
+	Index        int                   `json:"index"`
+	Message      chatCompletionRespMsg `json:"message"`
+	FinishReason string                `json:"finish_reason"`
+}
+
+// chatCompletionRespMsg is the response-side message shape — distinct from
+// backend.Message (the internal request/history type) because only the
+// response needs to carry tool_calls; adding it to backend.Message would
+// leak a wire-response concern into the internal neutral IR (lr-add405).
+type chatCompletionRespMsg struct {
+	Role      string           `json:"role"`
+	Content   string           `json:"content,omitempty"`
+	ToolCalls []openAIToolCall `json:"tool_calls,omitempty"`
 }
 
 type usage struct {
@@ -141,10 +237,28 @@ type chunkChoice struct {
 }
 
 // chunkDelta carries the incremental content for one SSE chunk.
-// Role is set on the first chunk; Content on the content chunk; both empty on the final chunk.
+// Role is set on the first chunk; Content or ToolCalls on the content
+// chunk; all empty on the final chunk.
 type chunkDelta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role      string               `json:"role,omitempty"`
+	Content   string               `json:"content,omitempty"`
+	ToolCalls []chunkToolCallDelta `json:"tool_calls,omitempty"`
+}
+
+// chunkToolCallDelta is one entry of delta.tool_calls in a streaming chunk.
+// Index is required by the OpenAI streaming grammar (accumulates
+// tool_calls by position across chunks); since this router emits each
+// tool_call's full id/name/arguments in a single chunk rather than true
+// incremental deltas (same "NOT true token streaming" limitation as the
+// text path), Index is simply the tool_call's position in resp.ToolUses.
+type chunkToolCallDelta struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id,omitempty"`
+	Type     string `json:"type,omitempty"`
+	Function struct {
+		Name      string `json:"name,omitempty"`
+		Arguments string `json:"arguments,omitempty"`
+	} `json:"function"`
 }
 
 // chatCompletions handles POST /v1/chat/completions.
@@ -202,6 +316,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reqHasTools := hasTools(req.Tools)
+	var toolDefs []backend.ToolDef
 	if reqHasTools {
 		filtered, err := h.router.FilterChainForTools(chain)
 		if err != nil {
@@ -220,6 +335,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		chain = filtered
+
+		openAITools, err := decodeOpenAITools(req.Tools)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
+		toolDefs = toBackendToolDefsFromOpenAI(openAITools)
 	}
 
 	routerReq := &backend.Request{
@@ -227,6 +349,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		MaxTokens:  req.MaxTokens,
 		WorkingDir: workingDir,
 		HasTools:   reqHasTools,
+		Tools:      toolDefs,
 	}
 
 	resp, meta, err := h.router.Route(r.Context(), routerReq, chain)
@@ -262,9 +385,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		Created: time.Now().Unix(),
 		Model:   req.Model,
 		Choices: []choice{{
-			Index:        0,
-			Message:      backend.Message{Role: "assistant", Content: resp.Content},
-			FinishReason: "stop",
+			Index: 0,
+			Message: chatCompletionRespMsg{
+				Role:      "assistant",
+				Content:   resp.Content,
+				ToolCalls: toOpenAIToolCalls(resp.ToolUses),
+			},
+			FinishReason: chatCompletionFinishReason(resp),
 		}},
 		Usage: usage{
 			PromptTokens:     resp.PromptTokensEst,
@@ -695,11 +822,19 @@ func (h *Handler) version(w http.ResponseWriter, r *http.Request) {
 
 // writeSSEStream writes an OpenAI-compatible Server-Sent Events response for
 // stream:true requests. Because backends return complete responses (not token
-// streams), we emit three events:
+// streams), we emit:
 //
 //  1. A role-only delta chunk (signals start of assistant turn to the client)
-//  2. A content delta chunk containing the full response text
-//  3. A finish chunk with finish_reason:"stop" and empty delta
+//  2. A content delta chunk containing the full response text — emitted
+//     unconditionally (even when resp.Content is empty), matching this
+//     handler's pre-lr-add405 contract
+//  3. A tool_calls delta chunk carrying every resp.ToolUses entry in one
+//     chunk (lr-add405; only when resp.ToolUses is non-empty) — see
+//     chunkToolCallDelta's doc for why this is one chunk, not true
+//     incremental deltas
+//  4. A finish chunk with finish_reason ("tool_calls" when ToolUses is
+//     non-empty, "stop" otherwise — chatCompletionFinishReason) and empty
+//     delta
 //
 // Followed by the required "data: [DONE]" sentinel.
 //
@@ -716,7 +851,7 @@ func writeSSEStream(w http.ResponseWriter, model string, resp *backend.Response)
 
 	id := "chatcmpl-" + uuid.NewString()[:8]
 	now := time.Now().Unix()
-	stopStr := "stop"
+	finishReason := chatCompletionFinishReason(resp)
 
 	chunks := []chatCompletionChunk{
 		// chunk 1: role delta — signals start of assistant turn
@@ -726,21 +861,42 @@ func writeSSEStream(w http.ResponseWriter, model string, resp *backend.Response)
 				Index: 0, Delta: chunkDelta{Role: "assistant"}, FinishReason: nil,
 			}},
 		},
-		// chunk 2: content delta — full response text in one chunk
-		{
-			ID: id, Object: "chat.completion.chunk", Created: now, Model: model,
-			Choices: []chunkChoice{{
-				Index: 0, Delta: chunkDelta{Content: resp.Content}, FinishReason: nil,
-			}},
-		},
-		// chunk 3: finish chunk — empty delta, finish_reason set
-		{
-			ID: id, Object: "chat.completion.chunk", Created: now, Model: model,
-			Choices: []chunkChoice{{
-				Index: 0, Delta: chunkDelta{}, FinishReason: &stopStr,
-			}},
-		},
 	}
+
+	// Content delta chunk: emitted unconditionally, even for an empty
+	// string, matching this handler's pre-lr-add405 contract (an OpenAI
+	// client's stream parser expects a content delta chunk in the normal
+	// text-completion case; only a tool_calls-only turn adds a distinct
+	// tool_calls chunk on top, it does not replace this one).
+	chunks = append(chunks, chatCompletionChunk{
+		ID: id, Object: "chat.completion.chunk", Created: now, Model: model,
+		Choices: []chunkChoice{{
+			Index: 0, Delta: chunkDelta{Content: resp.Content}, FinishReason: nil,
+		}},
+	})
+
+	if len(resp.ToolUses) > 0 {
+		toolCallDeltas := make([]chunkToolCallDelta, len(resp.ToolUses))
+		for i, tu := range resp.ToolUses {
+			toolCallDeltas[i] = chunkToolCallDelta{Index: i, ID: tu.ID, Type: "function"}
+			toolCallDeltas[i].Function.Name = tu.Name
+			toolCallDeltas[i].Function.Arguments = string(tu.Input)
+		}
+		chunks = append(chunks, chatCompletionChunk{
+			ID: id, Object: "chat.completion.chunk", Created: now, Model: model,
+			Choices: []chunkChoice{{
+				Index: 0, Delta: chunkDelta{ToolCalls: toolCallDeltas}, FinishReason: nil,
+			}},
+		})
+	}
+
+	// finish chunk — empty delta, finish_reason set
+	chunks = append(chunks, chatCompletionChunk{
+		ID: id, Object: "chat.completion.chunk", Created: now, Model: model,
+		Choices: []chunkChoice{{
+			Index: 0, Delta: chunkDelta{}, FinishReason: &finishReason,
+		}},
+	})
 
 	for _, chunk := range chunks {
 		data, err := json.Marshal(chunk)
