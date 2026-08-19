@@ -1,10 +1,11 @@
 // internal/backend/bedrock_api.go — adapter for AWS Bedrock's Converse API.
 //
 // Uses the AWS Bedrock Runtime Converse API, which is uniform across model
-// families for text-only, non-streaming invocation (both the Anthropic and
-// OpenAI families hosted on Bedrock use the same Converse call shape). This
-// is why one adapter covers both families with no model-family-specific
-// config — see CLAUDE.md's "Design constraint" note for bedrock_api.
+// families for non-streaming invocation, text content, and tool calling
+// (both the Anthropic and OpenAI families hosted on Bedrock use the same
+// Converse call shape). This is why one adapter covers both families with
+// no model-family-specific config — see CLAUDE.md's "Design constraint"
+// note for bedrock_api. Image content remains out of scope (lr-add405).
 //
 // Credentials come exclusively from the standard AWS SDK credential chain
 // (env vars, shared config/credentials files, web identity, ECS, IMDS) via
