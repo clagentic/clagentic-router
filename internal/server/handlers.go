@@ -201,10 +201,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if hasTools(req.Tools) {
+	reqHasTools := hasTools(req.Tools)
+	if reqHasTools {
 		filtered, err := h.router.FilterChainForTools(chain)
 		if err != nil {
 			if errors.Is(err, router.ErrNoToolCapableBackend) {
+				// Refused before Route is ever called — Route's own call_log
+				// writes never fire for this request, so record the refusal
+				// explicitly (presence only; see LogToolRefusal doc).
+				h.router.LogToolRefusal(r.Context(), chain, req.Model)
 				writeError(w, http.StatusUnprocessableEntity, "no_tool_capable_backend",
 					fmt.Sprintf("request carries tools but model %q resolves to no tool-capable backend; "+
 						"remove tools or route to a backend whose adapter declares Capabilities().SupportsTools", req.Model))
@@ -221,6 +226,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		Messages:   req.Messages,
 		MaxTokens:  req.MaxTokens,
 		WorkingDir: workingDir,
+		HasTools:   reqHasTools,
 	}
 
 	resp, meta, err := h.router.Route(r.Context(), routerReq, chain)
