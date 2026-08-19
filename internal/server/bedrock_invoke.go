@@ -156,6 +156,7 @@ func (h *Handler) bedrockRouted(w http.ResponseWriter, r *http.Request, modelID 
 	}
 
 	reqHasTools := hasTools(req.Tools)
+	var toolDefs []backend.ToolDef
 	if reqHasTools {
 		filtered, err := h.router.FilterChainForTools(chain)
 		if err != nil {
@@ -175,6 +176,16 @@ func (h *Handler) bedrockRouted(w http.ResponseWriter, r *http.Request, modelID 
 			return
 		}
 		chain = filtered
+
+		// Reuse decodeAnthropicTools/toBackendToolDefs (messages.go) — the
+		// Bedrock and direct Anthropic Messages "tools" array share the same
+		// name/description/input_schema wire shape, only the envelope differs.
+		anthropicTools, err := decodeAnthropicTools(req.Tools)
+		if err != nil {
+			writeBedrockError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		toolDefs = toBackendToolDefs(anthropicTools)
 	}
 
 	// Reuse anthropicToBackendMessages (messages.go) — the Bedrock and direct
@@ -193,6 +204,7 @@ func (h *Handler) bedrockRouted(w http.ResponseWriter, r *http.Request, modelID 
 		Messages:  msgs,
 		MaxTokens: req.MaxTokens,
 		HasTools:  reqHasTools,
+		Tools:     toolDefs,
 	}
 
 	resp, meta, err := h.router.Route(r.Context(), routerReq, chain)
@@ -221,16 +233,15 @@ func (h *Handler) bedrockRouted(w http.ResponseWriter, r *http.Request, modelID 
 
 	// The Bedrock InvokeModel response body for Anthropic models is the same
 	// shape as the direct Anthropic Messages response — no Bedrock-specific
-	// wrapper — so anthropicMsgResponse (messages.go) is reused as-is.
+	// wrapper — so anthropicMsgResponse (messages.go) is reused as-is,
+	// including tool_use content blocks and stop_reason (lr-add405).
 	writeJSON(w, http.StatusOK, anthropicMsgResponse{
-		ID:      "msg_" + uuid.NewString()[:24],
-		Type:    "message",
-		Role:    "assistant",
-		Model:   modelID,
-		Content: []anthropicMsgContentBlock{{Type: "text", Text: resp.Content}},
-		// Same documented limitation as messagesRouted: backends never surface
-		// a distinct stop reason, since tool calls are dropped in translation.
-		StopReason: "end_turn",
+		ID:         "msg_" + uuid.NewString()[:24],
+		Type:       "message",
+		Role:       "assistant",
+		Model:      modelID,
+		Content:    anthropicResponseContentBlocks(resp),
+		StopReason: anthropicStopReason(resp),
 		Usage: anthropicMsgUsage{
 			InputTokens:  resp.PromptTokensEst,
 			OutputTokens: resp.CompletionTokensEst,

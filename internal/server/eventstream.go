@@ -44,14 +44,20 @@ type bedrockEventStreamPayload = json.RawMessage
 // writeBedrockEventStream emits a routed-mode Bedrock InvokeModelWithResponseStream
 // response for a complete (non-token-streamed) backend response. Mirrors
 // writeAnthropicSSEStream's event sequence (message_start ->
-// content_block_start -> content_block_delta -> content_block_stop ->
-// message_delta -> message_stop) but frames each event as an AWS event-stream
-// "chunk" message instead of an SSE line, per the Bedrock wire contract.
+// content_block_start -> content_block_delta -> content_block_stop, repeated
+// per content block -> message_delta -> message_stop) but frames each event
+// as an AWS event-stream "chunk" message instead of an SSE line, per the
+// Bedrock wire contract.
 //
 // Like the other routed-mode streaming paths, this is NOT true token
-// streaming — backends return complete responses, so the full text is
-// emitted in one content_block_delta frame. Documented routed-mode limitation,
-// consistent with writeSSEStream/writeAnthropicSSEStream.
+// streaming — backends return complete responses, so each block's full
+// content is emitted in one content_block_delta frame. Documented
+// routed-mode limitation, consistent with writeSSEStream/writeAnthropicSSEStream.
+//
+// Content blocks and stop_reason (lr-add405) mirror writeAnthropicSSEStream
+// exactly: a text block at index 0 (only when resp.Content is non-empty),
+// followed by one tool_use block per resp.ToolUses at incrementing indices,
+// each using Anthropic's input_json_delta event shape.
 func writeBedrockEventStream(w http.ResponseWriter, model string, resp *backend.Response) error {
 	w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
 	w.Header().Set("X-Amzn-Bedrock-Content-Type", "application/json")
@@ -99,32 +105,60 @@ func writeBedrockEventStream(w http.ResponseWriter, model string, resp *backend.
 		return err
 	}
 
-	if err := writeChunk(map[string]interface{}{
-		"type":          "content_block_start",
-		"index":         0,
-		"content_block": map[string]interface{}{"type": "text", "text": ""},
-	}); err != nil {
-		return err
+	index := 0
+	if resp.Content != "" {
+		if err := writeChunk(map[string]interface{}{
+			"type":          "content_block_start",
+			"index":         index,
+			"content_block": map[string]interface{}{"type": "text", "text": ""},
+		}); err != nil {
+			return err
+		}
+		if err := writeChunk(map[string]interface{}{
+			"type":  "content_block_delta",
+			"index": index,
+			"delta": map[string]interface{}{"type": "text_delta", "text": resp.Content},
+		}); err != nil {
+			return err
+		}
+		if err := writeChunk(map[string]interface{}{
+			"type":  "content_block_stop",
+			"index": index,
+		}); err != nil {
+			return err
+		}
+		index++
 	}
 
-	if err := writeChunk(map[string]interface{}{
-		"type":  "content_block_delta",
-		"index": 0,
-		"delta": map[string]interface{}{"type": "text_delta", "text": resp.Content},
-	}); err != nil {
-		return err
-	}
-
-	if err := writeChunk(map[string]interface{}{
-		"type":  "content_block_stop",
-		"index": 0,
-	}); err != nil {
-		return err
+	for _, tu := range resp.ToolUses {
+		if err := writeChunk(map[string]interface{}{
+			"type":  "content_block_start",
+			"index": index,
+			"content_block": map[string]interface{}{
+				"type": "tool_use", "id": tu.ID, "name": tu.Name, "input": map[string]interface{}{},
+			},
+		}); err != nil {
+			return err
+		}
+		if err := writeChunk(map[string]interface{}{
+			"type":  "content_block_delta",
+			"index": index,
+			"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": string(tu.Input)},
+		}); err != nil {
+			return err
+		}
+		if err := writeChunk(map[string]interface{}{
+			"type":  "content_block_stop",
+			"index": index,
+		}); err != nil {
+			return err
+		}
+		index++
 	}
 
 	if err := writeChunk(map[string]interface{}{
 		"type":  "message_delta",
-		"delta": map[string]interface{}{"stop_reason": "end_turn", "stop_sequence": nil},
+		"delta": map[string]interface{}{"stop_reason": anthropicStopReason(resp), "stop_sequence": nil},
 		"usage": map[string]interface{}{"output_tokens": resp.CompletionTokensEst},
 	}); err != nil {
 		return err
