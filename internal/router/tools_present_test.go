@@ -15,6 +15,19 @@ import (
 	"github.com/clagentic/clagentic-router/internal/store"
 )
 
+// toolCapableMockAdapter is mockAdapter with Capabilities().SupportsTools
+// forced true, for tests that route a HasTools:true request and need the
+// single candidate backend to survive Route's sticky-through-fallback
+// tool-capability filter (lr-add405) rather than be filtered out before
+// Invoke is ever called.
+type toolCapableMockAdapter struct {
+	mockAdapter
+}
+
+func (m *toolCapableMockAdapter) Capabilities() backend.Capabilities {
+	return backend.Capabilities{SupportsTools: true}
+}
+
 // newStoreBackedTestRouter mirrors newTestRouter (offline_recovery_probe_test.go)
 // but wires a real *store.Store so call_log writes are observable.
 func newStoreBackedTestRouter(t *testing.T, id string, adapterFn func(ctx context.Context, req *backend.Request) (*backend.Response, error)) (*Router, *store.Store) {
@@ -26,7 +39,11 @@ func newStoreBackedTestRouter(t *testing.T, id string, adapterFn func(ctx contex
 	}
 	t.Cleanup(func() { st.Close() })
 
-	adapter := &mockAdapter{id: id, invoke: adapterFn}
+	// A tool-capable adapter — most of this file's tests set req.HasTools on
+	// a single-backend chain, and Route's sticky-through-fallback filter
+	// (lr-add405) now excludes a candidate whose adapter is not
+	// SupportsTools:true before Invoke is ever attempted.
+	adapter := &toolCapableMockAdapter{mockAdapter{id: id, invoke: adapterFn}}
 	adapters := map[string]backend.Adapter{id: adapter}
 	cfg := &config.Config{
 		Backends: map[string]*config.BackendConfig{
