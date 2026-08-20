@@ -229,8 +229,13 @@ func (a *GeminiCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 
 	if err != nil || exitCode != 0 {
 		// In --output-format json mode error JSON goes to stderr.
-		errType := ClassifyError(stderrStr+stdout.String(), exitCode)
-		resetAt := ParseResetTime(stderrStr + stdout.String())
+		// Classify (and parse reset time) against the FULL stderr+stdout, not
+		// the truncated display string above (lr-807319) — a head-truncation
+		// window can silently drop tail-positioned error text. truncate() is
+		// still used for the Raw display field only.
+		full := stderr.String() + stdout.String()
+		errType := ClassifyError(full, exitCode)
+		resetAt := ParseResetTime(full)
 		raw := stderrStr
 		if raw == "" {
 			raw = truncate(stdout.String(), 500)

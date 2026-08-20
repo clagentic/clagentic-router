@@ -150,6 +150,61 @@ func TestCodexCLI_Invoke_SubprocessEnvAWSCredentialsSurvive(t *testing.T) {
 	}
 }
 
+// writeFakeCodexBinFailing writes a fake "codex" binary that prints a long
+// preamble to STDERR (simulating codex's banner/progress text, which arrives
+// before any error text on a real stream-disconnect failure) followed by an
+// auth-classifiable error line, then exits non-zero. preambleLen controls how
+// much filler precedes the error line, letting the test push the error text
+// past the 500-char truncate() window that codex_cli.go applies to stderr
+// specifically (stdout is never truncated before classification, so the
+// preamble must be on stderr to reproduce the defect).
+func writeFakeCodexBinFailing(t *testing.T, dir string, preambleLen int) string {
+	t.Helper()
+	binPath := filepath.Join(dir, "codex")
+	preamble := strings.Repeat("x", preambleLen)
+	script := "#!/bin/sh\n" +
+		"printf '%s' " + shellQuote(preamble) + " >&2\n" +
+		"printf '%s\\n' " + shellQuote("stream disconnected before completion: failed to load AWS credentials: an error occurred while loading credentials") + " >&2\n" +
+		"exit 1\n"
+	if err := os.WriteFile(binPath, []byte(script), 0755); err != nil {
+		t.Fatalf("write fake codex bin: %v", err)
+	}
+	return binPath
+}
+
+// TestCodexCLI_Invoke_ClassifiesFullOutputNotTruncatedWindow is the lr-807319
+// regression test: MILLER diagnosed a production Bedrock credential failure
+// misclassified as error_type=unknown because ClassifyError was fed
+// truncate(stderr, 500)+stdout instead of the full combined output — codex
+// writes its banner/progress preamble first and the credential/stream error
+// at the tail, so a long-enough preamble pushed the "credential" substring
+// outside the classified (truncated) window even though it was well within
+// the actual combined output. This reproduces that shape with a stderr
+// preamble far longer than the 500-char truncate() window and asserts the
+// result is ErrTypeAuth, not ErrTypeUnknown.
+func TestCodexCLI_Invoke_ClassifiesFullOutputNotTruncatedWindow(t *testing.T) {
+	dir := t.TempDir()
+	// Preamble alone exceeds the 500-char truncate() window used for the Raw
+	// display field, so a defect that classifies against a head-truncated
+	// window would never see the credential text that follows it.
+	bin := writeFakeCodexBinFailing(t, dir, 800)
+
+	adapter := NewCodexCLIAdapter("test", "", "", "", "", bin)
+	req := &Request{Messages: []Message{{Role: "user", Content: "ping"}}}
+
+	_, err := adapter.Invoke(context.Background(), req)
+	if err == nil {
+		t.Fatal("expected Invoke to return an error, got nil")
+	}
+	ie, ok := err.(*InvokeError)
+	if !ok {
+		t.Fatalf("expected *InvokeError, got %T: %v", err, err)
+	}
+	if ie.Type != ErrTypeAuth {
+		t.Errorf("Type = %q, want %q (credential text past the 500-char head window must still classify as auth)", ie.Type, ErrTypeAuth)
+	}
+}
+
 // findFlagAll returns every value immediately following an occurrence of flag
 // in args, preserving order. Used because -c may appear more than once.
 func findFlagAll(args []string, flag string) []string {
