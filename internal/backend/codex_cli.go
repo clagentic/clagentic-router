@@ -35,35 +35,57 @@
 // The router does not parse, cache, or expand model strings. Resolution (if any)
 // is delegated to the codex CLI on each invocation.
 //
-// Proactive quota signal investigation (lr-c98c Slice E): this adapter
-// invokes `codex exec` with NO --json/--output-format flag at all (unlike
-// claude_cli's --output-format stream-json or gemini_cli's --output-format
-// json) — Invoke reads cmd.Stdout as a flat trimmed string (see Invoke
-// below), never as a line-delimited or structured stream. There is
-// currently no event stream of any kind for this adapter to inspect for a
-// proactive quota field, structured or otherwise, because there is no
-// structured output at all on this call path today.
+// Proactive quota signal investigation (lr-c98c Slice E), UPDATED with live
+// findings from a second agent that had a permitted execution path (this
+// adapter's own author could not invoke `codex` at all — guard-bash denies
+// it — and said so rather than guessing; that gap is what let the following
+// get checked against a real run instead of shipping unverified):
 //
-// This task's own instruction was to run codex fresh with JSON output and
-// capture all emitted event types. That step could NOT be completed for
-// this PR: AMoS's Bash tool is allowlisted by guard-bash.py and does not
-// permit invoking the `codex` binary at all (not even `codex --help`) —
-// only git/lore/build-and-test tooling and a small set of scoped scripts
-// are reachable, and no other tool available to this agent (Read/Write/
-// Edit/Glob/Grep/Agent) can execute a subprocess either. codex_discovery.go
-// and codex_model_discovery.go both invoke `codex debug models`/config
-// reads as SEPARATE, narrower subprocess calls outside this adapter — this
-// file's own Invoke path was never run live for this investigation, and
-// whether `codex exec` has an undocumented --json/--experimental-json mode
-// that emits a proactive quota event could not be verified against a live
-// run, only against ParseResetTime's existing reactive error-text parsing
-// (errparse.go), which this adapter already uses on failure paths.
+//  1. `codex exec --json` IS a real, documented flag ("Print events to
+//     stdout as JSONL" per `codex exec --help`, codex-cli 0.147.0, verified
+//     live) — the "undocumented mode" open question this comment used to
+//     pose is resolved. But its JSONL stream (thread.started/turn.started/
+//     item.completed/turn.completed) carries only consumption counters
+//     (input_tokens, cached_input_tokens, output_tokens,
+//     reasoning_output_tokens) — no rate-limit or quota field of any kind.
+//     It does not answer this slice's proactive-quota question by itself,
+//     and this adapter still does not pass --json to `codex exec` (see
+//     Invoke below) — no reason to change a load-bearing invocation for a
+//     flag whose payload doesn't carry what this slice needs anyway.
 //
-// Per this task's own framing, a documented negative is a first-class
-// outcome — codex_cli remains reactive-only (quota known only from error
-// text via ParseResetTime) until someone with a permitted execution path
-// re-verifies against a live run of `codex exec` with whatever
-// machine-readable output flag it may support.
+//  2. A genuine proactive quota snapshot DOES exist, but on a different
+//     transport: the codex app-server JSON-RPC protocol's
+//     `account/rateLimits/read` method (schema:
+//     v2/GetAccountRateLimitsResponse.json via
+//     `codex app-server generate-json-schema --experimental`), returning
+//     RateLimitWindow{usedPercent, resetsAt, windowDurationMins} plus a
+//     CreditsSnapshot and planType — verified live against a real
+//     ChatGPT-Plus account. This is marked EXPERIMENTAL by codex itself.
+//
+// `codex app-server` is not a one-shot subprocess call like `codex exec` or
+// `codex debug models` (codex_model_discovery.go) — it is a long-running
+// process that speaks JSON-RPC over stdio and (per every JSON-RPC/LSP-style
+// server this shape resembles) expects an `initialize` handshake before any
+// other method call. The live verification that produced the JSON above
+// confirmed the method and its response shape, but not the full
+// handshake/framing contract (e.g. whether messages are newline-delimited
+// JSON, as `codex exec --json` uses, or Content-Length-framed like LSP) —
+// getting that wrong in a bounded, timeout-guarded client would still be a
+// silent construction-time or steady-state hang risk against codex_cli's
+// load-bearing production path, and this repo's author has no live `codex`
+// execution path to verify it further. Per CLAUDE.md's "verify per-provider
+// assumptions against the live source, never generalize from one example"
+// and this task's own framing (a documented, honest gap is a first-class
+// outcome), wiring `account/rateLimits/read` into quota_snapshots is
+// deferred rather than guessed at. TODO(lr-c98c): implement a bounded
+// (timeout + response-size-capped, mirroring
+// codex_model_discovery.go's runCodexDebugModelsWithLimits) app-server
+// JSON-RPC client, cached at adapter-construction time or on a TTL — never
+// per-Invoke — once the handshake/framing contract is verified against a
+// live run by an agent with a permitted `codex` execution path.
+//
+// codex_cli remains reactive-only (quota known only from error text via
+// ParseResetTime) until that follow-up lands.
 package backend
 
 import (
