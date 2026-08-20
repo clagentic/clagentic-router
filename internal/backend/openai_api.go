@@ -95,9 +95,28 @@ type openaiChoice struct {
 	FinishReason string        `json:"finish_reason"`
 }
 
+// openaiUsage mirrors the Chat Completions API's "usage" object.
+// PromptTokensDetails.CachedTokens (lr-718af0) is a documented public field
+// — https://platform.openai.com/docs/api-reference/chat/object, "usage" —
+// reporting input tokens served from OpenAI's automatic prompt cache.
+// OpenAI's caching model has no separate "write" step exposed to the
+// caller (caching is managed server-side and populated automatically on
+// repeated prefixes), so there is no cache-write field to parse here —
+// CacheWriteTokens on the resulting CacheUsage is always a real, documented
+// zero for this adapter, not an unsupported value (see CacheUsage's doc).
 type openaiUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
+	PromptTokens        int                      `json:"prompt_tokens"`
+	CompletionTokens    int                      `json:"completion_tokens"`
+	PromptTokensDetails openaiPromptTokenDetails `json:"prompt_tokens_details"`
+}
+
+// openaiPromptTokenDetails is the "prompt_tokens_details" sub-object of
+// Chat Completions usage — CachedTokens is the only field this adapter
+// reads; other documented sub-fields (e.g. audio_tokens) are not relevant
+// to text-only chat completions and are omitted here, matching the
+// existing pattern of carrying only the fields this adapter actually uses.
+type openaiPromptTokenDetails struct {
+	CachedTokens int `json:"cached_tokens"`
 }
 
 type openaiResponse struct {
@@ -260,5 +279,14 @@ func (a *OpenAIAPIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 		CompletionTokensEst: out.Usage.CompletionTokens,
 		RateLimitInfo:       rl,
 		ToolUses:            toolUses,
+		// CacheUsage is always non-nil for a successful openai_api response
+		// (lr-718af0) — Chat Completions always returns a usage object.
+		// CacheWriteTokens is a real, documented zero here (see
+		// openaiUsage's doc) — OpenAI's cache has no write-side concept to
+		// report, not an "unsupported" gap.
+		CacheUsage: &CacheUsage{
+			InputTokens:     int64(out.Usage.PromptTokens),
+			CacheReadTokens: int64(out.Usage.PromptTokensDetails.CachedTokens),
+		},
 	}, nil
 }
