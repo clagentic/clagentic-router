@@ -236,11 +236,15 @@ func TestOpenAIAPIAdapter_NoAPIKey(t *testing.T) {
 }
 
 func TestOpenAIAPIAdapter_RateLimitHeadersPopulated(t *testing.T) {
-	// Verify that rate-limit response headers are harvested into RateLimitInfo.
+	// Verify that rate-limit response headers are harvested into RateLimitInfo,
+	// including the -limit headers added lr-c98c Slice E so the router can
+	// compute a synthetic utilization (1 - remaining/limit).
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("x-ratelimit-remaining-tokens", "8000")
+		w.Header().Set("x-ratelimit-limit-tokens", "10000")
 		w.Header().Set("x-ratelimit-reset-tokens", "6m0s")
 		w.Header().Set("x-ratelimit-remaining-requests", "50")
+		w.Header().Set("x-ratelimit-limit-requests", "60")
 		w.Header().Set("x-ratelimit-reset-requests", "1m0s")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -258,8 +262,14 @@ func TestOpenAIAPIAdapter_RateLimitHeadersPopulated(t *testing.T) {
 	if resp.RateLimitInfo.TokensRemaining != 8000 {
 		t.Errorf("TokensRemaining = %d, want 8000", resp.RateLimitInfo.TokensRemaining)
 	}
+	if resp.RateLimitInfo.TokensLimit != 10000 {
+		t.Errorf("TokensLimit = %d, want 10000", resp.RateLimitInfo.TokensLimit)
+	}
 	if resp.RateLimitInfo.RequestsRemaining != 50 {
 		t.Errorf("RequestsRemaining = %d, want 50", resp.RateLimitInfo.RequestsRemaining)
+	}
+	if resp.RateLimitInfo.RequestsLimit != 60 {
+		t.Errorf("RequestsLimit = %d, want 60", resp.RateLimitInfo.RequestsLimit)
 	}
 	if resp.RateLimitInfo.TokensResetAt.IsZero() {
 		t.Error("TokensResetAt is zero, expected a future time")
@@ -292,8 +302,14 @@ func TestOpenAIAPIAdapter_RateLimitHeadersAbsent(t *testing.T) {
 	if resp.RateLimitInfo.TokensRemaining != 0 {
 		t.Errorf("TokensRemaining = %d, want 0 (absent header)", resp.RateLimitInfo.TokensRemaining)
 	}
+	if resp.RateLimitInfo.TokensLimit != 0 {
+		t.Errorf("TokensLimit = %d, want 0 (absent header)", resp.RateLimitInfo.TokensLimit)
+	}
 	if resp.RateLimitInfo.RequestsRemaining != 0 {
 		t.Errorf("RequestsRemaining = %d, want 0 (absent header)", resp.RateLimitInfo.RequestsRemaining)
+	}
+	if resp.RateLimitInfo.RequestsLimit != 0 {
+		t.Errorf("RequestsLimit = %d, want 0 (absent header)", resp.RateLimitInfo.RequestsLimit)
 	}
 	if !resp.RateLimitInfo.TokensResetAt.IsZero() {
 		t.Errorf("TokensResetAt = %v, want zero time (absent header)", resp.RateLimitInfo.TokensResetAt)

@@ -5,6 +5,14 @@
 // is available (e.g. CI, containers without OAuth).
 //
 // API reference: https://docs.anthropic.com/en/api/messages
+//
+// Rate-limit headers (lr-1f7e, extended lr-c98c Slice E):
+// anthropic-ratelimit-tokens-remaining/-requests-remaining were already
+// harvested into RateLimitInfo. anthropic-ratelimit-tokens-limit/
+// -requests-limit are now harvested alongside them so the router can
+// compute a synthetic utilization (1 - remaining/limit) and feed it into
+// the same quota_snapshots table claude_cli's rate_limit_event populates —
+// see router.go's recordSuccess for the synthesis point.
 package backend
 
 import (
@@ -257,8 +265,10 @@ func (a *AnthropicAPIAdapter) Invoke(ctx context.Context, req *Request) (*Respon
 
 	rl := RateLimitInfo{
 		TokensRemaining:   parseIntHeader(resp.Header, "anthropic-ratelimit-tokens-remaining"),
+		TokensLimit:       parseIntHeader(resp.Header, "anthropic-ratelimit-tokens-limit"),
 		TokensResetAt:     parseRFC3339Header(resp.Header, "anthropic-ratelimit-tokens-reset"),
 		RequestsRemaining: parseIntHeader(resp.Header, "anthropic-ratelimit-requests-remaining"),
+		RequestsLimit:     parseIntHeader(resp.Header, "anthropic-ratelimit-requests-limit"),
 		RequestsResetAt:   parseRFC3339Header(resp.Header, "anthropic-ratelimit-requests-reset"),
 	}
 
