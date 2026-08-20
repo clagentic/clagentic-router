@@ -86,7 +86,20 @@ merge:
   # 5271770612): the first token is `go`, a toolchain binary this repo's
   # own `make build`/`make test` already assume is on PATH, not
   # `clagentic-router` itself.
+  #
+  # --source-dir . is explicit and load-bearing (lr-720e91): update's
+  # deploy.source_dir no longer defaults to "." -- a deployed host running
+  # only the installed binary has no source tree in its own cwd, so that
+  # default was silently attempting a `go build` against whatever directory
+  # happened to be current, never exercised until an operator asked for a
+  # real deployed-host update path. The new default is a managed checkout
+  # under $XDG_DATA_HOME/clagentic-router/src that update owns and
+  # git-pulls itself. --source-dir wins over config exactly like --config
+  # already does (cmdUpdate, cmd/clagentic-router/update.go), so this one
+  # flag keeps this step building from the merged tree at loadout-merge's
+  # cwd, byte-identically to the pre-lr-720e91 behavior, with no
+  # repo-committed router.yaml deploy.source_dir override required.
   post_merge_steps:
-    - cmd: ["go", "run", "./cmd/clagentic-router", "update"]
+    - cmd: ["go", "run", "./cmd/clagentic-router", "update", "--source-dir", "."]
       description: "rebuild+install+restart from the merged source tree (immune to installed-binary staleness; see comment above)"
       on_failure: fail
