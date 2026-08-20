@@ -287,7 +287,14 @@ func (a *CodexCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response, 
 	stderrStr := truncate(stderr.String(), 500)
 
 	if err != nil || exitCode != 0 {
-		combined := stderrStr + stdout.String()
+		// Classify against the FULL stderr+stdout, not the truncated display
+		// string above. codex writes a banner/progress preamble first and the
+		// credential/stream error at the tail (lr-807319); classifying against
+		// a head-truncated window silently drops the tail text the auth/quota/
+		// rate-limit patterns need to match, misclassifying as ErrTypeUnknown.
+		// truncate() is still used for the Raw display field — that's a
+		// separate, unrelated concern (bounding log/telemetry size).
+		combined := stderr.String() + stdout.String()
 		errType := ClassifyError(combined, exitCode)
 		slog.Debug("codex_cli invoke failed",
 			"backend", a.id, "exit_code", exitCode, "error_type", errType,

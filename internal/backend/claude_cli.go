@@ -783,8 +783,13 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 	stderrStr := truncate(stderr.String(), 500)
 
 	if err != nil || exitCode != 0 {
-		errType := ClassifyError(stderrStr+stdout.String(), exitCode)
-		resetAt := ParseResetTime(stderrStr + stdout.String())
+		// Classify (and parse reset time) against the FULL stderr+stdout, not
+		// the truncated display string above (lr-807319) — a head-truncation
+		// window can silently drop tail-positioned error text. truncate() is
+		// still used for the Raw display field only.
+		full := stderr.String() + stdout.String()
+		errType := ClassifyError(full, exitCode)
+		resetAt := ParseResetTime(full)
 		raw := stderrStr
 		if raw == "" {
 			raw = truncate(stdout.String(), 500)

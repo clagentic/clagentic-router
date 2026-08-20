@@ -355,8 +355,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	resp, meta, err := h.router.Route(r.Context(), routerReq, chain)
 	if err != nil {
 		if errors.Is(err, router.ErrAllFailed) || errors.Is(err, router.ErrNoChain) {
-			writeError(w, http.StatusServiceUnavailable, "backends_unavailable",
-				"no available backends in chain")
+			// Log the raw error server-side; do not include it in the client
+			// response to avoid leaking internal backend error details to
+			// inference callers. lastErrorType (if present) is type-only —
+			// see errorResponse.LastErrorType's doc.
+			slog.Error("chat: chain exhausted", "err", err, "request_id", RequestID(r.Context()))
+			var lastErrorType string
+			var chainErr *router.ChainExhaustedError
+			if errors.As(err, &chainErr) {
+				lastErrorType = string(chainErr.Type)
+			}
+			writeChainExhaustedError(w, lastErrorType)
 			return
 		}
 		// Log the raw error server-side; do not include it in the client response
@@ -921,6 +930,11 @@ type errorResponse struct {
 	Error struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
+		// LastErrorType is populated only on chain-exhaustion (503) responses.
+		// It reuses the same type-only, already-redacted state.ErrorType/
+		// backend.ErrorType enum GET /v1/models publishes as "last_error_type"
+		// per backend (lr-807319) — never raw error text, never a backend id.
+		LastErrorType string `json:"last_error_type,omitempty"`
 	} `json:"error"`
 }
 
@@ -935,6 +949,17 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 	resp.Error.Code = code
 	resp.Error.Message = message
 	writeJSON(w, status, resp)
+}
+
+// writeChainExhaustedError writes the 503 backends_unavailable response,
+// additionally carrying lastErrorType when known (empty = omitted). See
+// errorResponse.LastErrorType's doc for the redaction contract this reuses.
+func writeChainExhaustedError(w http.ResponseWriter, lastErrorType string) {
+	var resp errorResponse
+	resp.Error.Code = "backends_unavailable"
+	resp.Error.Message = "no available backends in chain"
+	resp.Error.LastErrorType = lastErrorType
+	writeJSON(w, http.StatusServiceUnavailable, resp)
 }
 
 func timeOrNull(t time.Time) interface{} {

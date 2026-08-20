@@ -196,7 +196,11 @@ func (a *CodexSubagentAdapter) Invoke(ctx context.Context, req *Request) (*Respo
 	stderrStr := truncate(stderr.String(), 500)
 
 	if err != nil || exitCode != 0 {
-		combined := stderrStr + stdout.String()
+		// Classify against the FULL stderr+stdout, not the truncated display
+		// string above (lr-807319) — see codex_cli.go's Invoke for the full
+		// rationale (this adapter shares codex_cli's exec-and-scan shape).
+		// truncate() is still used for the Raw display field only.
+		combined := stderr.String() + stdout.String()
 		errType := ClassifyError(combined, exitCode)
 		slog.Debug("codex_subagent invoke failed",
 			"backend", a.id, "exit_code", exitCode, "error_type", errType)

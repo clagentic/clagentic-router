@@ -37,6 +37,26 @@ var ErrNoChain = errors.New("chain resolved to no configured backends")
 // a 200 (the defect this capability model exists to close).
 var ErrNoToolCapableBackend = errors.New("chain has no tool-capable backend")
 
+// ChainExhaustedError wraps ErrAllFailed with the classified ErrorType of the
+// last backend that failed before the chain gave up (lr-807319). It carries
+// no raw error text, backend id, or any other identifying detail — Type is
+// the same state.ErrorType/backend.ErrorType enum (byte-identical string
+// values, see adapter.go) already published, type-only, via GET /v1/models'
+// "last_error_type" field. This reuses that existing redaction boundary
+// rather than inventing a new one: callers on the total-failure path get the
+// same category of information ("auth", "quota", ...) that a caller polling
+// /v1/models for an individual backend already has, with no new raw-text
+// surface.
+type ChainExhaustedError struct {
+	Type state.ErrorType
+}
+
+func (e *ChainExhaustedError) Error() string {
+	return fmt.Sprintf("%s: last_error_type=%s", ErrAllFailed, e.Type)
+}
+
+func (e *ChainExhaustedError) Unwrap() error { return ErrAllFailed }
+
 // localPoller is the interface implemented by LlamaCppPoller and OllamaPoller.
 // Only Start is required; the router manages the goroutine lifecycle.
 type localPoller interface {
@@ -281,6 +301,7 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 
 	reqID := backend.RequestIDFromCtx(ctx)
 	var lastErr error
+	var lastErrType state.ErrorType
 	tried := make([]string, 0, len(chain))
 
 	// reqHasTools gates the sticky-through-fallback tool-capability filter
@@ -418,6 +439,7 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 		}
 
 		lastErr = err
+		lastErrType = errType
 		slog.Info("router: backend failed, advancing chain",
 			"backend", bid, "chain_pos", i, "error_type", errType, "latency_ms", latencyMS, "request_id", reqID)
 
@@ -442,7 +464,14 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 	}
 
 	if lastErr != nil {
-		return nil, nil, fmt.Errorf("%w: last error: %v", ErrAllFailed, lastErr)
+		// %w on both ErrAllFailed (via ChainExhaustedError.Unwrap) and the raw
+		// lastErr: errors.Is(err, ErrAllFailed) still matches unchanged for
+		// existing callers, errors.As(err, &ie) still reaches the wrapped
+		// *backend.InvokeError for server-side logging, and a new
+		// errors.As(err, &ChainExhaustedError{}) additionally reaches the
+		// type-only classification. lastErr's raw text is logged server-side
+		// only (handlers.go/messages.go) — never in the client-facing 503 body.
+		return nil, nil, fmt.Errorf("%w: last error: %w", &ChainExhaustedError{Type: lastErrType}, lastErr)
 	}
 	return nil, nil, ErrAllFailed
 }
