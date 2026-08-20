@@ -168,28 +168,67 @@ backends, this requirement does not apply.
 ### Redeploying: `clagentic-router update`
 
 The router is a long-running daemon — landing a change in git does not make
-it live. `clagentic-router update` rebuilds the binary from source, installs
-it atomically (stage + rename, never an in-place copy over the running
-binary — avoids "text file busy"), and restarts the service. It reuses the
-same config file `serve` uses (no second config surface); every setting is
-optional and defaults to a stock systemd install:
+it live. `clagentic-router update` maintains a git checkout, rebuilds the
+binary from it, installs the result atomically (stage + rename, never an
+in-place copy over the running binary — avoids "text file busy"), and
+restarts the service. It reuses the same config file `serve` uses (no
+second config surface); every setting is optional and defaults to a stock
+systemd install:
 
 ```yaml
 deploy:
-  source_dir: .                                   # module root to build from (default: cwd)
+  source_dir: ""                                   # default: a managed checkout (see below); set explicitly to opt out
+  repo_url: ""                                      # git remote to clone the managed checkout from, if it doesn't already exist
   install_path: /usr/local/bin/clagentic-router    # path the running service execs
   service_name: clagentic-router                   # systemd unit name, without .service
   service_manager: systemd                         # systemd | none (install only, no restart)
 ```
 
 ```bash
-clagentic-router update                # uses the resolved config (see "Configuration")
-clagentic-router update --config PATH   # explicit config path
+clagentic-router update                             # uses the resolved config (see "Configuration")
+clagentic-router update --config PATH                # explicit config path
+clagentic-router update --source-dir /path/to/checkout   # override deploy.source_dir for this run only
 ```
 
+#### Where does the source come from? (lr-720e91)
+
+`update` never builds from its own working directory by default — a
+deployed host (systemd unit, cron, or an operator running `update` from an
+arbitrary shell) has no reason to have a source tree in cwd, and building
+from whatever happened to be there was the actual bug this section used to
+paper over.
+
+- **Default: a managed checkout.** `deploy.source_dir` unset resolves to
+  `$XDG_DATA_HOME/clagentic-router/src` (falls back to
+  `~/.local/share/clagentic-router/src`). `update` owns this checkout's git
+  state:
+  - **Missing** — cloned from `deploy.repo_url` if set. If `repo_url` is
+    unset, `update` refuses with an error naming exactly this: set
+    `deploy.repo_url`, or pre-create the checkout yourself at that path
+    (`git clone <remote> <path>`), or point `source_dir` elsewhere.
+  - **Present** — `git pull --ff-only`. Non-fast-forwardable state (local
+    commits, diverged history) fails loudly; `update` never merges or
+    resets a checkout out from under you.
+  - **Present but not a git repo** (no `.git`) — hard error naming the path,
+    rather than attempting to build whatever happens to be sitting there.
+- **Explicit `source_dir`/`--source-dir` always wins**, byte-identically,
+  and `update` never touches that directory's git state — it is assumed to
+  already reflect the desired revision, matching the pre-lr-720e91
+  contract exactly. This is the mechanism a post-merge automation step
+  uses: it passes `--source-dir .` so it keeps building from the
+  already-merged tree at its own cwd (see `.clagentic/loadout/config.yaml`'s
+  `post_merge_steps` in this repo for the concrete example) — no
+  repo-committed `router.yaml` override needed.
+- **Missing Go toolchain** on the host is detected before the build is
+  attempted and reported with an actionable message (install Go, or run
+  `update` from a host that has it), rather than surfacing as an opaque
+  `exec: "go": executable file not found in $PATH`.
+
 This is the command a project's `.crew/naomi.yaml` `post_merge_steps` should
-invoke as a bare, environment-agnostic verb — all host-specific detail lives
-in `router.yaml`'s `deploy:` block, not in the committed post-merge step.
+invoke — with an explicit `--source-dir` for the merged-tree case above —
+so all *other* host-specific detail (install path, unit name, checkout
+location for the deployed-host case) lives in `router.yaml`'s `deploy:`
+block, not in the committed post-merge step.
 
 ### Docker (API-only mode)
 
