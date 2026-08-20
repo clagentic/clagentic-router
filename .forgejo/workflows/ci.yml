@@ -4,6 +4,16 @@
 # Jobs: build+test, govulncheck.
 #
 # Runner: clagentic-router (repo-scoped).
+#
+# Third-party actions are pinned to full commit SHAs (supply-chain hardening)
+# with a trailing version comment for readability. Bump by re-resolving the
+# SHA for the new tag — never hand-edit the SHA alone.
+#
+# setup-go is pinned here to match .github/workflows/ci.yml rather than left
+# to the host runner's ambient Go install: go.mod's `go` directive sets a
+# floor, but only a pinned toolchain guarantees the runner actually satisfies
+# it (lr-539a14 root-caused a stale unmanaged version pin; an unpinned
+# runner toolchain is the same exposure in a worse, driftable form).
 
 on:
   push:
@@ -25,7 +35,12 @@ jobs:
     runs-on: clagentic-router
     steps:
       - name: Checkout
-        uses: https://code.forgejo.org/actions/checkout@v3
+        uses: https://code.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: https://code.forgejo.org/actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.25.x"
 
       - name: Build + test
         # Inline Go env — per-job env: blocks don't propagate reliably in host-mode runners.
@@ -45,7 +60,12 @@ jobs:
     runs-on: clagentic-router
     steps:
       - name: Checkout
-        uses: https://code.forgejo.org/actions/checkout@v3
+        uses: https://code.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: https://code.forgejo.org/actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.25.x"
 
       - name: govulncheck
         run: |
