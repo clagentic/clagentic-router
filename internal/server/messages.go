@@ -21,6 +21,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -187,6 +188,10 @@ type anthropicMsgError struct {
 	Error struct {
 		Type    string `json:"type"`
 		Message string `json:"message"`
+		// LastErrorType is populated only on chain-exhaustion (503) responses.
+		// See handlers.go's errorResponse.LastErrorType for the shared
+		// redaction contract this reuses (lr-807319).
+		LastErrorType string `json:"last_error_type,omitempty"`
 	} `json:"error"`
 }
 
@@ -219,6 +224,18 @@ func writeAnthropicError(w http.ResponseWriter, status int, message string) {
 	resp.Error.Type = anthropicErrorTypeForStatus(status)
 	resp.Error.Message = message
 	writeJSON(w, status, resp)
+}
+
+// writeAnthropicChainExhaustedError writes the 503 chain-exhaustion response,
+// additionally carrying lastErrorType when known (empty = omitted). See
+// anthropicMsgError.LastErrorType's doc for the redaction contract this reuses.
+func writeAnthropicChainExhaustedError(w http.ResponseWriter, lastErrorType string) {
+	var resp anthropicMsgError
+	resp.Type = "error"
+	resp.Error.Type = anthropicErrorTypeForStatus(http.StatusServiceUnavailable)
+	resp.Error.Message = "no available backends in chain"
+	resp.Error.LastErrorType = lastErrorType
+	writeJSON(w, http.StatusServiceUnavailable, resp)
 }
 
 // isRoutedModel reports whether model uses router chain-selection syntax
@@ -438,8 +455,16 @@ func (h *Handler) messagesRouted(w http.ResponseWriter, r *http.Request, req *an
 
 	resp, meta, err := h.router.Route(r.Context(), routerReq, chain)
 	if err != nil {
-		if err == router.ErrAllFailed || err == router.ErrNoChain {
-			writeAnthropicError(w, http.StatusServiceUnavailable, "no available backends in chain")
+		if errors.Is(err, router.ErrAllFailed) || errors.Is(err, router.ErrNoChain) {
+			// Log the raw error server-side only; lastErrorType (if present)
+			// is type-only — see anthropicMsgError.LastErrorType's doc.
+			slog.Error("messages: chain exhausted", "err", err, "request_id", RequestID(r.Context()))
+			var lastErrorType string
+			var chainErr *router.ChainExhaustedError
+			if errors.As(err, &chainErr) {
+				lastErrorType = string(chainErr.Type)
+			}
+			writeAnthropicChainExhaustedError(w, lastErrorType)
 			return
 		}
 		slog.Error("messages: routed backend error", "err", err, "request_id", RequestID(r.Context()))
