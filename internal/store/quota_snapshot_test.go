@@ -205,3 +205,75 @@ func TestInsertQuotaSnapshot_ObservedAtMonotonic(t *testing.T) {
 		t.Errorf("observed_at %d outside [%d, %d]", observedAt, before, after)
 	}
 }
+
+// TestLatestQuotaSnapshot_NoRows verifies the "no snapshot yet" case returns
+// (zero value, false) rather than an error — a backend with no quota
+// history at all (e.g. never invoked, or an adapter with no proactive
+// signal) is a legitimate state, not a failure.
+func TestLatestQuotaSnapshot_NoRows(t *testing.T) {
+	s := tempStore(t)
+	ctx := context.Background()
+
+	_, ok := s.LatestQuotaSnapshot(ctx, "never-seen")
+	if ok {
+		t.Error("expected ok=false for a backend with no rows")
+	}
+}
+
+// TestLatestQuotaSnapshot_ReturnsMostRecent inserts two snapshots for the
+// same backend and verifies the most recently observed one is returned.
+func TestLatestQuotaSnapshot_ReturnsMostRecent(t *testing.T) {
+	s := tempStore(t)
+	ctx := context.Background()
+
+	first := 0.30
+	if err := s.InsertQuotaSnapshot(ctx, "backend-z", QuotaSnapshotInput{
+		Status: "allowed_warning", RateLimitType: "five_hour", Utilization: &first, RawJSON: `{"n":1}`,
+	}); err != nil {
+		t.Fatalf("insert first: %v", err)
+	}
+
+	// Ensure a strictly later observed_at (UnixNano-resolution clock).
+	time.Sleep(2 * time.Millisecond)
+
+	second := 0.85
+	if err := s.InsertQuotaSnapshot(ctx, "backend-z", QuotaSnapshotInput{
+		Status: "allowed_warning", RateLimitType: "five_hour", Utilization: &second, RawJSON: `{"n":2}`,
+	}); err != nil {
+		t.Fatalf("insert second: %v", err)
+	}
+
+	got, ok := s.LatestQuotaSnapshot(ctx, "backend-z")
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if got.Utilization == nil || *got.Utilization != second {
+		t.Errorf("utilization = %v, want %v (the most recent insert)", got.Utilization, second)
+	}
+	if got.RawJSON != `{"n":2}` {
+		t.Errorf("raw_json = %q, want the second insert's payload", got.RawJSON)
+	}
+}
+
+// TestLatestQuotaSnapshot_NullUtilizationRoundTrips verifies a below-threshold
+// (utilization absent) row round-trips as a nil pointer, not a fabricated 0.0
+// — this task's own goal statement requires absent data stay representable
+// as NULL, never a zero value indistinguishable from "fully available."
+func TestLatestQuotaSnapshot_NullUtilizationRoundTrips(t *testing.T) {
+	s := tempStore(t)
+	ctx := context.Background()
+
+	if err := s.InsertQuotaSnapshot(ctx, "backend-null", QuotaSnapshotInput{
+		Status: "allowed", RateLimitType: "seven_day", Utilization: nil, RawJSON: `{}`,
+	}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	got, ok := s.LatestQuotaSnapshot(ctx, "backend-null")
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if got.Utilization != nil {
+		t.Errorf("utilization = %v, want nil", *got.Utilization)
+	}
+}

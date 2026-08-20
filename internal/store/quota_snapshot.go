@@ -71,6 +71,38 @@ type QuotaSnapshotRow struct {
 	RawJSON               string
 }
 
+// LatestQuotaSnapshot returns the most recently observed quota_snapshots row
+// for backendID, or (QuotaSnapshotRow{}, false) if none exists yet. This is
+// the read side of InsertQuotaSnapshot — exported so callers outside this
+// package (e.g. a future /v1/capacity history endpoint, or a test verifying
+// a write actually landed) never need direct *sql.DB access to this table.
+func (s *Store) LatestQuotaSnapshot(ctx context.Context, backendID string) (QuotaSnapshotRow, bool) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT backend_id, observed_at, status, rate_limit_type,
+		       utilization, resets_at, surpassed_threshold,
+		       is_using_overage, overage_status, overage_disabled_reason,
+		       overage_resets_at, raw_json
+		FROM quota_snapshots
+		WHERE backend_id = ?
+		ORDER BY observed_at DESC
+		LIMIT 1`, backendID)
+
+	var out QuotaSnapshotRow
+	var observedAtNano int64
+	var isUsingOverage int
+	if err := row.Scan(
+		&out.BackendID, &observedAtNano, &out.Status, &out.RateLimitType,
+		&out.Utilization, &out.ResetsAt, &out.SurpassedThreshold,
+		&isUsingOverage, &out.OverageStatus, &out.OverageDisabledReason,
+		&out.OverageResetsAt, &out.RawJSON,
+	); err != nil {
+		return QuotaSnapshotRow{}, false
+	}
+	out.ObservedAt = time.Unix(0, observedAtNano).UTC()
+	out.IsUsingOverage = isUsingOverage != 0
+	return out, true
+}
+
 // InsertQuotaSnapshot inserts one quota snapshot row derived from a rate_limit_event.
 // Absence of Utilization (nil) is not an error — it means status=allowed (below threshold)
 // and is stored as NULL in the DB. The gap in utilization data is itself signal.
