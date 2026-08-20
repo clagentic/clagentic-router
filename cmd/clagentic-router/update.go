@@ -24,9 +24,11 @@ package main
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/clagentic/clagentic-router/internal/config"
 )
@@ -170,6 +172,33 @@ func checkGoToolchain() error {
 // silent merge or reset, matching clagentic-lite's `update` convention
 // (git pull --ff-only; divergence fails loudly rather than discarding
 // history).
+//
+// IDENTITY CHECK (lr-720e91 fold-in, PEACHES comment 5360190075 / BOBBIE
+// comment 5360192680): a present managed checkout used to be pulled purely
+// on the strength of having a ".git" directory — proof it is *a* repo, not
+// proof it is *the* repo this deploy is supposed to run. A pre-seeded,
+// symlinked, or accidentally-repointed checkout at the managed path would
+// be pulled, built, and installed as the running (often root-run) systemd
+// daemon with no check at all. verifyOriginMatchesRepoURL below reads the
+// checkout's own `origin` remote and compares it against repoURL — on both
+// the present-and-pull branch AND (new) is consulted here on every call,
+// closing the gap BOBBIE also flagged: repoURL used to be read only on the
+// missing-directory clone branch and never consulted again for the life of
+// the checkout.
+//
+// RESIDUAL (named, not fixed here — out of scope for this fold-in per
+// dispatch instructions): this check verifies which remote the checkout
+// *claims* to track, not who was able to create or write the managed path
+// in the first place. An unprivileged local user able to pre-create or
+// symlink the managed checkout directory before the daemon's first `update`
+// run could still seed a checkout whose origin happens to equal
+// deploy.repo_url (a fork with a rewritten origin, or a MITM'd clone), and
+// this check would pass it. Closing that requires filesystem-permission
+// hardening of the managed path itself (e.g. requiring it live under a
+// directory only the service user/root can create), which is a distinct,
+// larger change — not folded in here. TODO(lr-720e91): evaluate locking
+// down DefaultManagedSourceDir's parent directory ownership/permissions as
+// a follow-up.
 func ensureSourceCheckout(sourceDir, repoURL string, out *os.File) error {
 	info, statErr := os.Stat(sourceDir)
 	switch {
@@ -178,6 +207,9 @@ func ensureSourceCheckout(sourceDir, repoURL string, out *os.File) error {
 			return fmt.Errorf("deploy.source_dir %q exists but is not a git checkout (no .git). "+
 				"Remove it and let update clone into it (deploy.repo_url required), or point "+
 				"deploy.source_dir/--source-dir at an existing checkout", sourceDir)
+		}
+		if err := verifyOriginMatchesRepoURL(sourceDir, repoURL, out); err != nil {
+			return err
 		}
 		fmt.Fprintf(out, "update: pulling %s (git pull --ff-only)\n", sourceDir)
 		if err := gitPullFFOnly(sourceDir); err != nil {
@@ -201,6 +233,121 @@ func ensureSourceCheckout(sourceDir, repoURL string, out *os.File) error {
 	default:
 		return fmt.Errorf("stat deploy.source_dir %q: %w", sourceDir, statErr)
 	}
+}
+
+// verifyOriginMatchesRepoURL is the identity check documented on
+// ensureSourceCheckout above. It reads the checkout's own `origin` remote
+// and compares it against repoURL (normalized — see normalizeGitURL),
+// refusing to pull a managed checkout that does not track the configured
+// repo. Three explicit decisions, all made here rather than left implicit:
+//
+//  1. repoURL == "" (no deploy.repo_url configured) with an existing managed
+//     checkout: WARN, do not fail. There is nothing to compare against — an
+//     operator who pre-cloned the checkout by hand without ever setting
+//     repo_url stated no expectation for this check to enforce, and failing
+//     would regress that (pre-existing, still-supported) setup. The warning
+//     names the gap explicitly rather than silently saying nothing, so an
+//     operator who *should* have set repo_url notices.
+//  2. Multiple remotes: only `origin` is consulted — by design. `origin` is
+//     the sole remote this checkout's own clone path (gitClone) ever
+//     configures, so it is the only one with a defined meaning here; other
+//     remotes an operator may have added by hand for their own purposes are
+//     not this check's business.
+//  3. No `origin` remote configured at all: hard error. A managed checkout
+//     with no origin cannot be identity-checked, and "cannot verify" is not
+//     "assume it's fine" for a path that gets compiled and installed as the
+//     running daemon.
+func verifyOriginMatchesRepoURL(sourceDir, repoURL string, out *os.File) error {
+	origin, err := gitOriginURL(sourceDir)
+	if err != nil {
+		if repoURL == "" {
+			fmt.Fprintf(out, "update: warning: deploy.source_dir %q has no \"origin\" remote and "+
+				"deploy.repo_url is unset, so its identity cannot be verified before building from "+
+				"it (proceeding — set deploy.repo_url to enable this check)\n", sourceDir)
+			return nil
+		}
+		return fmt.Errorf("deploy.source_dir %q has no \"origin\" remote, so it cannot be verified "+
+			"against deploy.repo_url %q before building from it. Add an origin remote pointing at "+
+			"deploy.repo_url (git -C %s remote add origin %s), or point deploy.source_dir/--source-dir "+
+			"at a different checkout: %w", sourceDir, repoURL, sourceDir, repoURL, err)
+	}
+
+	if repoURL == "" {
+		fmt.Fprintf(out, "update: warning: deploy.repo_url is unset, so deploy.source_dir %q's origin "+
+			"(%s) cannot be verified against an expected value before building from it (proceeding — "+
+			"set deploy.repo_url to enable this check)\n", sourceDir, origin)
+		return nil
+	}
+
+	if !gitURLsEquivalent(origin, repoURL) {
+		return fmt.Errorf("deploy.source_dir %q is a checkout of a DIFFERENT repository than "+
+			"deploy.repo_url configures: checkout origin is %q, deploy.repo_url is %q. Refusing to "+
+			"pull and build from it — this directory would be compiled and installed as the running "+
+			"service. Remove %q and let update re-clone it from deploy.repo_url, or point "+
+			"deploy.source_dir/--source-dir at the correct checkout, or correct deploy.repo_url if it "+
+			"is the one that is wrong", sourceDir, origin, repoURL, sourceDir)
+	}
+	return nil
+}
+
+// gitOriginURL returns the URL configured for the "origin" remote in dir.
+func gitOriginURL(dir string) (string, error) {
+	cmd := exec.Command("git", "-C", dir, "remote", "get-url", "origin")
+	cmd.Env = os.Environ()
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("git remote get-url origin in %s: %w", dir, err)
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+// gitURLsEquivalent reports whether a and b identify the same git remote,
+// tolerating the equivalent forms of the same URL that are NOT the same
+// string: a ".git" suffix, a trailing slash, and scp-style SSH syntax
+// (git@host:owner/repo) vs. an explicit scheme (https://host/owner/repo,
+// ssh://git@host/owner/repo). It does not attempt any equivalence beyond
+// that — two URLs with different hosts or different paths are always
+// treated as different repos, deliberately, so this never masks a genuine
+// mismatch by over-normalizing.
+func gitURLsEquivalent(a, b string) bool {
+	return normalizeGitURL(a) == normalizeGitURL(b)
+}
+
+// normalizeGitURL reduces a git remote URL to a scheme/host/path-lowercased
+// comparison key: strips a trailing ".git", strips a trailing "/", and
+// rewrites scp-style SSH ("git@host:owner/repo", "user@host:path") to the
+// same "host/path" shape an explicit-scheme URL normalizes to, so
+// "https://github.com/o/r", "https://github.com/o/r.git",
+// "git@github.com:o/r.git", and "https://github.com/o/r/" all compare
+// equal. Host is lowercased (DNS is case-insensitive); path case is left
+// as-is (many git hosts, including self-hosted Forgejo, are
+// case-sensitive on the path).
+func normalizeGitURL(raw string) string {
+	s := strings.TrimSpace(raw)
+	s = strings.TrimSuffix(s, "/")
+	s = strings.TrimSuffix(s, ".git")
+
+	if u, err := url.Parse(s); err == nil && u.Scheme != "" && u.Host != "" {
+		// Explicit-scheme form (https://, ssh://, git://, ...): scheme itself
+		// is not part of the identity key — https vs. ssh vs. git transport
+		// to the same host/path is still the same repository.
+		return strings.ToLower(u.Host) + strings.TrimSuffix(u.Path, "/")
+	}
+
+	// scp-style SSH: [user@]host:path — url.Parse does not recognize this
+	// (no scheme), so rewrite it by hand into the same "host/path" shape.
+	if at := strings.Index(s, "@"); at != -1 {
+		rest := s[at+1:]
+		if colon := strings.Index(rest, ":"); colon != -1 {
+			host := rest[:colon]
+			path := rest[colon+1:]
+			return strings.ToLower(host) + "/" + strings.TrimSuffix(path, "/")
+		}
+	}
+
+	// Unrecognized shape (e.g. a bare local filesystem path) — fall back to
+	// the trimmed string itself rather than guessing further.
+	return s
 }
 
 // gitPullFFOnly runs `git pull --ff-only` in dir. A non-fast-forwardable

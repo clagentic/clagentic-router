@@ -206,9 +206,22 @@ paper over.
     unset, `update` refuses with an error naming exactly this: set
     `deploy.repo_url`, or pre-create the checkout yourself at that path
     (`git clone <remote> <path>`), or point `source_dir` elsewhere.
-  - **Present** — `git pull --ff-only`. Non-fast-forwardable state (local
-    commits, diverged history) fails loudly; `update` never merges or
-    resets a checkout out from under you.
+  - **Present** — identity-checked, then `git pull --ff-only`. Before
+    pulling, `update` reads the checkout's own `origin` remote and compares
+    it against `deploy.repo_url` (tolerating equivalent forms: `.git`
+    suffix, trailing slash, scp-style SSH vs. an explicit-scheme URL). A
+    mismatch is a hard error naming both URLs — a managed checkout is never
+    silently pulled and built if it turns out to be a checkout of a
+    different repository (or a fork, or a stale/pre-seeded directory). No
+    `origin` remote at all is also a hard error when `repo_url` is set
+    (identity cannot be verified, so it is not assumed fine); when
+    `repo_url` is also unset there is nothing to check against, so `update`
+    warns and proceeds rather than failing — see
+    `ensureSourceCheckout`/`verifyOriginMatchesRepoURL` in
+    `cmd/clagentic-router/update.go` for the full decision rationale. Once
+    identity-checked, non-fast-forwardable pull state (local commits,
+    diverged history) still fails loudly; `update` never merges or resets a
+    checkout out from under you.
   - **Present but not a git repo** (no `.git`) — hard error naming the path,
     rather than attempting to build whatever happens to be sitting there.
 - **Explicit `source_dir`/`--source-dir` always wins**, byte-identically,

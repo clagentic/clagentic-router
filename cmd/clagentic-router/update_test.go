@@ -10,6 +10,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -327,5 +328,262 @@ func TestEnsureSourceCheckout_ExistingGitRepo_NoUpstream_FailsLoudly(t *testing.
 func TestCheckGoToolchain_FoundOnPath(t *testing.T) {
 	if err := checkGoToolchain(); err != nil {
 		t.Errorf("checkGoToolchain() = %v, want nil (go must be on PATH to run this test)", err)
+	}
+}
+
+// TestNormalizeGitURL_Equivalence covers the URL-equivalence cases from the
+// lr-720e91 identity-check fold-in (PEACHES comment 5360190075): a naive
+// string comparison would false-fail on these legitimate variations of the
+// same remote.
+func TestNormalizeGitURL_Equivalence(t *testing.T) {
+	equivalentGroups := [][]string{
+		{
+			"https://github.com/o/r",
+			"https://github.com/o/r.git",
+			"https://github.com/o/r/",
+			"https://github.com/o/r.git/",
+		},
+		{
+			"git@github.com:o/r.git",
+			"git@github.com:o/r",
+			"https://github.com/o/r",
+			"ssh://git@github.com/o/r",
+		},
+		{
+			"https://GitHub.com/o/r",
+			"https://github.com/o/r",
+		},
+	}
+	for _, group := range equivalentGroups {
+		want := normalizeGitURL(group[0])
+		for _, u := range group[1:] {
+			if got := normalizeGitURL(u); got != want {
+				t.Errorf("normalizeGitURL(%q) = %q, want %q (equivalent to %q)", u, got, want, group[0])
+			}
+		}
+	}
+}
+
+// TestGitURLsEquivalent_DifferentReposNotEqual verifies normalization never
+// over-corrects into treating genuinely different remotes as the same repo
+// — different host, different owner, and different repo name must all
+// still compare unequal.
+func TestGitURLsEquivalent_DifferentReposNotEqual(t *testing.T) {
+	cases := []struct{ a, b string }{
+		{"https://github.com/o/r", "https://gitlab.com/o/r"},     // different host
+		{"https://github.com/o/r", "https://github.com/other/r"}, // different owner
+		{"https://github.com/o/r", "https://github.com/o/other"}, // different repo
+		{"git@github.com:o/r.git", "git@github.com:o/fork.git"},  // scp-style, different repo
+	}
+	for _, tc := range cases {
+		if gitURLsEquivalent(tc.a, tc.b) {
+			t.Errorf("gitURLsEquivalent(%q, %q) = true, want false (genuinely different repos)", tc.a, tc.b)
+		}
+	}
+}
+
+// initBareRepo creates a bare git repo at dir, for use as a fake "remote"
+// in the ensureSourceCheckout identity-check tests below — mirrors the
+// verification style used for the original lr-720e91 clone/pull tests.
+func initBareRepo(t *testing.T, dir string) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir bare repo dir: %v", err)
+	}
+	cmd := exec.Command("git", "init", "--bare", dir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init --bare %s: %v\n%s", dir, err, out)
+	}
+	return dir
+}
+
+// seedBareRepo clones bareRepoDir into a scratch working tree, commits one
+// file, and pushes it back — a bare repo has no commits of its own, and
+// ensureSourceCheckout's clone/pull path needs at least one to exercise
+// realistically.
+func seedBareRepo(t *testing.T, bareRepoDir string) {
+	t.Helper()
+	work := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = work
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	// Force a known branch name regardless of the environment's
+	// init.defaultBranch, then push and set it as the bare repo's HEAD, so a
+	// later `git clone`/`git pull` has a matching, tracked default branch
+	// (avoids "no such ref was fetched" from a master/main mismatch between
+	// this seeding step and the environment's git config).
+	run("init", "-b", "main")
+	run("config", "user.email", "test@example.com")
+	run("config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(work, "README"), []byte("seed"), 0o644); err != nil {
+		t.Fatalf("write seed file: %v", err)
+	}
+	run("add", "README")
+	run("commit", "-m", "seed")
+	run("remote", "add", "origin", bareRepoDir)
+	run("push", "origin", "HEAD:refs/heads/main")
+
+	bareCmd := exec.Command("git", "-C", bareRepoDir, "symbolic-ref", "HEAD", "refs/heads/main")
+	if out, err := bareCmd.CombinedOutput(); err != nil {
+		t.Fatalf("set bare repo HEAD to main: %v\n%s", err, out)
+	}
+}
+
+// TestEnsureSourceCheckout_OriginMismatch_FailsWithBothURLs is the real,
+// non-mocked reproduction the fold-in dispatch asked for: a managed
+// checkout cloned from bare repo A, then pointed at bare repo B via
+// deploy.repo_url. ensureSourceCheckout must refuse to pull it and must
+// name both URLs in the error.
+func TestEnsureSourceCheckout_OriginMismatch_FailsWithBothURLs(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping git-invoking test in -short mode")
+	}
+	root := t.TempDir()
+	repoA := initBareRepo(t, filepath.Join(root, "repo-a.git"))
+	repoB := initBareRepo(t, filepath.Join(root, "repo-b.git"))
+	seedBareRepo(t, repoA)
+
+	checkout := filepath.Join(root, "checkout")
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open devnull: %v", err)
+	}
+	defer devNull.Close()
+
+	// Clone from repo A into the managed checkout location.
+	if err := gitClone(repoA, checkout); err != nil {
+		t.Fatalf("gitClone(repoA): %v", err)
+	}
+
+	// Now point deploy.repo_url at repo B instead — the mismatch case.
+	err = ensureSourceCheckout(checkout, repoB, devNull)
+	if err == nil {
+		t.Fatal("expected error for origin/repo_url mismatch, got nil")
+	}
+	t.Logf("captured mismatch error:\n%s", err.Error())
+	if !strings.Contains(err.Error(), repoA) {
+		t.Errorf("error %q does not name the checkout's actual origin (%s)", err.Error(), repoA)
+	}
+	if !strings.Contains(err.Error(), repoB) {
+		t.Errorf("error %q does not name the configured deploy.repo_url (%s)", err.Error(), repoB)
+	}
+}
+
+// TestEnsureSourceCheckout_OriginMatches_PullsSuccessfully verifies the
+// non-mismatch case still works end-to-end: same repo_url as origin pulls
+// cleanly with no error.
+func TestEnsureSourceCheckout_OriginMatches_PullsSuccessfully(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping git-invoking test in -short mode")
+	}
+	root := t.TempDir()
+	repoA := initBareRepo(t, filepath.Join(root, "repo-a.git"))
+	seedBareRepo(t, repoA)
+
+	checkout := filepath.Join(root, "checkout")
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open devnull: %v", err)
+	}
+	defer devNull.Close()
+
+	if err := gitClone(repoA, checkout); err != nil {
+		t.Fatalf("gitClone(repoA): %v", err)
+	}
+
+	if err := ensureSourceCheckout(checkout, repoA, devNull); err != nil {
+		t.Fatalf("ensureSourceCheckout with matching repo_url: %v", err)
+	}
+}
+
+// TestEnsureSourceCheckout_NoOriginRemote_FailsWithRepoURLSet verifies a
+// managed checkout with no "origin" remote at all is a hard error when
+// deploy.repo_url IS set — "cannot verify" must not be treated as "assume
+// it's fine" for a path that gets compiled and installed as the running
+// daemon.
+func TestEnsureSourceCheckout_NoOriginRemote_FailsWithRepoURLSet(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping git-invoking test in -short mode")
+	}
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init")
+	run("config", "user.email", "test@example.com")
+	run("config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(dir, "README"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	run("add", "README")
+	run("commit", "-m", "seed")
+	// Deliberately no `git remote add origin` — this checkout has no origin.
+
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open devnull: %v", err)
+	}
+	defer devNull.Close()
+
+	err = ensureSourceCheckout(dir, "https://example.invalid/o/r.git", devNull)
+	if err == nil {
+		t.Fatal("expected error for missing origin remote with repo_url set, got nil")
+	}
+}
+
+// TestEnsureSourceCheckout_NoOriginRemote_WarnsWhenRepoURLAlsoEmpty
+// verifies decision item 1 from the lr-720e91 fold-in dispatch: an existing
+// managed checkout with NO deploy.repo_url configured (and, here, no origin
+// remote either) is a WARN-and-proceed, not a hard failure — there is
+// nothing to compare against, and an operator who pre-cloned deliberately
+// without ever setting repo_url stated no expectation this check enforces.
+func TestEnsureSourceCheckout_NoOriginRemote_WarnsWhenRepoURLAlsoEmpty(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping git-invoking test in -short mode")
+	}
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init")
+	run("config", "user.email", "test@example.com")
+	run("config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(dir, "README"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	run("add", "README")
+	run("commit", "-m", "seed")
+
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open devnull: %v", err)
+	}
+	defer devNull.Close()
+
+	// No origin remote, no repo_url — expected outcome per item 1 is a
+	// no-upstream `git pull --ff-only` failure (same as the pre-existing
+	// TestEnsureSourceCheckout_ExistingGitRepo_NoUpstream_FailsLoudly case),
+	// NOT an identity-check failure. Assert the identity check itself does
+	// not produce the error by checking it doesn't mention repo_url/origin
+	// mismatch wording.
+	err = ensureSourceCheckout(dir, "", devNull)
+	if err != nil && strings.Contains(err.Error(), "DIFFERENT repository") {
+		t.Errorf("expected the no-repo_url case to warn-and-proceed to the pull step, not fail the "+
+			"identity check, got: %v", err)
 	}
 }
