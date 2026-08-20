@@ -865,7 +865,7 @@ func printUsage() {
 
 Usage:
   clagentic-router serve [--config PATH] [--log-level debug|info|warn|error] [--unsafe-no-auth]
-  clagentic-router update [--config PATH]
+  clagentic-router update [--config PATH] [--source-dir PATH]
   clagentic-router health  [--server URL] [--token TOKEN]
   clagentic-router doctor  [--server URL] [--token TOKEN]
   clagentic-router quota   [--server URL] [--token TOKEN]
@@ -879,13 +879,19 @@ Serve flags:
   --unsafe-no-auth  Start without authentication (development only — never use in production)
 
 Update:
-  Rebuilds the binary from source (deploy.source_dir, default ".") and
-  atomically installs it at deploy.install_path (default
+  Maintains a git checkout at deploy.source_dir (default: a managed
+  checkout under $XDG_DATA_HOME/clagentic-router/src that update clones —
+  deploy.repo_url required — or pulls, ff-only, itself), rebuilds the
+  binary from it, atomically installs it at deploy.install_path (default
   /usr/local/bin/clagentic-router), then restarts deploy.service_name via
   systemd (default "clagentic-router"; set deploy.service_manager: "none"
   to install without restarting). Uses the same config resolved by "serve" —
   add an optional [deploy] block to router.yaml only if these defaults do
-  not match your install.
+  not match your install. --source-dir PATH overrides deploy.source_dir for
+  this invocation only (wins over config, like --config itself) — set it to
+  an existing checkout (e.g. "." to build from update's own working
+  directory) to opt out of the managed-checkout clone/pull behavior; update
+  never touches the git state of an explicitly-set source_dir.
 
 Environment variables:
   CLAGENTIC_ROUTER_CONFIG       Config file path (default: ./router.yaml)
