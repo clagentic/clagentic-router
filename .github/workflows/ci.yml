@@ -6,6 +6,10 @@
 #
 # Runner: ubuntu-latest (GitHub-hosted). Ported from .forgejo/workflows/ci.yml
 # (lr-bfbcf2) — same jobs, GitHub-native checkout/setup-go actions.
+#
+# Third-party actions are pinned to full commit SHAs (supply-chain hardening)
+# with a trailing version comment for readability. Bump by re-resolving the
+# SHA for the new tag — never hand-edit the SHA alone.
 
 on:
   push:
@@ -27,12 +31,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.25.x"
+          check-latest: true
 
       - name: Build + test
         run: |
@@ -47,15 +52,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.25.x"
+          check-latest: true
 
       - name: govulncheck
         run: |
           set -eux
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0 # 617f44b718537dccdea1915395650e0529e3b72e
           "$(go env GOPATH)/bin/govulncheck" ./...

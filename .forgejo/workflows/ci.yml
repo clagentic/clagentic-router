@@ -4,6 +4,25 @@
 # Jobs: build+test, govulncheck.
 #
 # Runner: clagentic-router (repo-scoped).
+#
+# Third-party actions are pinned to full commit SHAs (supply-chain hardening)
+# with a trailing version comment for readability. Bump by re-resolving the
+# SHA for the new tag — never hand-edit the SHA alone.
+#
+# setup-go is pinned here to match .github/workflows/ci.yml rather than left
+# to the host runner's ambient Go install: go.mod's `go` directive sets a
+# floor, but only a pinned toolchain guarantees the runner actually satisfies
+# it (lr-539a14 root-caused a stale unmanaged version pin; an unpinned
+# runner toolchain is the same exposure in a worse, driftable form).
+#
+# check-latest: true is required, not optional decoration: setup-go's own
+# default (check-latest: false) prefers a tool-cache hit over verifying it
+# actually satisfies the latest patch in the go-version range, so a runner
+# image pre-caching an older 1.25.z can silently under-satisfy go.mod's
+# floor even with setup-go present and a correct go-version spec (lr-01d90e
+# job 96428414187: ambient 1.25.12 selected against a 1.25.13 floor).
+# govulncheck itself is pinned to an exact tag (not @latest) for the same
+# reason applied to the scanner instead of the toolchain.
 
 on:
   push:
@@ -25,7 +44,13 @@ jobs:
     runs-on: clagentic-router
     steps:
       - name: Checkout
-        uses: https://code.forgejo.org/actions/checkout@v3
+        uses: https://code.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: https://code.forgejo.org/actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.25.x"
+          check-latest: true
 
       - name: Build + test
         # Inline Go env — per-job env: blocks don't propagate reliably in host-mode runners.
@@ -45,7 +70,13 @@ jobs:
     runs-on: clagentic-router
     steps:
       - name: Checkout
-        uses: https://code.forgejo.org/actions/checkout@v3
+        uses: https://code.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: https://code.forgejo.org/actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.25.x"
+          check-latest: true
 
       - name: govulncheck
         run: |
@@ -54,5 +85,5 @@ jobs:
           export GOMODCACHE="${HOME}/go/pkg/mod"
           export GOCACHE="${HOME}/.cache/go"
           mkdir -p "$GOPATH" "$GOCACHE"
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0 # 617f44b718537dccdea1915395650e0529e3b72e
           "${GOPATH}/bin/govulncheck" ./...
