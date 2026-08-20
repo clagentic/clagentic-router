@@ -37,6 +37,7 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.25.x"
+          check-latest: true
 
       - name: Build + test
         run: |
@@ -57,9 +58,10 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.25.x"
+          check-latest: true
 
       - name: govulncheck
         run: |
           set -eux
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0 # 617f44b718537dccdea1915395650e0529e3b72e
           "$(go env GOPATH)/bin/govulncheck" ./...

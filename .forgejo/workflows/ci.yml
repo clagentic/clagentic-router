@@ -14,6 +14,15 @@
 # floor, but only a pinned toolchain guarantees the runner actually satisfies
 # it (lr-539a14 root-caused a stale unmanaged version pin; an unpinned
 # runner toolchain is the same exposure in a worse, driftable form).
+#
+# check-latest: true is required, not optional decoration: setup-go's own
+# default (check-latest: false) prefers a tool-cache hit over verifying it
+# actually satisfies the latest patch in the go-version range, so a runner
+# image pre-caching an older 1.25.z can silently under-satisfy go.mod's
+# floor even with setup-go present and a correct go-version spec (lr-01d90e
+# job 96428414187: ambient 1.25.12 selected against a 1.25.13 floor).
+# govulncheck itself is pinned to an exact tag (not @latest) for the same
+# reason applied to the scanner instead of the toolchain.
 
 on:
   push:
@@ -41,6 +50,7 @@ jobs:
         uses: https://code.forgejo.org/actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.25.x"
+          check-latest: true
 
       - name: Build + test
         # Inline Go env — per-job env: blocks don't propagate reliably in host-mode runners.
@@ -66,6 +76,7 @@ jobs:
         uses: https://code.forgejo.org/actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.25.x"
+          check-latest: true
 
       - name: govulncheck
         run: |
@@ -74,5 +85,5 @@ jobs:
           export GOMODCACHE="${HOME}/go/pkg/mod"
           export GOCACHE="${HOME}/.cache/go"
           mkdir -p "$GOPATH" "$GOCACHE"
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0 # 617f44b718537dccdea1915395650e0529e3b72e
           "${GOPATH}/bin/govulncheck" ./...
