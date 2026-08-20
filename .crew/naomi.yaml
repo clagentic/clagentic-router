@@ -92,10 +92,20 @@ merge_requirements:
 # binary is currently installed, which cannot contain a subcommand that only
 # just landed in this same merge (lr-a814a5; confirmed root cause of PR #33's
 # post-merge failure). Every host-specific detail (install path, service
-# name, source checkout) is resolved from the same router.yaml config chain
-# "serve" already uses (the optional [deploy] block; see router.example.yaml),
-# never from this file. No absolute paths, env-var assignments, hostnames, or
-# service names belong here.
+# name) is resolved from the same router.yaml config chain "serve" already
+# uses (the optional [deploy] block; see router.example.yaml), never from
+# this file. No absolute paths, env-var assignments, hostnames, or service
+# names belong here.
+#
+# --source-dir . is explicit and load-bearing (lr-720e91): update's
+# deploy.source_dir no longer defaults to "." (a deployed host has no source
+# tree in its own cwd, so that default was silently building nothing/stale
+# code there) -- it now defaults to a managed checkout under
+# $XDG_DATA_HOME/clagentic-router/src that update owns and git-pulls itself.
+# --source-dir wins over config exactly like --config already does, so this
+# one flag keeps this step building from the merged tree at
+# loadout-merge's cwd, byte-identically to the pre-lr-720e91 behavior,
+# without requiring a repo-committed router.yaml deploy.source_dir override.
 post_merge_steps:
-  - cmd: ["go", "run", "./cmd/clagentic-router", "update"]
+  - cmd: ["go", "run", "./cmd/clagentic-router", "update", "--source-dir", "."]
     on_failure: fail

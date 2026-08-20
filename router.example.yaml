@@ -337,14 +337,29 @@ anthropic:
 #   # profile: env:AWS_PROFILE  # optional named AWS profile for passthrough credential resolution
 
 # --- Deploy ("clagentic-router update" self-deploy subcommand) ---
-# Entirely optional. `update` rebuilds the binary from source and restarts
-# the running service, reusing this same config file (same resolution chain
-# "serve" uses — no second config surface). Every field defaults to a stock
-# systemd install; a clean third-party install works unconfigured. Only add
-# this block if your install path, unit name, or source checkout location
-# differs from the defaults below.
+# Entirely optional. `update` maintains a git checkout, rebuilds the binary
+# from it, and restarts the running service, reusing this same config file
+# (same resolution chain "serve" uses — no second config surface). Every
+# field defaults to a stock systemd install; a clean third-party install
+# works unconfigured EXCEPT for repo_url below (see its comment — the
+# default managed checkout has no default remote to clone from).
+#
+# source_dir default (lr-720e91): a managed checkout at
+# $XDG_DATA_HOME/clagentic-router/src (falls back to
+# ~/.local/share/clagentic-router/src) that `update` owns — it clones it
+# (repo_url required, see below) if absent, else runs `git pull --ff-only`
+# before every build. This is NEVER update's own current working directory
+# — a deployed host (systemd unit, arbitrary cwd) has no reason to have a
+# source tree in cwd at all, which was the bug this default used to have.
+#
+# Set source_dir explicitly (or pass --source-dir on the CLI, which wins
+# over this value the same way --config does) to point at a checkout you
+# manage yourself instead — e.g. "." to build from update's own working
+# directory, matching pre-lr-720e91 behavior exactly. update never touches
+# the git state of an explicitly-configured source_dir.
 # deploy:
-#   source_dir: .                                   # module root to build from
+#   source_dir: ""                                   # default: managed checkout (see above); set to an explicit path (e.g. ".") to opt out of the managed-checkout behavior
+#   repo_url: ""                                      # git remote to clone into the DEFAULT managed source_dir if it does not exist yet. Required only when source_dir is left at its default AND the managed checkout has not been created another way (e.g. a prior manual `git clone`). No default — cloning to an unaudited location from a guessed URL is worse than failing loudly.
 #   install_path: /usr/local/bin/clagentic-router    # path the running service execs
 #   service_name: clagentic-router                   # systemd unit (without .service)
 #   service_manager: systemd                         # systemd | none (install only, no restart)

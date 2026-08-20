@@ -527,17 +527,51 @@ type LogConfig struct {
 }
 
 // DeployConfig controls the optional "clagentic-router update" self-deploy
-// subcommand: rebuild the binary from source and restart the running
-// service. All fields are optional with defaults matching a stock
-// systemd install; a clean third-party install works unconfigured.
+// subcommand: maintain a git checkout at a known location, rebuild the
+// binary from it, and restart the running service. All fields are optional
+// with defaults matching a stock systemd install; a clean third-party
+// install works unconfigured.
+//
+// WHY A MANAGED CHECKOUT, NOT CWD (lr-720e91): SourceDir used to default to
+// "." — the update subcommand's own working directory. That is never a safe
+// default on a deployed host: a systemd unit invokes `clagentic-router
+// update` with the service's cwd (often "/"), not a source tree, and there
+// is no reason to expect a Go module to be present there at all. This
+// followed clagentic-lite's distribution convention (see its README's
+// "There is no package manager. Distribution is the git repo itself" and
+// its `~/.clagentic/lite` clone-once-to-a-known-location model) — a fixed,
+// brand-consistent checkout path that `update` owns and `git pull
+// --ff-only`s in place, mirroring `clagentic-lite update`. It does NOT
+// mirror clagentic-lite's *mechanics* beyond that: this is a compiled Go
+// daemon replacing a live systemd-held binary, not a shell tool re-stamping
+// template files — see runUpdate's own doc for the build/install/restart
+// contract (fresh -o build, atomic rename, mandatory restart) that
+// predates this change (lr-2e0a65) and is preserved unmodified here.
 type DeployConfig struct {
-	// SourceDir is the module root to build from. Default "." (the current
-	// working directory). The update subcommand does not fetch or check out
-	// anything itself — it builds whatever source is present at this path,
-	// which is expected to already reflect the desired revision (e.g. a
-	// post-merge automation step that runs with cwd already synced to the
-	// merged commit).
+	// SourceDir is the module root to build from. Default: a managed
+	// checkout at $XDG_DATA_HOME/clagentic-router/src (falling back to
+	// ~/.local/share/clagentic-router/src when XDG_DATA_HOME is unset) —
+	// never the update subcommand's own working directory. update maintains
+	// this checkout itself (clone-if-absent when RepoURL is set, `git pull
+	// --ff-only` otherwise) rather than assuming it already reflects the
+	// desired revision.
+	//
+	// Set this explicitly to keep the pre-existing "build from a tree that
+	// already reflects the desired revision" behavior — e.g. a post-merge
+	// automation step that runs with cwd already synced to the merged
+	// commit sets source_dir (or passes --source-dir) to "." explicitly.
+	// An explicit value here is honored byte-identically and update never
+	// clones or pulls a directory the operator pointed at themselves; the
+	// git-pull-ownership behavior below applies only to the DEFAULT managed
+	// checkout path.
 	SourceDir string `yaml:"source_dir"`
+
+	// RepoURL is the git remote to clone from when the resolved SourceDir
+	// (default managed path only — see SourceDir) does not yet exist. No
+	// default: cloning to an operator-unaudited location from a guessed URL
+	// is worse than failing loudly, so an empty RepoURL with a missing
+	// checkout is a hard, actionable config error naming exactly this field.
+	RepoURL string `yaml:"repo_url"`
 
 	// InstallPath is the absolute path of the installed binary that the
 	// running service executes. Default "/usr/local/bin/clagentic-router".
@@ -554,12 +588,45 @@ type DeployConfig struct {
 	ServiceManager string `yaml:"service_manager"`
 }
 
-// ResolvedSourceDir returns SourceDir, defaulting to ".".
+// DefaultManagedSourceDir returns the default managed checkout location
+// update owns when deploy.source_dir is not set: $XDG_DATA_HOME/
+// clagentic-router/src, falling back to ~/.local/share/clagentic-router/src.
+// Mirrors resolveDBPath's XDG resolution shape in cmd/clagentic-router/
+// main.go (state vs. data: a source checkout is persistent user data, not
+// runtime state, so XDG_DATA_HOME is the correct analog, not
+// XDG_STATE_HOME). Returns "" when neither XDG_DATA_HOME nor HOME is set —
+// callers must treat that as "cannot resolve a default" and fail loudly
+// rather than falling back to cwd.
+func DefaultManagedSourceDir() string {
+	base := os.Getenv("XDG_DATA_HOME")
+	if base == "" {
+		home := os.Getenv("HOME")
+		if home == "" {
+			return ""
+		}
+		base = home + "/.local/share"
+	}
+	return base + "/clagentic-router/src"
+}
+
+// ResolvedSourceDir returns SourceDir, defaulting to the managed checkout
+// location (DefaultManagedSourceDir) rather than ".". See the SourceDir
+// field doc and this type's package-level doc for the full rationale.
 func (d *DeployConfig) ResolvedSourceDir() string {
 	if d.SourceDir == "" {
-		return "."
+		return DefaultManagedSourceDir()
 	}
 	return d.SourceDir
+}
+
+// SourceDirIsManaged reports whether ResolvedSourceDir() is the default
+// managed checkout (true) or an operator-supplied explicit path (false).
+// runUpdate uses this to decide whether it owns the checkout's git state
+// (clone-if-absent, pull --ff-only) — an explicit source_dir is assumed to
+// already reflect the desired revision, exactly as before this change, and
+// update never touches its git state.
+func (d *DeployConfig) SourceDirIsManaged() bool {
+	return d.SourceDir == ""
 }
 
 // ResolvedInstallPath returns InstallPath, defaulting to the standard
