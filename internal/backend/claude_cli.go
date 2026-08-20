@@ -780,24 +780,20 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 		}
 	}
 
-	stderrStr := truncate(stderr.String(), 500)
-
 	if err != nil || exitCode != 0 {
-		// Classify (and parse reset time) against the FULL stderr+stdout, not
-		// the truncated display string above (lr-807319) — a head-truncation
-		// window can silently drop tail-positioned error text. truncate() is
-		// still used for the Raw display field only.
-		full := stderr.String() + stdout.String()
-		errType := ClassifyError(full, exitCode)
-		resetAt := ParseResetTime(full)
-		raw := stderrStr
-		if raw == "" {
-			raw = truncate(stdout.String(), 500)
-		}
+		// classificationText and Raw are now the SAME string (lr-c1d353):
+		// previously "full" (stderr+full stdout) drove classification while
+		// a separately-computed "raw" (stderr, or a stdout head when stderr
+		// was empty) drove the Raw display field, so the logged/reported
+		// error text was never guaranteed to be the text that produced
+		// error_type — see extractClassificationText's doc for the fix.
+		text := extractClassificationText(stdout.Bytes(), stderr.String())
+		errType := ClassifyError(text, exitCode)
+		resetAt := ParseResetTime(text)
 		slog.Debug("claude_cli invoke failed",
 			"backend", a.id, "exit_code", exitCode, "error_type", errType, "reset_at", resetAt,
 			"request_id", RequestIDFromCtx(ctx))
-		ie := &InvokeError{Type: errType, Raw: raw}
+		ie := &InvokeError{Type: errType, Raw: truncate(text, 500)}
 		return nil, ie
 	}
 
@@ -806,6 +802,98 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 	// (carries the final response) and rate_limit_event lines (quota telemetry).
 	// All other line types are silently ignored for forward compatibility.
 	return parseStreamJSON(stdout.Bytes(), req, a.id)
+}
+
+// extractClassificationText returns the text that ClassifyError should
+// classify, and that InvokeError.Raw should report — the SAME string in
+// both cases, by construction (lr-c1d353).
+//
+// MILLER's diagnosis of lr-c1d353 found that the previous nonzero-exit path
+// classified against "full" (stderr + entire stdout) while reporting a
+// SEPARATE "raw" string (stderr, or a truncated stdout HEAD when stderr was
+// empty) as InvokeError.Raw. For a stream-json claude invocation, stdout is
+// the whole event stream — tool names, session ids, cost floats, and the
+// model's own prose — not error-only text, and stderr is frequently empty
+// even on a real failure (claude writes diagnostics to stdout as stream
+// events on many failure modes). That split let a harmless stream-json
+// init event get logged as "the error" while classification silently ran
+// against unrelated stream content elsewhere in stdout — the exact defect
+// that produced the same payload classifying as unknown then rate_limit
+// across two otherwise-identical runs.
+//
+// Fix: parse stdout as stream-json FIRST and, if it contains a type=="error"
+// event or a "result" line carrying IsError/Errors/Error/Message, extract
+// ONLY that field's text — never the surrounding stream. Fall back to
+// stderr when stdout does not parse as stream-json at all, or parses but
+// contains no error-bearing field (e.g. the subprocess crashed before
+// writing any stream-json output, or exited nonzero for a reason the CLI
+// never described in-band). Fall back to raw stdout only as a last resort,
+// truncated by the caller exactly as before, so a genuinely undiagnosable
+// failure is still visible rather than silently empty.
+func extractClassificationText(stdout []byte, stderrStr string) string {
+	if len(bytes.TrimSpace(stdout)) > 0 {
+		if text, ok := errorTextFromStreamJSON(stdout); ok {
+			return text
+		}
+	}
+	if stderrStr != "" {
+		return stderrStr
+	}
+	return string(stdout)
+}
+
+// errorTextFromStreamJSON scans stdout as newline-delimited stream-json
+// looking for an error-bearing field: a type=="error" event's error/message,
+// or a "result" line's Error/Message/Errors (the same fields parseStreamJSON
+// itself checks on the success path — see its "error" case and the
+// resultLine.IsError branch below). Returns ("", false) when stdout does
+// not decode as stream-json at all, or decodes but no line carries an
+// error-bearing field — the caller falls back to stderr in that case.
+func errorTextFromStreamJSON(stdout []byte) (string, bool) {
+	scanner := bufio.NewScanner(bytes.NewReader(stdout))
+	var sawValidLine bool
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var sl claudeOutput
+		if err := json.Unmarshal(line, &sl); err != nil {
+			continue
+		}
+		sawValidLine = true
+
+		if sl.Type == "error" {
+			if sl.Error != "" {
+				return sl.Error, true
+			}
+			if sl.Message != "" {
+				return sl.Message, true
+			}
+		}
+		if sl.Type == "result" && (sl.IsError || len(sl.Errors) > 0) {
+			if len(sl.Errors) > 0 {
+				return strings.Join(sl.Errors, "; "), true
+			}
+			if sl.Error != "" {
+				return sl.Error, true
+			}
+			if sl.Message != "" {
+				return sl.Message, true
+			}
+		}
+	}
+	if !sawValidLine {
+		// stdout never decoded as stream-json (e.g. plain crash output) —
+		// tell the caller to fall back to stderr rather than silently
+		// returning empty.
+		return "", false
+	}
+	// Valid stream-json throughout, but no line carried an error-bearing
+	// field — the nonzero exit is not explained in-band by the stream
+	// (e.g. an early abort before any output, or a reason the CLI does not
+	// report as a structured event). Fall back to stderr.
+	return "", false
 }
 
 // parseStreamJSON scans the stream-json output lines, extracts the result and any
