@@ -21,6 +21,40 @@
 // Stderr noise: the gemini CLI always emits keychain / credential lines on
 // stderr regardless of success. Do NOT treat non-empty stderr as an error —
 // check exit code only.
+//
+// Proactive quota signal investigation (lr-c98c Slice E), UPDATED with live
+// findings (gemini 0.47.0, verified by a second agent with a permitted
+// `gemini` execution path — this adapter's own author could not invoke the
+// binary at all, guard-bash denies it, and said so rather than guessing):
+//
+// The geminiOutput/geminiOutputStats/geminiModelStats/geminiTokenCounts
+// types below remain this package's only verified capture of
+// `gemini --output-format json` shape, confirmed live: session_id, a
+// response string, and a per-model token-count stats block — no quota,
+// rate_limit, or usage field of any kind. stream-json events were also
+// checked live and carry no quota field either. So: gemini_cli's JSON
+// INVOCATION PATH (the shape this adapter's Invoke actually parses) has no
+// proactive quota signal — that negative is now confirmed live, not just
+// stated as an unverified gap.
+//
+// That is narrower than "gemini has no proactive quota signal at all",
+// which would be wrong: the CLI's shipped JsonFormatter simply never wires
+// one in. gemini's Config.refreshUserQuota() calls the Code Assist
+// `retrieveUserQuota` RPC and gets back buckets[].{modelId,
+// remainingAmount, remainingFraction, resetTime} — a real proactive
+// snapshot — but that result only reaches the interactive TUI footer and
+// the `/stats` slash command, never `--output-format json` or
+// stream-json. There is no flag on this CLI (verified: none of --output-
+// format's documented values expose it) that routes that internal model
+// through the JSON path this adapter invokes, so there is nothing for this
+// adapter to harvest without a different integration point than
+// stdout-of-a-subprocess (e.g. gemini's own Code Assist RPC directly,
+// which is out of scope for a CLI-subprocess adapter). TODO(lr-c98c):
+// revisit if/when the gemini CLI exposes retrieveUserQuota's result through
+// --output-format json or stream-json.
+//
+// gemini_cli remains reactive-only (quota known only from error text via
+// ParseResetTime) on its current JSON invocation path.
 package backend
 
 import (

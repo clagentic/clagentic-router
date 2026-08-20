@@ -5,6 +5,13 @@
 // is available (e.g. CI, containers without OAuth).
 //
 // API reference: https://platform.openai.com/docs/api-reference/chat
+//
+// Rate-limit headers (lr-1f7e, extended lr-c98c Slice E): x-ratelimit-
+// remaining-tokens/-requests were already harvested into RateLimitInfo.
+// x-ratelimit-limit-tokens/-requests are now harvested alongside them so
+// the router can compute a synthetic utilization (1 - remaining/limit) and
+// feed it into the same quota_snapshots table claude_cli's rate_limit_event
+// populates — see router.go's recordSuccess for the synthesis point.
 package backend
 
 import (
@@ -240,8 +247,10 @@ func (a *OpenAIAPIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 
 	rl := RateLimitInfo{
 		TokensRemaining:   parseIntHeader(resp.Header, "x-ratelimit-remaining-tokens"),
+		TokensLimit:       parseIntHeader(resp.Header, "x-ratelimit-limit-tokens"),
 		TokensResetAt:     parseDurationResetHeader(resp.Header, "x-ratelimit-reset-tokens"),
 		RequestsRemaining: parseIntHeader(resp.Header, "x-ratelimit-remaining-requests"),
+		RequestsLimit:     parseIntHeader(resp.Header, "x-ratelimit-limit-requests"),
 		RequestsResetAt:   parseDurationResetHeader(resp.Header, "x-ratelimit-reset-requests"),
 	}
 

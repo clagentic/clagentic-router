@@ -197,15 +197,19 @@ func TestAnthropicAPI_SkipsThinkingBlocks(t *testing.T) {
 }
 
 // TestAnthropicAPI_RateLimitHeadersPopulated verifies that Anthropic rate-limit headers
-// are harvested and stored in RateLimitInfo.
+// are harvested and stored in RateLimitInfo, including the -limit headers
+// added lr-c98c Slice E so the router can compute a synthetic utilization
+// (1 - remaining/limit).
 func TestAnthropicAPI_RateLimitHeadersPopulated(t *testing.T) {
 	resetTime := "2026-05-28T20:00:00Z"
 	wantResetAt, _ := time.Parse(time.RFC3339, resetTime)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("anthropic-ratelimit-tokens-remaining", "45000")
+		w.Header().Set("anthropic-ratelimit-tokens-limit", "50000")
 		w.Header().Set("anthropic-ratelimit-tokens-reset", resetTime)
 		w.Header().Set("anthropic-ratelimit-requests-remaining", "100")
+		w.Header().Set("anthropic-ratelimit-requests-limit", "120")
 		w.Header().Set("anthropic-ratelimit-requests-reset", resetTime)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -224,8 +228,14 @@ func TestAnthropicAPI_RateLimitHeadersPopulated(t *testing.T) {
 	if resp.RateLimitInfo.TokensRemaining != 45000 {
 		t.Errorf("TokensRemaining = %d, want 45000", resp.RateLimitInfo.TokensRemaining)
 	}
+	if resp.RateLimitInfo.TokensLimit != 50000 {
+		t.Errorf("TokensLimit = %d, want 50000", resp.RateLimitInfo.TokensLimit)
+	}
 	if resp.RateLimitInfo.RequestsRemaining != 100 {
 		t.Errorf("RequestsRemaining = %d, want 100", resp.RateLimitInfo.RequestsRemaining)
+	}
+	if resp.RateLimitInfo.RequestsLimit != 120 {
+		t.Errorf("RequestsLimit = %d, want 120", resp.RateLimitInfo.RequestsLimit)
 	}
 	if !resp.RateLimitInfo.TokensResetAt.Equal(wantResetAt) {
 		t.Errorf("TokensResetAt = %v, want %v", resp.RateLimitInfo.TokensResetAt, wantResetAt)
@@ -256,11 +266,17 @@ func TestAnthropicAPI_RateLimitHeadersAbsent(t *testing.T) {
 	if resp.RateLimitInfo.TokensRemaining != 0 {
 		t.Errorf("TokensRemaining = %d, want 0 (absent header)", resp.RateLimitInfo.TokensRemaining)
 	}
+	if resp.RateLimitInfo.TokensLimit != 0 {
+		t.Errorf("TokensLimit = %d, want 0 (absent header)", resp.RateLimitInfo.TokensLimit)
+	}
 	if !resp.RateLimitInfo.TokensResetAt.IsZero() {
 		t.Errorf("TokensResetAt = %v, want zero time (absent header)", resp.RateLimitInfo.TokensResetAt)
 	}
 	if resp.RateLimitInfo.RequestsRemaining != 0 {
 		t.Errorf("RequestsRemaining = %d, want 0 (absent header)", resp.RateLimitInfo.RequestsRemaining)
+	}
+	if resp.RateLimitInfo.RequestsLimit != 0 {
+		t.Errorf("RequestsLimit = %d, want 0 (absent header)", resp.RateLimitInfo.RequestsLimit)
 	}
 	if !resp.RateLimitInfo.RequestsResetAt.IsZero() {
 		t.Errorf("RequestsResetAt = %v, want zero time (absent header)", resp.RateLimitInfo.RequestsResetAt)

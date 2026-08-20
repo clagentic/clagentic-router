@@ -161,10 +161,23 @@ func ResolveWorkingDir(raw string) (string, error) {
 // RateLimitInfo holds provider rate-limit header values from one response.
 // All fields are best-effort — absent headers leave fields at zero value.
 // These reflect per-minute windows, distinct from billing quota fields.
+//
+// TokensLimit/RequestsLimit (lr-c98c, Slice E) carry the window ceiling
+// alongside the pre-existing Remaining fields, harvested from the
+// provider's own "-limit" header (openai_api: x-ratelimit-limit-tokens/
+// -requests; anthropic_api: anthropic-ratelimit-tokens-limit/
+// -requests-limit) using the same best-effort parseIntHeader helper
+// already used for Remaining — no new parsing mechanism. Zero means the
+// header was absent, identically to every other field here. The router
+// uses Limit alongside Remaining to compute a synthetic utilization
+// (1.0 - remaining/limit) for quota_snapshots parity with claude_cli's
+// rate_limit_event; see router.go's recordSuccess.
 type RateLimitInfo struct {
 	TokensRemaining   int64
+	TokensLimit       int64
 	TokensResetAt     time.Time
 	RequestsRemaining int64
+	RequestsLimit     int64
 	RequestsResetAt   time.Time
 }
 
