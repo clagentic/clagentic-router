@@ -17,6 +17,25 @@ type errorPattern struct {
 	matches []string // substrings to check (case-insensitive OR logic)
 }
 
+// billingWordRe matches "billing" as a whole word (case-insensitive), not as
+// a substring of an unrelated identifier (tool name, file path, MCP server
+// name) that happens to contain it. See ClassifyError's doc for why this
+// pattern is a regex while the others remain plain substrings.
+var billingWordRe = regexp.MustCompile(`(?i)\bbilling\b`)
+
+// apiKeyWordRe matches "api key" as a whole phrase (case-insensitive),
+// bounded so it does not fire inside a longer token such as a tool or
+// parameter name that merely contains the substring "api key".
+var apiKeyWordRe = regexp.MustCompile(`(?i)\bapi[ _-]?key\b`)
+
+// credentialWordRe matches "credential"/"credentials" as a whole word
+// (case-insensitive). Unbounded substring matching on "credential" fires on
+// any tool description, file path, or CLAUDE.md prose that mentions
+// credentials without describing an actual auth failure (MILLER,
+// lr-c1d353) — ErrTypeAuth drives a hard StatusOffline transition
+// (state.go), so a false positive here is not cosmetic.
+var credentialWordRe = regexp.MustCompile(`(?i)\bcredentials?\b`)
+
 var errorPatterns = []errorPattern{
 	// Quota / credit exhaustion — hard limits
 	{ErrTypeQuota, []string{
@@ -26,7 +45,6 @@ var errorPatterns = []errorPattern{
 		"credit balance",
 		"insufficient_quota",
 		"quota exceeded",
-		"billing",
 		"account has insufficient credits",
 	}},
 	// Rate limiting — soft window limits
@@ -36,7 +54,9 @@ var errorPatterns = []errorPattern{
 		"too many requests",
 		"overloaded_error",
 		"overloaded",
-		"529",
+		"status 529",
+		"http 529",
+		"529 overloaded",
 		"try again in",
 		"please slow down",
 	}},
@@ -46,8 +66,6 @@ var errorPatterns = []errorPattern{
 		"unauthorized",
 		"invalid api key",
 		"invalid_api_key",
-		"api key",
-		"credential",
 		"not logged in",
 		"login required",
 	}},
@@ -58,7 +76,7 @@ var errorPatterns = []errorPattern{
 		"network unreachable",
 		"dial tcp",
 		"connection reset",
-		"EOF",
+		"eof",
 		"i/o timeout",
 	}},
 	// Timeout — from context deadline or OS timeout
@@ -71,6 +89,15 @@ var errorPatterns = []errorPattern{
 
 // ClassifyError returns the ErrorType for the given stderr text and exit code.
 // exitCode 127 = binary not found; 124 = killed by timeout command.
+//
+// Word-boundary patterns (billing, api key, credential) are checked inline,
+// interleaved with the plain-substring errorPatterns table, so slice/table
+// ordering (Quota before RateLimit before Auth before Network before
+// Timeout — first match wins) is preserved exactly as before this change;
+// see errparse.go's package doc and lr-c1d353 for why an incidental
+// "billing" or "credential" substring must not outrank a real match earlier
+// in that priority order, nor a later one for a pattern this input doesn't
+// actually contain.
 func ClassifyError(stderr string, exitCode int) ErrorType {
 	if exitCode == 127 {
 		return ErrTypeNotFound
@@ -84,6 +111,19 @@ func ClassifyError(stderr string, exitCode int) ErrorType {
 		for _, m := range p.matches {
 			if strings.Contains(lower, m) {
 				return p.typ
+			}
+		}
+		// Word-boundary patterns belonging to this same ErrorType, checked
+		// at this point in slice order so first-match-wins priority across
+		// types is unaffected by moving them out of the plain-substring list.
+		switch p.typ {
+		case ErrTypeQuota:
+			if billingWordRe.MatchString(stderr) {
+				return ErrTypeQuota
+			}
+		case ErrTypeAuth:
+			if apiKeyWordRe.MatchString(stderr) || credentialWordRe.MatchString(stderr) {
+				return ErrTypeAuth
 			}
 		}
 	}
