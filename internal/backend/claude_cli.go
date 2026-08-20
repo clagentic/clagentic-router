@@ -21,6 +21,26 @@
 //
 // The router does not parse, cache, or expand model strings. Resolution is
 // entirely delegated to the claude CLI on each invocation.
+//
+// Cache token accounting (lr-718af0): the claude CLI's stream-json "result"
+// line may carry a "usage" object with cache_creation_input_tokens/
+// cache_read_input_tokens (the same underlying Anthropic Messages API
+// fields anthropic_api.go parses) on some CLI versions, but this package's
+// author has no permitted `claude` execution path (guard-bash denies it,
+// same restriction documented in codex_cli.go's and gemini_cli.go's
+// investigation comments) to confirm that shape against a live run of the
+// actual stream-json output this adapter parses. Per CLAUDE.md's "verify
+// per-provider assumptions against the live source, never generalize from
+// one example" and this repo's own lr-60781e/lr-8dd85a/lr-82e68e lineage —
+// where a plausible-but-unverified shape assumption was shipped and later
+// found wrong — claudeOutput below does NOT add a speculative Usage field,
+// and Response.CacheUsage is left nil for every claude_cli invocation:
+// documented as an honest unverified gap, not a fabricated zero and not a
+// guessed field name. TODO(lr-718af0): parse the real usage object once an
+// agent with a permitted `claude` execution path captures the live
+// stream-json shape (mirroring how codex_cli's cache fields were confirmed
+// by a second agent's live run rather than this file's own author's read of
+// the CLI's docs).
 package backend
 
 import (

@@ -55,6 +55,15 @@
 //
 // gemini_cli remains reactive-only (quota known only from error text via
 // ParseResetTime) on its current JSON invocation path.
+//
+// Cache token accounting (lr-718af0): geminiTokenCounts above is this
+// package's live-verified capture of `gemini --output-format json`'s stats
+// block (see the quota-signal investigation above) — Input/Candidates/Total
+// only, no cache-read/cache-write field of any kind. This is the same
+// verified shape, re-examined for a different question, not a fresh guess:
+// Response.CacheUsage is left nil for every gemini_cli invocation,
+// documented unsupported rather than a fabricated zero (see
+// backend.CacheUsage's doc for why nil vs. zero matters here).
 package backend
 
 import (

@@ -86,6 +86,50 @@
 //
 // codex_cli remains reactive-only (quota known only from error text via
 // ParseResetTime) until that follow-up lands.
+//
+// Cache token accounting (lr-718af0) — VERIFIED, not inferred: a live
+// capture of `codex exec --json` (codex-cli 0.147.0, provided directly in
+// this task's dispatch) shows the JSONL turn.completed event carries a
+// usage object with EXACTLY the shape this feature needs:
+//
+//	"usage":{"input_tokens":16786,"cached_input_tokens":11008,
+//	         "cache_write_input_tokens":0,"output_tokens":5,
+//	         "reasoning_output_tokens":0}
+//
+// So codex_cli is NOT a documented no-op for cache accounting — the data
+// exists and is reachable. The decision made here is deliberately NOT to
+// wire it into this adapter's Invoke in this change:
+//
+//   - Invoke below does not pass --json today; it treats stdout as a flat
+//     text string and classifies failures from that raw text (ClassifyError,
+//     ParseResetTime). Adding --json would change the parse target, the
+//     success/failure detection path, and the error-classification input for
+//     every call this adapter makes — codex_cli is a load-bearing production
+//     path (CLAUDE.md), not a place to bundle an invocation-shape change into
+//     an additive observability feature.
+//   - The safer precedent this repo already uses for "shell out and parse a
+//     different codex output shape" (codex_discovery.go, codex_model_discovery.go)
+//     is a SEPARATE one-shot subprocess call at adapter-construction time,
+//     never touching the per-request Invoke path. That precedent does not
+//     transfer here: cache usage is per-invocation data (it varies call to
+//     call), not a one-time discovery value resolvable once at construction,
+//     so there is no equivalent "call it once, cache the result" escape
+//     hatch available.
+//   - Switching Invoke's own stdout contract for every codex_cli call,
+//     everywhere this adapter is deployed, to gain one new observability
+//     field is a real behavior change to a production path and needs its own
+//     scoped, reviewed change with its own risk assessment and test
+//     coverage — not a rider on this task's diff.
+//
+// Response.CacheUsage is therefore left nil for codex_cli today: this is a
+// genuine, temporary "not yet wired" gap, not a "cannot report" gap — the
+// two are different facts and this comment states which one applies.
+// TODO(lr-718af0): switch Invoke to `codex exec --json`, parse the
+// turn.completed usage object above, and re-validate the existing
+// stdout-based failure classification against the new JSONL shape (error
+// events likely need their own line-type check, mirroring how claude_cli.go
+// distinguishes a "result" line from an "error" line in parseStreamJSON)
+// before this can land as its own change.
 package backend
 
 import (

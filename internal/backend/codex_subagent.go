@@ -7,6 +7,18 @@
 // to resolve the tier to a concrete model. This is the "openai-via-codex-subagent"
 // provider path from the relay registry — it avoids hardcoding model strings and
 // lets the models.json file be the single source of truth for tier → model.
+//
+// Cache token accounting (lr-718af0): this adapter invokes the claude CLI
+// (--output-format json, parsed into the same claudeOutput type
+// claude_cli.go uses) via the codex subagent, so it inherits the identical
+// unverified-usage-shape gap documented in claude_cli.go's package doc — no
+// permitted `claude` execution path exists for this repo's author to
+// confirm whether/how a usage/cache object appears in this specific
+// --agent codex output path. Response.CacheUsage is left nil here for the
+// same reason: an honest unverified gap, not a guessed field or a
+// fabricated zero. TODO(lr-718af0): resolve identically to claude_cli.go's
+// TODO — the same live-verification step should cover both adapters, since
+// they parse the same claudeOutput shape.
 package backend
 
 import (

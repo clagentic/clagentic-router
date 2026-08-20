@@ -3,6 +3,15 @@
 // Invokes: POST <url>/api/chat with a JSON body (OpenAI-compatible messages).
 // No authentication required by default (Ollama is local-first).
 // stream=false for synchronous responses.
+//
+// Cache token accounting (lr-718af0): Ollama's /api/chat has no prompt-cache
+// concept in its wire API at all — no cache_read/cache_write-equivalent
+// field exists in its documented response shape (only prompt_eval_count/
+// eval_count, which this adapter does not even currently parse — see
+// ollamaResponse below, real token counts are a separate, pre-existing gap
+// this task does not expand scope to fix). Response.CacheUsage is left nil
+// here: documented unsupported, not a fabricated zero (see
+// backend.CacheUsage's doc).
 package backend
 
 import (
