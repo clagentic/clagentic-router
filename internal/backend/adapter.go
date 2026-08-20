@@ -201,6 +201,51 @@ type Response struct {
 	// a tool this turn. The router never executes these and never expects a
 	// corresponding tool_result on a later call — see Request.Tools doc.
 	ToolUses []ToolUse
+	// CacheUsage carries per-model prompt-cache token accounting harvested
+	// from the provider's response (lr-718af0). nil means this adapter
+	// cannot report cache data for this call — either the adapter family has
+	// no cache-accounting concept at all (verified per-family; see each
+	// adapter's Capabilities/Invoke doc) or discovering support genuinely
+	// requires a live capability check this repo's author could not run (see
+	// claude_cli.go/codex_subagent.go/codex_cli.go doc comments for the
+	// specific reasoning per adapter). A non-nil *CacheUsage with all-zero
+	// fields is a real, reported cache miss — this distinction is load-bearing:
+	// collapsing "unsupported" into a zero would make the derived hit-rate
+	// metric indistinguishable from a real miss and actively misleading (see
+	// CacheUsage's own doc and this task's acceptance criteria).
+	CacheUsage *CacheUsage
+}
+
+// CacheUsage holds per-model prompt-cache token counts from one adapter
+// invocation (lr-718af0). All three fields are real counts reported by the
+// provider — never estimates, never derived from PromptTokensEst/
+// CompletionTokensEst (those remain char/4-style estimates on CLI adapters
+// that lack real usage data; CacheUsage exists precisely so a caller can
+// tell the two apart).
+//
+// CacheWriteTokens is zero-valued (not unsupported) for a provider whose
+// caching model has no separate "write" concept — e.g. openai_api's cache is
+// automatic and read-only from the caller's perspective; there is nothing to
+// write-account. That is a real, documented zero from a family that DOES
+// report cache reads, distinct from the whole-struct-nil "cannot report
+// anything" case above.
+type CacheUsage struct {
+	// InputTokens is the total input/prompt tokens billed for this call,
+	// exactly as the provider reports it (may double-count cached tokens
+	// depending on provider billing semantics — this struct does not attempt
+	// to normalize that across providers, only to carry each provider's own
+	// number through unmodified).
+	InputTokens int64
+	// CacheReadTokens is the count of input tokens served from an existing
+	// prompt cache (a "hit"). Zero is a real, reported cache miss when
+	// CacheUsage itself is non-nil.
+	CacheReadTokens int64
+	// CacheWriteTokens is the count of input tokens written to create or
+	// extend a prompt cache entry this call. Zero either means no cache was
+	// written this call, or the provider's caching model has no write-side
+	// accounting at all (see doc above) — both are real zeros, not a "cannot
+	// report" case, because CacheUsage itself is non-nil.
+	CacheWriteTokens int64
 }
 
 // ErrorType classifies why an invocation failed.

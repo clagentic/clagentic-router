@@ -95,9 +95,19 @@ type anthropicContentBlock struct {
 	Input json.RawMessage `json:"input,omitempty"`
 }
 
+// anthropicUsage mirrors the Anthropic Messages API's "usage" object.
+// CacheCreationInputTokens/CacheReadInputTokens (lr-718af0) are documented
+// public API fields — https://docs.anthropic.com/en/api/messages, "usage" —
+// present whenever prompt caching is used on this call; absent (zero value)
+// otherwise. Anthropic always includes the usage object on a successful
+// response, so a non-error response from this adapter always yields a
+// non-nil CacheUsage (see Invoke below) — no ambiguity between "usage
+// omitted" and "zero cache activity" exists at this API surface.
 type anthropicUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens              int `json:"input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 }
 
 type anthropicResponse struct {
@@ -278,6 +288,15 @@ func (a *AnthropicAPIAdapter) Invoke(ctx context.Context, req *Request) (*Respon
 		CompletionTokensEst: out.Usage.OutputTokens,
 		RateLimitInfo:       rl,
 		ToolUses:            toolUses,
+		// CacheUsage is always non-nil for a successful anthropic_api response
+		// (lr-718af0) — the Messages API's usage object is always present,
+		// so zero-valued cache fields here are a real reported cache miss,
+		// not an absence of data. See anthropicUsage's doc.
+		CacheUsage: &CacheUsage{
+			InputTokens:      int64(out.Usage.InputTokens),
+			CacheReadTokens:  int64(out.Usage.CacheReadInputTokens),
+			CacheWriteTokens: int64(out.Usage.CacheCreationInputTokens),
+		},
 	}, nil
 }
 

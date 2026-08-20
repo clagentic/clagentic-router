@@ -24,6 +24,13 @@
 // the Bedrock console for the correct form for your target model/region.
 //
 // API reference: https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html
+//
+// Cache token accounting (lr-718af0): types.TokenUsage.CacheReadInputTokens/
+// CacheWriteInputTokens exist on the vendored SDK version pinned in go.mod
+// (github.com/aws/aws-sdk-go-v2/service/bedrockruntime v1.57.1) — confirmed
+// via a live reflection probe against the actual vendored struct (not
+// inferred from SDK changelog prose), so this adapter reports real cache
+// data, not a documented no-op. See Invoke's cacheUsage construction.
 package backend
 
 import (
@@ -190,12 +197,33 @@ func (a *BedrockAPIAdapter) Invoke(ctx context.Context, req *Request) (*Response
 	}
 
 	var promptTokens, completionTokens int
+	var cacheUsage *CacheUsage
 	if out.Usage != nil {
 		if out.Usage.InputTokens != nil {
 			promptTokens = int(*out.Usage.InputTokens)
 		}
 		if out.Usage.OutputTokens != nil {
 			completionTokens = int(*out.Usage.OutputTokens)
+		}
+		// CacheReadInputTokens/CacheWriteInputTokens (lr-718af0) are real
+		// fields on the vendored SDK's types.TokenUsage — confirmed live via
+		// reflection against github.com/aws/aws-sdk-go-v2/service/bedrockruntime
+		// v1.57.1 (the version pinned in go.mod), not inferred from docs.
+		// out.Usage itself is only nil when Bedrock's response omits the
+		// usage block entirely (not expected on a successful Converse call,
+		// but defensively handled here since the SDK types it as a pointer);
+		// when out.Usage is present, CacheUsage is always populated — zero
+		// cache fields are a real reported cache miss, matching
+		// anthropic_api's contract (both APIs always return a usage object
+		// on success).
+		cacheUsage = &CacheUsage{
+			InputTokens: int64(promptTokens),
+		}
+		if out.Usage.CacheReadInputTokens != nil {
+			cacheUsage.CacheReadTokens = int64(*out.Usage.CacheReadInputTokens)
+		}
+		if out.Usage.CacheWriteInputTokens != nil {
+			cacheUsage.CacheWriteTokens = int64(*out.Usage.CacheWriteInputTokens)
 		}
 	}
 
@@ -207,6 +235,7 @@ func (a *BedrockAPIAdapter) Invoke(ctx context.Context, req *Request) (*Response
 		PromptTokensEst:     promptTokens,
 		CompletionTokensEst: completionTokens,
 		ToolUses:            toolUses,
+		CacheUsage:          cacheUsage,
 	}, nil
 }
 

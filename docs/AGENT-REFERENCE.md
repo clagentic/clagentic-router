@@ -44,6 +44,7 @@ send or can expect → this file.
 | GET | /doctor | Live probe of all backends |
 | GET | /quota | Per-backend quota and rate state |
 | GET | /metrics | Prometheus text format |
+| GET | `<cache_metrics.path>` | Prometheus text format per-model cache-token aggregates — opt-in, disabled and unregistered by default (`cache_metrics.enabled: false`); default path `/metrics/cache` when enabled. See "Cache token metrics" below. |
 | GET | /logs | Recent call log (`?from=RFC3339&to=RFC3339`) |
 | GET | /stats | Aggregated call statistics |
 | POST | /backends/{id}/reset | Clear error state, re-probe |
@@ -121,6 +122,49 @@ all, so `cmd.Dir` is their *only* isolation layer. See CLAUDE.md's
 "Subprocess cwd contract" for the full per-adapter rationale and why
 `cmd.Dir` defaulting to `/` still strengthens `codex_cli`/`gemini_cli` even
 without a matching HOME override.
+
+### Cache token metrics
+
+`GET <cache_metrics.path>` (default `/metrics/cache`, opt-in via
+`cache_metrics.enabled: true` — see `router.example.yaml`) exposes
+per-`(backend, model)` prompt-cache token aggregates in Prometheus text
+format, captured at each adapter's `Invoke` boundary:
+
+```
+router_cache_input_tokens_total{backend="claude-opus",model="claude-opus-4-8"} 15234
+router_cache_read_tokens_total{backend="claude-opus",model="claude-opus-4-8"} 9821
+router_cache_write_tokens_total{backend="claude-opus",model="claude-opus-4-8"} 2100
+router_cache_calls_reported{backend="claude-opus",model="claude-opus-4-8"} 42
+router_cache_calls_unsupported{backend="claude-opus",model="claude-opus-4-8"} 0
+```
+
+**Per-adapter-family breadth (checked first, before any storage design) —
+one family per row, no silent gaps:**
+
+| Adapter | Reports cache tokens? | Basis |
+|---|---|---|
+| `anthropic_api` | Yes — input, cache_read, cache_write | Messages API `usage.cache_creation_input_tokens`/`cache_read_input_tokens`, documented public fields |
+| `bedrock_api` | Yes — input, cache_read, cache_write | `types.TokenUsage.CacheReadInputTokens`/`CacheWriteInputTokens` — confirmed via a live reflection probe against the exact vendored SDK version pinned in `go.mod`, not inferred from docs |
+| `openai_api` | Yes — input, cache_read only | Chat Completions `usage.prompt_tokens_details.cached_tokens`; OpenAI's cache has no write-side concept to report, so `cache_write` is a real, documented `0`, not "unsupported" |
+| `codex_cli` | **Not yet wired — verified present, deliberately deferred** | `codex exec --json`'s `turn.completed` event carries `input_tokens`/`cached_input_tokens`/`cache_write_input_tokens` (live-captured, codex-cli 0.147.0). This adapter does not pass `--json` today and changing its invocation/parse/error-classification contract for a production, load-bearing path is out of scope for this addition — see `codex_cli.go`'s package doc for the full reasoning and the `TODO(lr-718af0)` follow-up. |
+| `claude_cli` | **Unverified — honest gap, not a guess** | The CLI's stream-json `result` line may carry a `usage`/cache object on some versions, but no permitted live-verification path existed to confirm the shape this adapter actually parses; a speculative field was deliberately not added (see CLAUDE.md's provider-verification rule and `claude_cli.go`'s doc) |
+| `codex_subagent` | **Unverified — same gap as `claude_cli`** | Invokes the identical `claude` binary/output shape as `claude_cli`; same disposition, same follow-up |
+| `gemini_cli` | **No — verified, documented no-op** | `gemini --output-format json`'s `stats.models.<model>.tokens` block has only `input`/`candidates`/`total` — no cache field of any kind, confirmed live in this package's own prior quota-signal investigation (`gemini_cli.go`) |
+| `ollama_http` | **No — documented no-op** | Ollama's `/api/chat` has no prompt-cache concept in its API at all |
+
+**A `nil` field, never a fabricated `0`, marks "cannot report".** A
+`(backend, model)` pair only accumulates `calls_unsupported` when its
+adapter has no cache data for that call; `calls_reported` and the token
+totals track only real reported data, including a genuine zero-token cache
+miss. A consumer of this endpoint MUST check `calls_reported > 0` before
+treating a `0` hit-rate as a real miss rather than "no data yet" — the same
+distinction the underlying Go types (`backend.CacheUsage`,
+`store.CacheUsageRow.HitRate`) enforce at the code level.
+
+**Counts/aggregates only.** No prompt content, request body, or response
+text is ever captured or persisted for this feature — only integer token
+counts and call counters, the same boundary the `call_log.tools_present`
+bit draws.
 
 ### `working_dir` wire field
 

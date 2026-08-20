@@ -61,7 +61,7 @@ func newChatCompletionsTestServer(t *testing.T, supportsTools bool) (*httptest.S
 		"test-backend": &stubAdapter{id: "test-backend", supportsTools: supportsTools},
 	}
 	r := router.New(cfg, adapters, nil, nil)
-	srv := New(":0", "secret", "secret", false, r, nil, "https://api.anthropic.com", "", "", "")
+	srv := New(":0", "secret", "secret", false, r, nil, "https://api.anthropic.com", "", "", "", false, "")
 	ts := httptest.NewServer(srv.httpServer.Handler)
 	return ts, func() { ts.Close() }
 }

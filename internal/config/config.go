@@ -471,6 +471,34 @@ func (p *ProxyConfig) Address() string {
 	return fmt.Sprintf("%s:%d", host, port)
 }
 
+// CacheMetricsConfig controls the optional per-model prompt-cache token
+// capture and exposition feature (lr-718af0). Opt-in: Enabled defaults to
+// false, matching every other observability toggle in this file
+// (QuotaProbeConfig.Enabled, RoutingConfig.ActiveProbeEnabled) — a clean
+// third-party install runs unconfigured with this feature off and every
+// other flow unchanged.
+type CacheMetricsConfig struct {
+	// Enabled activates cache-token capture at the adapter Invoke boundary
+	// and the GET <Path> exposition endpoint below. Default false.
+	Enabled bool `yaml:"enabled"`
+
+	// Path is the HTTP path the Prometheus-format cache-metrics exposition
+	// endpoint is registered at, served on the same listener/port as every
+	// other route in this daemon (Proxy.Host/Proxy.Port) — this repo has no
+	// second HTTP listener anywhere and this feature does not introduce one.
+	// Default "/metrics/cache" when empty. Admin-token gated, identically to
+	// the existing GET /metrics route.
+	Path string `yaml:"path"`
+}
+
+// ResolvedPath returns Path, defaulting to "/metrics/cache" when unset.
+func (c *CacheMetricsConfig) ResolvedPath() string {
+	if c.Path == "" {
+		return "/metrics/cache"
+	}
+	return c.Path
+}
+
 // StorageConfig controls state persistence.
 type StorageConfig struct {
 	// DBPath is the SQLite database file path.
@@ -573,13 +601,14 @@ type Config struct {
 	// Use "role:chain-name" in the model field to reference these.
 	Chains map[string][]string `yaml:"chains"`
 
-	Routing   RoutingConfig   `yaml:"routing"`
-	Alerts    AlertsConfig    `yaml:"alerts"`
-	Proxy     ProxyConfig     `yaml:"proxy"`
-	Storage   StorageConfig   `yaml:"storage"`
-	Log       LogConfig       `yaml:"log"`
-	Anthropic AnthropicConfig `yaml:"anthropic"`
-	Bedrock   BedrockConfig   `yaml:"bedrock"`
+	Routing      RoutingConfig      `yaml:"routing"`
+	Alerts       AlertsConfig       `yaml:"alerts"`
+	Proxy        ProxyConfig        `yaml:"proxy"`
+	Storage      StorageConfig      `yaml:"storage"`
+	Log          LogConfig          `yaml:"log"`
+	Anthropic    AnthropicConfig    `yaml:"anthropic"`
+	Bedrock      BedrockConfig      `yaml:"bedrock"`
+	CacheMetrics CacheMetricsConfig `yaml:"cache_metrics"`
 
 	// Deploy configures the optional "update" self-deploy subcommand.
 	// Every field defaults to a stock systemd install; omit entirely for

@@ -112,6 +112,10 @@ func Open(dbPath string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store: init quota_snapshots schema: %w", err)
 	}
+	if _, err := db.Exec(cacheUsageSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: init cache_usage schema: %w", err)
+	}
 	if err := migrateCallLog(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("store: migrate call_log: %w", err)
