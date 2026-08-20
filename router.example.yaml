@@ -349,6 +349,19 @@ anthropic:
 #   service_name: clagentic-router                   # systemd unit (without .service)
 #   service_manager: systemd                         # systemd | none (install only, no restart)
 
+# --- Cache token metrics (GET <cache_metrics.path>) ---
+# Opt-in per-model prompt-cache token capture at the adapter Invoke boundary
+# (see docs/AGENT-REFERENCE.md for the full per-adapter-family breadth
+# writeup: anthropic_api, openai_api, and bedrock_api report real cache
+# data; claude_cli, codex_subagent, codex_cli, gemini_cli, and ollama_http
+# do not currently — each documented explicitly in its own adapter file,
+# distinguishing "cannot report" from "reports a real zero"). Disabled by
+# default; a clean install works unconfigured with this feature fully off
+# and no new route registered.
+# cache_metrics:
+#   enabled: true
+#   path: /metrics/cache   # default when omitted; served on the same proxy.port/host as every other route
+
 # --- Storage ---
 storage:
   db_path: ""   # default: $XDG_STATE_HOME/clagentic-router/state.db
