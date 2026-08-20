@@ -40,7 +40,13 @@ type Server struct {
 // bedrockRegion/bedrockProfile configure the POST /model/{modelId}/invoke[-with-response-stream]
 // passthrough target; bedrockRegion empty disables Bedrock passthrough (routed
 // role:/chain:/backend: model IDs still work) — see bedrock_invoke.go.
-func New(addr, token, adminToken string, allowNoAuth bool, r *router.Router, st *store.Store, anthropicUpstreamURL, anthropicUpstreamAPIKey, bedrockRegion, bedrockProfile string) *Server {
+// cacheMetricsEnabled/cacheMetricsPath gate and place the optional GET
+// per-model cache-token exposition endpoint (lr-718af0, see
+// cache_metrics.go); the route is registered only when cacheMetricsEnabled
+// is true — an unconfigured install (cacheMetricsEnabled == false, the
+// config default) never registers the path at all, not merely returns an
+// empty body from it.
+func New(addr, token, adminToken string, allowNoAuth bool, r *router.Router, st *store.Store, anthropicUpstreamURL, anthropicUpstreamAPIKey, bedrockRegion, bedrockProfile string, cacheMetricsEnabled bool, cacheMetricsPath string) *Server {
 	h := &Handler{
 		router:                  r,
 		store:                   st,
@@ -79,6 +85,20 @@ func New(addr, token, adminToken string, allowNoAuth bool, r *router.Router, st 
 	mux.HandleFunc("GET /quota", h.adminAuth(h.quota))
 	mux.HandleFunc("GET /v1/capacity", h.adminAuth(h.capacity))
 	mux.HandleFunc("GET /metrics", h.adminAuth(h.metrics))
+	if cacheMetricsEnabled {
+		// Opt-in per-model cache-token exposition (lr-718af0) — path is
+		// config-driven (cache_metrics.path, default /metrics/cache) and the
+		// route is not registered at all when the feature is disabled, so an
+		// unconfigured install has no new attack surface here. Defaulted here
+		// (not only in config.CacheMetricsConfig.ResolvedPath) so this
+		// constructor is correct for any caller, not only one that remembered
+		// to call ResolvedPath() first.
+		path := cacheMetricsPath
+		if path == "" {
+			path = "/metrics/cache"
+		}
+		mux.HandleFunc("GET "+path, h.adminAuth(h.cacheMetrics))
+	}
 	mux.HandleFunc("GET /logs", h.adminAuth(h.logs))
 	mux.HandleFunc("GET /stats", h.adminAuth(h.stats))
 

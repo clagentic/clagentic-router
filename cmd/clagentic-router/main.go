@@ -176,7 +176,8 @@ func cmdServe(args []string) error {
 	}
 	srv := server.New(addr, token, adminToken, sf.unsafeNoAuth, r, st,
 		cfg.Anthropic.ResolvedUpstreamURL(), cfg.Anthropic.ResolvedUpstreamAPIKey(),
-		cfg.Bedrock.ResolvedRegion(), cfg.Bedrock.Profile)
+		cfg.Bedrock.ResolvedRegion(), cfg.Bedrock.Profile,
+		cfg.CacheMetrics.Enabled, cfg.CacheMetrics.ResolvedPath())
 
 	// Graceful shutdown on SIGINT/SIGTERM
 	sigCh := make(chan os.Signal, 1)
