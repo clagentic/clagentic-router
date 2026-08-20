@@ -281,6 +281,33 @@ not distinguish them); `ValidationException`/`ResourceNotFoundException` →
 `ModelErrorException`/`InternalServerException`/`ServiceUnavailableException`
 → `network`.
 
+### Chain-exhaustion response (`503 backends_unavailable`)
+
+When every backend in a routed chain fails, `/v1/chat/completions` and
+`/v1/messages` (routed mode) both return `503`, never `502` — `502` is
+reserved for a distinct, non-exhaustion failure branch. The body carries an
+optional `last_error_type` field: the `ErrorType` (table above) of the
+**last** backend to fail before the chain gave up, or omitted entirely when
+unknown. This reuses the exact same type-only enum `GET /v1/models`
+publishes per backend as `last_error_type` — never raw error text, never a
+backend id, never any AWS profile/account/token/config-path detail.
+
+OpenAI-compatible shape:
+
+```json
+{"error": {"code": "backends_unavailable", "message": "no available backends in chain", "last_error_type": "auth"}}
+```
+
+Anthropic-compatible shape:
+
+```json
+{"type": "error", "error": {"type": "overloaded_error", "message": "no available backends in chain", "last_error_type": "auth"}}
+```
+
+An agent polling for chain health can distinguish "every backend is out of
+quota" from "every backend needs re-auth" from this field alone, without a
+second call to `/v1/models`.
+
 ## Routing invariants an agent must not assume around
 
 - **`router.Score()` is pure and deterministic** — same snapshot/config/
