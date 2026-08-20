@@ -12,8 +12,15 @@ import (
 // "clean third-party install works unconfigured" acceptance criterion.
 func TestDeployConfig_Defaults(t *testing.T) {
 	var d DeployConfig
-	if got, want := d.ResolvedSourceDir(), "."; got != want {
-		t.Errorf("ResolvedSourceDir() = %q, want %q", got, want)
+	// ResolvedSourceDir() is NOT "." (lr-720e91): a deployed host's update
+	// subcommand has no reason to have a source tree in its own cwd. Default
+	// is the managed checkout path, derived from XDG_DATA_HOME/HOME — see
+	// TestResolvedSourceDir_ManagedDefault for the exact value assertion.
+	if got := d.ResolvedSourceDir(); got == "." {
+		t.Errorf("ResolvedSourceDir() = %q, want anything other than \".\" (lr-720e91: cwd is never a safe default on a deployed host)", got)
+	}
+	if !d.SourceDirIsManaged() {
+		t.Error("SourceDirIsManaged() = false with SourceDir unset, want true")
 	}
 	if got, want := d.ResolvedInstallPath(), "/usr/local/bin/clagentic-router"; got != want {
 		t.Errorf("ResolvedInstallPath() = %q, want %q", got, want)
@@ -23,6 +30,46 @@ func TestDeployConfig_Defaults(t *testing.T) {
 	}
 	if got, want := d.ResolvedServiceManager(), "systemd"; got != want {
 		t.Errorf("ResolvedServiceManager() = %q, want %q", got, want)
+	}
+}
+
+// TestResolvedSourceDir_ManagedDefault pins down the exact managed-checkout
+// default path derived from XDG_DATA_HOME (and the HOME fallback), so a
+// regression changing the resolution shape is caught precisely, not just
+// "not dot".
+func TestResolvedSourceDir_ManagedDefault(t *testing.T) {
+	t.Run("XDG_DATA_HOME set", func(t *testing.T) {
+		t.Setenv("XDG_DATA_HOME", "/xdg/data")
+		var d DeployConfig
+		if got, want := d.ResolvedSourceDir(), "/xdg/data/clagentic-router/src"; got != want {
+			t.Errorf("ResolvedSourceDir() = %q, want %q", got, want)
+		}
+	})
+	t.Run("XDG_DATA_HOME unset, HOME fallback", func(t *testing.T) {
+		t.Setenv("XDG_DATA_HOME", "")
+		t.Setenv("HOME", "/home/op")
+		var d DeployConfig
+		if got, want := d.ResolvedSourceDir(), "/home/op/.local/share/clagentic-router/src"; got != want {
+			t.Errorf("ResolvedSourceDir() = %q, want %q", got, want)
+		}
+	})
+	t.Run("neither set", func(t *testing.T) {
+		t.Setenv("XDG_DATA_HOME", "")
+		t.Setenv("HOME", "")
+		var d DeployConfig
+		if got := d.ResolvedSourceDir(); got != "" {
+			t.Errorf("ResolvedSourceDir() = %q, want empty (unresolvable — caller must fail loudly, never fall back to cwd)", got)
+		}
+	})
+}
+
+// TestSourceDirIsManaged_ExplicitValue verifies an explicit SourceDir
+// (including explicitly ".") is reported as NOT managed — update must never
+// touch the git state of a directory the operator pointed at themselves.
+func TestSourceDirIsManaged_ExplicitValue(t *testing.T) {
+	d := DeployConfig{SourceDir: "."}
+	if d.SourceDirIsManaged() {
+		t.Error("SourceDirIsManaged() = true with explicit SourceDir \".\", want false")
 	}
 }
 
