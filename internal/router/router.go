@@ -373,6 +373,7 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 					ToolsPresent:        req.HasTools,
 				})
 			}
+			r.recordCacheUsage(ctx, bid, resp)
 
 			return resp, meta, nil
 		}
@@ -864,6 +865,37 @@ func (r *Router) recordSuccess(bid string, resp *backend.Response, latencyMS int
 			})
 		}
 	}
+}
+
+// recordCacheUsage folds one successful call's cache-token accounting into
+// the store's per-(backend,model) aggregate (lr-718af0). No-op when the
+// feature is not opted in (CacheMetrics.Enabled) or when there is no store
+// to write to — mirrors every other store write in this file: fire-and-
+// forget, never blocking or failing the request on a storage error.
+//
+// resp.CacheUsage nil vs. non-nil is translated to store.CacheUsageInput.
+// Reported, preserving the "cannot report" vs. "reported a real zero"
+// distinction all the way to the persisted aggregate — see
+// backend.CacheUsage's doc and store/cache_usage.go's schema comment for
+// why collapsing the two would make the derived hit-rate metric
+// misleading.
+func (r *Router) recordCacheUsage(ctx context.Context, bid string, resp *backend.Response) {
+	if !r.cfg.CacheMetrics.Enabled || r.store == nil {
+		return
+	}
+	bcfg := r.cfg.Backends[bid]
+	model := ""
+	if bcfg != nil {
+		model = bcfg.Model
+	}
+	in := store.CacheUsageInput{Model: model}
+	if resp.CacheUsage != nil {
+		in.Reported = true
+		in.InputTokens = resp.CacheUsage.InputTokens
+		in.CacheReadTokens = resp.CacheUsage.CacheReadTokens
+		in.CacheWriteTokens = resp.CacheUsage.CacheWriteTokens
+	}
+	r.store.RecordCacheUsage(ctx, bid, in)
 }
 
 // effectiveRateLimitEvent returns the event that should flow into
