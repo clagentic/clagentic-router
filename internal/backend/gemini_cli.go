@@ -21,6 +21,33 @@
 // Stderr noise: the gemini CLI always emits keychain / credential lines on
 // stderr regardless of success. Do NOT treat non-empty stderr as an error —
 // check exit code only.
+//
+// Proactive quota signal investigation (lr-c98c Slice E): the geminiOutput/
+// geminiOutputStats/geminiModelStats/geminiTokenCounts types below are this
+// package's only verified capture of `gemini --output-format json` shape —
+// they were derived from this repo's own prior live use of the CLI (this
+// adapter's Invoke path), not from documentation or from another CLI's
+// shape (CLAUDE.md's "verify per-provider assumptions against the live
+// source" applies here directly). That verified shape contains a
+// session_id, a response string, and a per-model token-count stats block —
+// no quota, rate_limit, or usage field of any kind, proactive or otherwise.
+//
+// This task's own instruction was to run the CLI fresh with verbose/JSON
+// output and inspect all emitted event types. That step could NOT be
+// completed for this PR: AMoS's Bash tool is allowlisted by guard-bash.py
+// and does not permit invoking the `gemini` binary at all (not even
+// `gemini --help`) — only git/lore/build-and-test tooling and a small set
+// of scoped scripts are reachable. No other tool available to this agent
+// (Read/Write/Edit/Glob/Grep/Agent) can execute a subprocess either. So this
+// is a genuine, stated gap, not a documented certainty: the finding above
+// is confirmed for the JSON output shape this adapter has already parsed in
+// production, but a fresh verbose/streaming invocation (which might emit
+// additional event types beyond the single JSON object this adapter reads)
+// was never actually run for this task. Per this task's own framing, a
+// documented negative is a first-class outcome — gemini_cli remains
+// reactive-only (quota known only from error text via ParseResetTime) until
+// someone with a permitted execution path re-verifies against a live,
+// verbose run.
 package backend
 
 import (

@@ -34,6 +34,36 @@
 //
 // The router does not parse, cache, or expand model strings. Resolution (if any)
 // is delegated to the codex CLI on each invocation.
+//
+// Proactive quota signal investigation (lr-c98c Slice E): this adapter
+// invokes `codex exec` with NO --json/--output-format flag at all (unlike
+// claude_cli's --output-format stream-json or gemini_cli's --output-format
+// json) — Invoke reads cmd.Stdout as a flat trimmed string (see Invoke
+// below), never as a line-delimited or structured stream. There is
+// currently no event stream of any kind for this adapter to inspect for a
+// proactive quota field, structured or otherwise, because there is no
+// structured output at all on this call path today.
+//
+// This task's own instruction was to run codex fresh with JSON output and
+// capture all emitted event types. That step could NOT be completed for
+// this PR: AMoS's Bash tool is allowlisted by guard-bash.py and does not
+// permit invoking the `codex` binary at all (not even `codex --help`) —
+// only git/lore/build-and-test tooling and a small set of scoped scripts
+// are reachable, and no other tool available to this agent (Read/Write/
+// Edit/Glob/Grep/Agent) can execute a subprocess either. codex_discovery.go
+// and codex_model_discovery.go both invoke `codex debug models`/config
+// reads as SEPARATE, narrower subprocess calls outside this adapter — this
+// file's own Invoke path was never run live for this investigation, and
+// whether `codex exec` has an undocumented --json/--experimental-json mode
+// that emits a proactive quota event could not be verified against a live
+// run, only against ParseResetTime's existing reactive error-text parsing
+// (errparse.go), which this adapter already uses on failure paths.
+//
+// Per this task's own framing, a documented negative is a first-class
+// outcome — codex_cli remains reactive-only (quota known only from error
+// text via ParseResetTime) until someone with a permitted execution path
+// re-verifies against a live run of `codex exec` with whatever
+// machine-readable output flag it may support.
 package backend
 
 import (
