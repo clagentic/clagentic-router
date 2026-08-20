@@ -20,7 +20,7 @@ A self-hosted LLM routing daemon with fallback chains, live quota intelligence, 
 - Walks a fallback chain when backends are unavailable or rate-limited
 - Scores backends by health, quota pressure, latency EMA, and cost weight; near-ties broken by jitter
 - Tracks quota/rate-limit state persistently in SQLite; auto-recovers when windows reset
-- Parses `rate_limit_event` from the Claude CLI stream — captures live utilization, reset time, and bucket type on every response; persists to `quota_snapshots` table for historical analysis
+- Parses `rate_limit_event` from the Claude CLI stream — captures live utilization, reset time, and bucket type on every response; persists to `quota_snapshots` table for historical analysis. `openai_api`/`anthropic_api` feed the same table via a synthetic utilization computed from their rate-limit headers; `gemini_cli`/`codex_cli` have no proactive quota signal today (documented, reactive-only — see their adapter files) and are not represented in `quota_snapshots`
 - Exposes an OpenAI-compatible `/v1/chat/completions` endpoint — any OpenAI SDK works without changes; also exposes Anthropic Messages (`/v1/messages`) and Bedrock InvokeModel-shaped endpoints
 - Delivers webhook alerts (HMAC-signed, exponential retry) on backend state changes
 - Runs as a daemon on any Linux host; CLI adapters (`claude_cli`, `codex_cli`, `codex_subagent`, `gemini_cli`) require OAuth sessions on that host; API adapters (`anthropic_api`, `openai_api`, `bedrock_api`) work anywhere, including containers

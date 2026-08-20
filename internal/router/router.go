@@ -248,7 +248,11 @@ func (r *Router) startQuotaProbers(ctx context.Context) {
 		probeBid := bid
 		prober := p
 		prober.Start(ctx, func(resp *backend.Response) {
-			r.applyRateLimitEvent(ctx, probeBid, resp)
+			// Probers only ever wrap ClaudeCLIAdapter (see New's construction
+			// guard above), so effectiveRateLimitEvent's header-synthesis
+			// fallback is always a no-op here (claude_cli never populates
+			// RateLimitInfo) — used anyway for a single call path, not two.
+			r.applyRateLimitEvent(ctx, probeBid, effectiveRateLimitEvent(resp))
 		})
 		slog.Info("quota_probe: started probe loop", "backend", probeBid)
 	}
@@ -336,7 +340,7 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 		if err == nil {
 			// Success
 			r.recordSuccess(bid, resp, latencyMS)
-			r.applyRateLimitEvent(ctx, bid, resp)
+			r.applyRateLimitEvent(ctx, bid, effectiveRateLimitEvent(resp))
 
 			meta := &RouteMeta{
 				BackendID:     bid,
@@ -862,11 +866,87 @@ func (r *Router) recordSuccess(bid string, resp *backend.Response, latencyMS int
 	}
 }
 
-// applyRateLimitEvent processes a rate_limit_event embedded in a successful response.
-// It persists a quota snapshot to the store, updates BackendState quota fields,
-// and logs the event. Called after every successful invoke that returns a Response.
-func (r *Router) applyRateLimitEvent(ctx context.Context, bid string, resp *backend.Response) {
-	e := resp.RateLimitEvent
+// effectiveRateLimitEvent returns the event that should flow into
+// applyRateLimitEvent for one successful invoke.
+//
+// claude_cli's real rate_limit_event (resp.RateLimitEvent) always wins when
+// present — it carries provider-computed utilization, threshold-crossing
+// status, and overage fields no header can express, and it is verified
+// present on every claude_cli response regardless of quota level (lr-fe3b).
+// Only when that is nil do we fall back to synthesizing an event from
+// resp.RateLimitInfo (openai_api/anthropic_api header harvest, lr-1f7e/
+// lr-c98c) — this keeps the two backend families sharing one quota_snapshots
+// table (this task's stated goal) without ever preferring a synthetic,
+// lower-fidelity signal over a real one.
+func effectiveRateLimitEvent(resp *backend.Response) *backend.RateLimitEvent {
+	if resp.RateLimitEvent != nil {
+		return resp.RateLimitEvent
+	}
+	return synthesizeRateLimitEventFromHeaders(resp.RateLimitInfo)
+}
+
+// synthesizeRateLimitEventFromHeaders builds a backend.RateLimitEvent from
+// provider rate-limit headers (openai_api/anthropic_api), so header-only
+// backends can feed the same quota_snapshots table claude_cli's in-band
+// rate_limit_event populates (lr-c98c Slice E goal: "single quota_snapshots
+// table as the source of truth for all backends").
+//
+// Utilization is computed as 1.0 - (remaining/limit) ONLY when both the
+// remaining and limit fields are non-zero (i.e. the provider actually sent
+// both headers this response) — per this task's own goal statement, an
+// absent signal must be storable as NULL utilization, never a fabricated
+// 0.0, which would be indistinguishable from "quota fully available" and is
+// strictly worse than recording nothing. Tokens window is preferred over
+// requests window when both are present, matching this repo's existing
+// token-oriented scoring model (Score/EMA operate on token estimates, not
+// request counts).
+//
+// Returns nil when neither window has both remaining and limit populated —
+// the common case for any adapter that does not set RateLimitInfo at all
+// (CLI adapters, ollama_http, bedrock_api — see this function's callers'
+// doc for the full per-adapter breadth statement).
+func synthesizeRateLimitEventFromHeaders(rl backend.RateLimitInfo) *backend.RateLimitEvent {
+	var (
+		remaining, limit int64
+		resetAt          time.Time
+		rateLimitType    string
+	)
+	switch {
+	case rl.TokensRemaining > 0 && rl.TokensLimit > 0:
+		remaining, limit, resetAt, rateLimitType = rl.TokensRemaining, rl.TokensLimit, rl.TokensResetAt, "tokens"
+	case rl.RequestsRemaining > 0 && rl.RequestsLimit > 0:
+		remaining, limit, resetAt, rateLimitType = rl.RequestsRemaining, rl.RequestsLimit, rl.RequestsResetAt, "requests"
+	default:
+		return nil
+	}
+
+	u := 1.0 - (float64(remaining) / float64(limit))
+	if u < 0 {
+		u = 0
+	}
+
+	return &backend.RateLimitEvent{
+		Status:        "allowed", // headers carry no threshold-crossing/rejection signal of their own
+		RateLimitType: rateLimitType,
+		ResetsAt:      resetAt,
+		Utilization:   &u,
+		RawJSON: fmt.Sprintf(
+			`{"source":"header_harvest","remaining":%d,"limit":%d,"rate_limit_type":%q}`,
+			remaining, limit, rateLimitType,
+		),
+	}
+}
+
+// applyRateLimitEvent persists a quota snapshot to the store, updates
+// BackendState quota fields, and logs the event. e is either a real
+// claude_cli rate_limit_event or a synthetic event built by
+// effectiveRateLimitEvent from openai_api/anthropic_api rate-limit headers
+// (lr-c98c Slice E) — both flow through this single path so quota_snapshots
+// is one shared history table regardless of which backend family produced
+// the data (this task's stated goal). nil (no event, no usable headers) is
+// the common case for gemini_cli, codex_cli, and any adapter whose response
+// carries neither — a no-op, not an error.
+func (r *Router) applyRateLimitEvent(ctx context.Context, bid string, e *backend.RateLimitEvent) {
 	if e == nil {
 		return
 	}
