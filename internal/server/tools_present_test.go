@@ -53,7 +53,7 @@ func newStoreBackedTestServer(t *testing.T, supportsTools bool) (*httptest.Serve
 		"test-backend": &stubAdapter{id: "test-backend", supportsTools: supportsTools},
 	}
 	r := router.New(cfg, adapters, st, nil)
-	srv := New(":0", "secret", "secret", false, r, st, "https://api.anthropic.com", "", "", "")
+	srv := New(":0", "secret", "secret", false, r, st, "https://api.anthropic.com", "", "", "", false, "")
 	ts := httptest.NewServer(srv.httpServer.Handler)
 	return ts, st, func() { ts.Close(); st.Close() }
 }
@@ -239,7 +239,7 @@ func TestMessagesRouted_ToolsRefusal_WritesCallLogRow(t *testing.T) {
 		"test-backend": &stubAdapter{id: "test-backend", supportsTools: false},
 	}
 	r := router.New(cfg, adapters, st, nil)
-	srv := New(":0", "secret", "secret", false, r, st, "https://api.anthropic.com", "", "", "")
+	srv := New(":0", "secret", "secret", false, r, st, "https://api.anthropic.com", "", "", "", false, "")
 	ts := httptest.NewServer(srv.httpServer.Handler)
 	defer ts.Close()
 
@@ -311,7 +311,7 @@ func TestBedrockRouted_ToolsRefusal_WritesCallLogRow(t *testing.T) {
 		"test-backend": &stubAdapter{id: "test-backend", supportsTools: false},
 	}
 	r := router.New(cfg, adapters, st, nil)
-	srv := New(":0", "secret", "secret", false, r, st, "https://api.anthropic.com", "", "", "")
+	srv := New(":0", "secret", "secret", false, r, st, "https://api.anthropic.com", "", "", "", false, "")
 	ts := httptest.NewServer(srv.httpServer.Handler)
 	defer ts.Close()
 

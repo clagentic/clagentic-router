@@ -38,7 +38,7 @@ func newEmptyTokenServer(t *testing.T, allowNoAuth bool) (*httptest.Server, func
 	}
 	r := router.New(cfg, adapters, nil, nil)
 
-	srv := New(":0", "", "", allowNoAuth, r, nil, "https://api.anthropic.com", "", "", "")
+	srv := New(":0", "", "", allowNoAuth, r, nil, "https://api.anthropic.com", "", "", "", false, "")
 	ts := httptest.NewServer(srv.httpServer.Handler)
 	return ts, func() { ts.Close() }
 }

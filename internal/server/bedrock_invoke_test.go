@@ -48,7 +48,7 @@ func newBedrockTestServer(t *testing.T) (*httptest.Server, func()) {
 	}
 	r := router.New(cfg, adapters, nil, nil)
 
-	srv := New(":0", "secret", "secret", false, r, nil, "https://api.anthropic.com", "", "", "")
+	srv := New(":0", "secret", "secret", false, r, nil, "https://api.anthropic.com", "", "", "", false, "")
 	ts := httptest.NewServer(srv.httpServer.Handler)
 	return ts, func() { ts.Close() }
 }
@@ -266,7 +266,7 @@ func TestBedrockInvoke_ToolsWithCapableBackend_Succeeds(t *testing.T) {
 		"tool-backend": &stubAdapter{id: "tool-backend", supportsTools: true},
 	}
 	r := router.New(cfg, adapters, nil, nil)
-	srv := New(":0", "secret", "secret", false, r, nil, "https://api.anthropic.com", "", "", "")
+	srv := New(":0", "secret", "secret", false, r, nil, "https://api.anthropic.com", "", "", "", false, "")
 	ts := httptest.NewServer(srv.httpServer.Handler)
 	defer ts.Close()
 
