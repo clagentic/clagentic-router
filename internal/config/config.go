@@ -583,8 +583,15 @@ type DeployConfig struct {
 	ServiceName string `yaml:"service_name"`
 
 	// ServiceManager selects how the running daemon is restarted after
-	// install: "systemd" (default) or "none" (install only, no restart —
-	// for setups where an external supervisor handles restarts).
+	// install: "systemd" (default, system-scope `systemctl restart`),
+	// "systemd-user" (user-scope `systemctl --user restart` — for a
+	// single-operator workstation running the router as a `systemd --user`
+	// unit; see deploy/clagentic-router.user.service), or "none" (install
+	// only, no restart — for setups where an external supervisor handles
+	// restarts). "systemd" and "none" are unchanged by the addition of
+	// "systemd-user" — no auto-detection is performed; an operator on a
+	// user-scope host must set this explicitly (CLAUDE.md "Explicit config
+	// always wins" — see lr-574334).
 	ServiceManager string `yaml:"service_manager"`
 }
 
@@ -646,7 +653,8 @@ func (d *DeployConfig) ResolvedServiceName() string {
 	return d.ServiceName
 }
 
-// ResolvedServiceManager returns ServiceManager, defaulting to "systemd".
+// ResolvedServiceManager returns ServiceManager, defaulting to "systemd"
+// (unchanged by the addition of "systemd-user" — see the field doc).
 func (d *DeployConfig) ResolvedServiceManager() string {
 	if d.ServiceManager == "" {
 		return "systemd"
