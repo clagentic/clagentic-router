@@ -50,9 +50,15 @@ Type=oneshot
 #     started, independent of what is now on disk at install_path.
 #   - Restart failure (systemctl/readback failure, AFTER a successful
 #     install+verify): install_path holds the NEW binary — verification
-#     already passed — but the running process has not necessarily picked
-#     it up; the service continues running whatever it was running before
-#     the failed restart attempt until a later successful restart.
+#     already passed — but `systemctl restart` is stop-then-start, not an
+#     atomic swap (MILLER, lr-c69197 seventh fold-in, confirmed on-host via
+#     a failed unit's journal: Starting -> Main process exited -> Failed
+#     with result 'exit-code' -> terminal state Active: failed, no process
+#     running). If the stop half succeeds and the start half fails, the
+#     PREVIOUSLY-RUNNING PROCESS IS ALREADY DEAD, not "left alone" — the
+#     unit ends in `failed` with nothing running until a later successful
+#     restart, which with no Restart= set here (see below) means the next
+#     timer activation, up to OnUnitActiveSec + RandomizedDelaySec later.
 #
 # This unit adds no additional retry logic on top of `update`'s own
 # rollback; Restart= is deliberately NOT set below (see the timer's own doc

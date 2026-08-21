@@ -496,12 +496,20 @@ journalctl --user -u clagentic-router-update    # after it has fired at least on
   never touches it at all; a post-install verification failure rolls the
   previous binary back onto it (a real restore — see "Redeploying" above's
   "Post-install verification failure rolls back the binary" paragraph, not
-  merely "was never touched"); a restart failure leaves the newly-installed,
-  already-verified binary in place but the running process may not yet be
-  executing it. In every case the **running process itself** is left alone
-  by a failed run — `update` never kills or restarts the service except in
-  its own final, only-reached-after-verification restart step — so a failed
-  update never hands control to a half-built or unverified binary. Check
+  merely "was never touched"). **A restart failure is different and is NOT
+  safe** (MILLER, lr-c69197 seventh fold-in): `systemctl restart` is
+  stop-then-start, not an atomic swap — if the stop half succeeds and the
+  start half fails, the unit ends in `failed` with **no process running at
+  all**; the previously-running process was already killed by the stop half
+  and is not "left alone". install_path holds the newly-installed,
+  already-verified binary, but the service is down, not degraded, until the
+  next timer activation — up to `OnUnitActiveSec` + `RandomizedDelaySec`
+  later (see "Interval and jitter" below), since `Restart=` is deliberately
+  unset. For the build-failure and post-install-verification-failure cases
+  above, the **running process itself** genuinely is left alone — `update`
+  never kills or restarts the service before verification passes — so those
+  two failure modes never hand control to a half-built or unverified binary.
+  Only the restart-failure case ends with the service down. Check
   `journalctl --user -u clagentic-router-update` after a failure.
 - **Interval and jitter:** `OnUnitActiveSec=1h` with `RandomizedDelaySec=10m`
   — frequent enough that a merged fix does not sit unpropagated for an
