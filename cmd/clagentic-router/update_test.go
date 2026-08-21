@@ -575,6 +575,153 @@ func TestBackupInstalledBinary_StaleBakAlreadyExists_RefusesWithoutClobbering(t 
 	}
 }
 
+// TestBackupInstalledBinary_ThreeStates_CrashWindow is the regression test
+// for the lr-c69197 fourth fold-in defect (PEACHES comment 5373781420):
+// backupInstalledBinary used to check installPath existence FIRST and
+// return ("", nil) — "nothing to back up" — whenever installPath was
+// missing, even when a restorable .bak sat right there. This covers all
+// three states backupInstalledBinary must disambiguate, named explicitly in
+// backupInstalledBinary's own doc:
+//
+//  1. neither installPath nor .bak present -> genuine first-ever install,
+//     ("", nil), nothing to roll back to.
+//  2. installPath present, .bak present -> stale-backup refusal (already
+//     covered by TestBackupInstalledBinary_StaleBakAlreadyExists_
+//     RefusesWithoutClobbering above; re-asserted here for the side-by-side
+//     three-state comparison).
+//  3. installPath ABSENT, .bak present (the crash window OPERATOR-GUIDE.md
+//     documents as reachable) -> must return the existing .bak path so a
+//     caller's rollback-on-failure has something real to restore, NOT
+//     ("", nil) as if this were state 1.
+func TestBackupInstalledBinary_ThreeStates_CrashWindow(t *testing.T) {
+	t.Run("neither installPath nor .bak present: first-ever install", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "clagentic-router")
+
+		backupPath, err := backupInstalledBinary(target)
+		if err != nil {
+			t.Fatalf("backupInstalledBinary: unexpected error: %v", err)
+		}
+		if backupPath != "" {
+			t.Errorf("backupPath = %q, want empty string (nothing to back up, nothing to roll back to)", backupPath)
+		}
+	})
+
+	t.Run("installPath present, .bak present: stale-backup refusal", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "clagentic-router")
+		backupPath := target + ".bak"
+		if err := os.WriteFile(target, []byte("current"), 0o755); err != nil {
+			t.Fatalf("write target: %v", err)
+		}
+		if err := os.WriteFile(backupPath, []byte("stale"), 0o755); err != nil {
+			t.Fatalf("write stale backup: %v", err)
+		}
+
+		gotBackupPath, err := backupInstalledBinary(target)
+		if err == nil {
+			t.Fatal("expected error for installPath present + stale .bak present, got nil")
+		}
+		if gotBackupPath != "" {
+			t.Errorf("backupPath = %q on error, want empty string", gotBackupPath)
+		}
+		// Neither file touched.
+		if content, readErr := os.ReadFile(target); readErr != nil || string(content) != "current" {
+			t.Errorf("target contents changed or unreadable: content=%q err=%v", content, readErr)
+		}
+		if content, readErr := os.ReadFile(backupPath); readErr != nil || string(content) != "stale" {
+			t.Errorf("backup contents changed or unreadable: content=%q err=%v", content, readErr)
+		}
+	})
+
+	t.Run("installPath ABSENT, .bak present: crash-window state must return the existing backup", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "clagentic-router")
+		backupPath := target + ".bak"
+		goodBinaryContents := []byte("the only good binary left on the box")
+		if err := os.WriteFile(backupPath, goodBinaryContents, 0o755); err != nil {
+			t.Fatalf("write .bak: %v", err)
+		}
+		// installPath deliberately never created — this is the crash window:
+		// the backup rename completed, the replacing rename never landed.
+
+		gotBackupPath, err := backupInstalledBinary(target)
+		if err != nil {
+			t.Fatalf("backupInstalledBinary: unexpected error for the crash-window state: %v "+
+				"(a restorable .bak must not be reported as a first-ever install)", err)
+		}
+		if gotBackupPath != backupPath {
+			t.Errorf("backupPath = %q, want %q (the existing, restorable backup — not empty, "+
+				"which would falsely claim there is nothing to roll back to)", gotBackupPath, backupPath)
+		}
+		// The .bak file itself must be left in place and untouched — the
+		// caller (installAndVerifyWithRollback) is responsible for consuming
+		// it, not this function.
+		content, readErr := os.ReadFile(backupPath)
+		if readErr != nil {
+			t.Fatalf("read .bak after backupInstalledBinary: %v", readErr)
+		}
+		if string(content) != string(goodBinaryContents) {
+			t.Errorf(".bak contents = %q, want unchanged %q", string(content), string(goodBinaryContents))
+		}
+	})
+}
+
+// TestInstallAndVerifyWithRollback_CrashWindowState_RecoversOnInstallFailure
+// is the end-to-end regression test for the crash-window state through the
+// full rollback caller, not just backupInstalledBinary in isolation: when
+// installPath is absent and .bak is the only good binary on the box, and
+// the subsequent install itself fails, the operator must get "previous
+// binary restored" (using the pre-existing .bak), NOT "no previous binary
+// existed to roll back to" — the exact false claim PEACHES traced as a
+// consequence of the defect.
+func TestInstallAndVerifyWithRollback_CrashWindowState_RecoversOnInstallFailure(t *testing.T) {
+	dir := t.TempDir()
+	installPath := filepath.Join(dir, "clagentic-router")
+	backupPath := installPath + ".bak"
+	stagedPath := installPath + ".new" // deliberately never created, forces installBinary to fail
+
+	goodBinaryContents := []byte("the only good binary left on the box, from before the crash")
+	if err := os.WriteFile(backupPath, goodBinaryContents, 0o755); err != nil {
+		t.Fatalf("write pre-existing .bak: %v", err)
+	}
+	// installPath deliberately absent — the crash window.
+
+	stagedInfo, err := os.Stat(backupPath) // any valid FileInfo; install fails before this is consulted
+	if err != nil {
+		t.Fatalf("stat backupPath for stagedInfo: %v", err)
+	}
+
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open devnull: %v", err)
+	}
+	defer devNull.Close()
+
+	err = installAndVerifyWithRollback(stagedPath, installPath, stagedInfo, "test-host", devNull)
+	if err == nil {
+		t.Fatal("expected an error for the forced installBinary failure, got nil")
+	}
+	if strings.Contains(err.Error(), "no previous binary existed to roll back to") {
+		t.Errorf("error = %q — falsely claims no previous binary existed, despite a restorable "+
+			".bak being present at %s (the exact regression this test guards)", err.Error(), backupPath)
+	}
+	if !strings.Contains(err.Error(), "previous binary restored") {
+		t.Errorf("error = %q, want it to confirm the previous binary was restored from the "+
+			"crash-window .bak", err.Error())
+	}
+
+	restored, err := os.ReadFile(installPath)
+	if err != nil {
+		t.Fatalf("read installPath after crash-window recovery: %v (installPath must hold the "+
+			"restored binary, not be left absent)", err)
+	}
+	if string(restored) != string(goodBinaryContents) {
+		t.Errorf("installPath contents after recovery = %q, want the restored .bak contents %q",
+			string(restored), string(goodBinaryContents))
+	}
+}
+
 // TestInstallAndVerifyWithRollback_Success_RemovesBackup verifies the
 // non-failure path: a successful install+verify removes the backup file
 // rather than leaving a stale ".bak" artifact behind permanently.
@@ -613,6 +760,55 @@ func TestInstallAndVerifyWithRollback_Success_RemovesBackup(t *testing.T) {
 	}
 	if _, err := os.Stat(installPath + ".bak"); !os.IsNotExist(err) {
 		t.Errorf("backup path %s.bak should have been removed after a successful verify, stat err = %v", installPath, err)
+	}
+}
+
+// TestInstallAndVerifyWithRollback_CrashWindowState_SuccessConsumesStaleBak
+// covers the crash-window state's other outcome: a SUCCESSFUL install/verify
+// following recovery from state (iii) must consume (remove) the pre-existing
+// .bak exactly like any other successful run, so the crash does not leave a
+// stale .bak behind to wedge the NEXT update against the case-2 stale-backup
+// refusal — the second half of the consequence PEACHES traced ("on success
+// the stale .bak survives, so the next update hits your new refusal").
+func TestInstallAndVerifyWithRollback_CrashWindowState_SuccessConsumesStaleBak(t *testing.T) {
+	dir := t.TempDir()
+	installPath := filepath.Join(dir, "clagentic-router")
+	backupPath := installPath + ".bak"
+	stagedPath := installPath + ".new"
+
+	if err := os.WriteFile(backupPath, []byte("pre-crash good binary"), 0o755); err != nil {
+		t.Fatalf("write pre-existing .bak: %v", err)
+	}
+	// installPath deliberately absent — the crash window.
+	if err := os.WriteFile(stagedPath, []byte("freshly built, post-recovery"), 0o644); err != nil {
+		t.Fatalf("write staged file: %v", err)
+	}
+	stagedInfo, err := os.Stat(stagedPath)
+	if err != nil {
+		t.Fatalf("stat staged file: %v", err)
+	}
+
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open devnull: %v", err)
+	}
+	defer devNull.Close()
+
+	if err := installAndVerifyWithRollback(stagedPath, installPath, stagedInfo, "test-host", devNull); err != nil {
+		t.Fatalf("installAndVerifyWithRollback: unexpected error recovering from the crash window: %v", err)
+	}
+
+	content, err := os.ReadFile(installPath)
+	if err != nil {
+		t.Fatalf("read installPath: %v", err)
+	}
+	if string(content) != "freshly built, post-recovery" {
+		t.Errorf("installPath contents = %q, want the freshly staged contents", string(content))
+	}
+	if _, err := os.Stat(backupPath); !os.IsNotExist(err) {
+		t.Errorf("crash-window .bak at %s should have been consumed/removed after a successful "+
+			"recovery, stat err = %v (a surviving stale .bak here would wedge the NEXT update against "+
+			"the stale-backup refusal)", backupPath, err)
 	}
 }
 

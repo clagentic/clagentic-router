@@ -481,47 +481,84 @@ func installBinary(stagedPath, installPath string) error {
 // runs AFTER installBinary's os.Rename has already replaced installPath.
 // This closes that gap for real rather than only correcting the claim.
 //
-// Returns ("", nil) when installPath does not exist yet (first-ever
-// install) — there is nothing to back up, and that is not an error; a
-// caller checks for the empty return to know rollback-on-failure has
-// nothing to restore.
+// Returns ("", nil) ONLY for genuine first-ever install: neither
+// installPath nor installPath+".bak" exists — there is nothing to back up
+// and nothing to roll back to, and that is not an error; a caller checks
+// for the empty return to know rollback-on-failure has nothing to restore.
 //
-// STALE .bak HANDLING (lr-c69197 second fold-in, PEACHES nit 1 / BOBBIE):
+// STALE .bak HANDLING (lr-c69197 second fold-in, PEACHES nit 1 / BOBBIE;
+// crash-window fix, lr-c69197 fourth fold-in, PEACHES comment 5373781420):
 // installPath+".bak" can already exist on entry — a prior update run was
 // interrupted (killed, host rebooted, OOM) between this rename and the
-// later cleanup/restore rename that would have consumed it. Two wrong
-// answers were considered and rejected:
-//   - Silently overwrite it: the stale .bak may be the ONLY good binary on
-//     the box (the interrupted run may have failed AFTER this backup but
-//     BEFORE a working install ever completed) — clobbering it destroys the
-//     one known-good artifact left to roll back to.
-//   - Fail forever until an operator intervenes: a single interrupted run
-//     would then permanently wedge every future update, which is worse than
-//     the problem this rollback mechanism exists to solve.
-// The chosen behavior: refuse to proceed with THIS backup, but do not
-// destroy either file — hard error naming both installPath and the stale
-// backupPath, so the update fails loudly (same as any other pre-install
-// error: install_path itself is untouched) and an operator resolves the
-// ambiguity by hand (inspect .bak, then either remove it if it is known-bad
-// or restore it manually if it is the good one). This is a pre-existing
-// stale artifact, not a new failure this run caused, so leaving both files
-// exactly as found is the safe default.
+// later cleanup/restore rename that would have consumed it. There are three
+// distinct states to disambiguate, not two, and each wants different
+// behavior:
+//
+//  1. Neither installPath nor .bak present: genuine first-ever install.
+//     Nothing to back up, nothing to roll back to. Returns ("", nil).
+//  2. installPath present, .bak present: a stale backup from an interrupted
+//     run that crashed AFTER a working install had already completed and
+//     been backed up again (or, more commonly, an operator/process placed a
+//     .bak there by hand). Two wrong answers were considered and rejected:
+//       - Silently overwrite it: the stale .bak may be the ONLY good binary
+//         on the box (the interrupted run may have failed AFTER this backup
+//         but BEFORE a working install ever completed) — clobbering it
+//         destroys the one known-good artifact left to roll back to.
+//       - Fail forever until an operator intervenes: a single interrupted
+//         run would then permanently wedge every future update, which is
+//         worse than the problem this rollback mechanism exists to solve.
+//     The chosen behavior: refuse to proceed with THIS backup, but do not
+//     destroy either file — hard error naming both installPath and the
+//     stale backupPath, so the update fails loudly (same as any other
+//     pre-install error: install_path itself is untouched) and an operator
+//     resolves the ambiguity by hand.
+//  3. installPath ABSENT, .bak present: the narrow crash window documented
+//     in OPERATOR-GUIDE.md — a prior run's backup rename (installPath ->
+//     .bak) completed but the crash landed before the replacing rename
+//     (staged -> installPath) ever put a new binary at installPath. Unlike
+//     case 2, there is no ambiguity about which file is "the current one"
+//     to protect: installPath is empty, so .bak is unambiguously the only
+//     candidate good binary on the box, and refusing here (treating this as
+//     "first-ever install", the bug this fix closes) would (a) make a
+//     SUBSEQUENT install failure claim "no previous binary existed to roll
+//     back to" despite .bak sitting right there, restorable, and (b) on
+//     install SUCCESS leave the stale .bak behind to wedge the very next
+//     update against case 2's refusal — a single crash permanently wedging
+//     every future update, exactly the outcome the case-2 guard exists to
+//     prevent. The chosen behavior: treat .bak as the existing backup
+//     in-place — return its path directly (no rename needed; installPath is
+//     already empty, there is nothing to move aside) so the caller's
+//     rollback-on-failure path can restore it, and a successful install
+//     naturally consumes/removes it via the same cleanup as any other run.
+//     This self-recovers the crash window without an operator having to
+//     intervene, while never fabricating a rollback target that isn't
+//     genuinely there.
 func backupInstalledBinary(installPath string) (string, error) {
-	if _, err := os.Stat(installPath); err != nil {
-		if os.IsNotExist(err) {
-			return "", nil
-		}
-		return "", fmt.Errorf("stat existing binary at %s: %w", installPath, err)
-	}
 	backupPath := installPath + ".bak"
-	if _, err := os.Stat(backupPath); err == nil {
+	_, backupStatErr := os.Stat(backupPath)
+	if backupStatErr != nil && !os.IsNotExist(backupStatErr) {
+		return "", fmt.Errorf("stat existing backup at %s: %w", backupPath, backupStatErr)
+	}
+	backupExists := backupStatErr == nil
+
+	if _, err := os.Stat(installPath); err != nil {
+		if !os.IsNotExist(err) {
+			return "", fmt.Errorf("stat existing binary at %s: %w", installPath, err)
+		}
+		// installPath is absent. Case 3 (backupExists) vs. case 1 (it doesn't).
+		if backupExists {
+			return backupPath, nil
+		}
+		return "", nil
+	}
+
+	// installPath exists — case 2 if .bak also exists.
+	if backupExists {
 		return "", fmt.Errorf("refusing to back up %s: a stale backup already exists at %s from a "+
 			"previous interrupted update — it may be the only known-good binary left to roll back to, "+
 			"so it is never silently overwritten. Inspect %s by hand: if it is safe to discard, remove "+
 			"it and re-run update; if it looks like the good binary and %s does not, restore it "+
 			"manually (mv %s %s)", installPath, backupPath, backupPath, installPath, backupPath, installPath)
-	} else if !os.IsNotExist(err) {
-		return "", fmt.Errorf("stat existing backup at %s: %w", backupPath, err)
 	}
 	if err := os.Rename(installPath, backupPath); err != nil {
 		return "", fmt.Errorf("rename %s -> %s: %w (backup and target must be on the same filesystem)", installPath, backupPath, err)

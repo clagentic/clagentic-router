@@ -282,28 +282,54 @@ automatically" below for why), so the already-running process is
 unaffected either way — this only concerns what is on disk at
 `install_path` for the next successful update or manual restart to pick up.
 
-**A stale `install_path.bak` from a previous interrupted run is never
-silently overwritten.** If `update` is killed, the host reboots, or the
-process is OOM-killed between the backup rename and the later
-cleanup/restore rename that would normally consume it, `install_path.bak`
-can already exist the next time `update` runs. `backupInstalledBinary`
-refuses to proceed in that case — it does not clobber the stale file (it
-may be the only known-good binary left to roll back to) and it does not
-fail every future update forever either (both files are left exactly as
-found, so removing the stale `.bak` by hand, or restoring it manually if it
-turns out to be the good binary, unblocks the very next run). See the
-troubleshooting table below for the exact error text and the by-hand
-resolution.
+**`backupInstalledBinary` disambiguates three states on entry, not two
+(lr-c69197 fourth fold-in, PEACHES comment 5373781420) — whether
+`install_path` exists and whether `install_path.bak` exists are checked
+independently, and each of the four combinations that matters gets its own
+behavior:**
 
-**Known availability gap, not closed here (BOBBIE, lr-c69197 second
-fold-in):** `backupInstalledBinary`'s rename-away and `installBinary`'s
-replacing rename are two separate syscalls, not one atomic operation. A
-crash between them leaves `install_path` absent with only `install_path.bak`
-present — a narrow but real window where nothing execs from `install_path`
-at all. BOBBIE classified this as an availability gap, not a security
-exposure, and it is deliberately not made atomic here (that would need a
-different mechanism entirely, e.g. a symlink swap). See the troubleshooting
-table below for what to do if you find a host in this state.
+1. **Neither `install_path` nor `.bak` present** — genuine first-ever
+   install. Nothing to back up, nothing to roll back to; `update` proceeds.
+2. **`install_path` present, `.bak` present** — a stale backup from a
+   previous interrupted run (killed, host rebooted, OOM-killed) between the
+   backup rename and the later cleanup/restore rename that would normally
+   have consumed it. `backupInstalledBinary` refuses to proceed with a NEW
+   backup here — it does not clobber the stale file (it may be the only
+   known-good binary left to roll back to) and it does not fail every future
+   update forever either (both files are left exactly as found, so removing
+   the stale `.bak` by hand, or restoring it manually if it turns out to be
+   the good binary, unblocks the very next run). See the troubleshooting
+   table below for the exact error text and the by-hand resolution.
+3. **`install_path` ABSENT, `.bak` present — the crash window described
+   below — now self-recovers.** `backupInstalledBinary`'s rename-away and
+   `installBinary`'s replacing rename are two separate syscalls, not one
+   atomic operation; a crash between them leaves exactly this state.
+   `install_path.bak` is unambiguously the only candidate good binary on the
+   box in this state (there is no existing `install_path` to protect from
+   being clobbered, unlike case 2), so `update` treats it as the backup for
+   this run: a subsequent `installBinary` failure restores from it (the
+   operator sees "previous binary restored", not "no previous binary existed
+   to roll back to" — the false claim a prior version of this logic made),
+   and a subsequent successful install/verify consumes it via the same
+   cleanup as any other run, so it does not survive to wedge the *next*
+   update against case 2's refusal. No operator action is required to
+   recover from this state — the next `update` run does it automatically.
+4. **A `stat` failure on either path that isn't "does not exist"**
+   (permissions, I/O error) — hard error naming which path and why, same as
+   any other pre-install error.
+
+**Known, narrower availability gap, not closed here (BOBBIE, lr-c69197
+second fold-in):** the crash window itself (case 3 above) is not made
+atomic — `backupInstalledBinary`'s rename-away and `installBinary`'s
+replacing rename remain two separate syscalls, so there is still a real
+(if narrow) window where nothing execs from `install_path` at all if the
+process dies between them. BOBBIE classified this as an availability gap,
+not a security exposure. What lr-c69197's fourth fold-in closes is only the
+*consequence* that used to follow a crash in this window (a permanently
+wedged host requiring manual intervention) — the update mechanism now
+self-recovers on its next run rather than needing an operator. Making the
+window itself atomic would need a different mechanism entirely (e.g. a
+symlink swap) and remains out of scope here.
 
 ```yaml
 deploy:
@@ -521,7 +547,7 @@ backend, before tagging a release, and after deploying a new binary.
 | `update` reports `install: post-install verification failed: ...; additionally, restoring the previous binary from ... FAILED` | Both the new build failed verification AND the rollback itself could not rename the backup back into place (e.g. `install_path.bak` was itself removed or made unwritable between backup and restore) — `install_path` is left in an unknown state, not guaranteed to hold either binary | Manually inspect `install_path` and `install_path.bak` (if it still exists) and restore by hand; this is the one failure path `update`'s rollback cannot self-heal |
 | `update` reports `restart: ... was not actually restarted` | `systemctl restart` exited 0, but the unit's `ActiveEnterTimestamp`/`MainPID` did not change — the unit did not actually cycle (e.g. `ExecStart` no-op, or the wrong unit was targeted) | Confirm `deploy.service_name`/`deploy.service_manager` name the unit that's actually running; check `systemctl [--user] status <unit>` by hand |
 | `update` reports `install: back up previous binary before replacing it: refusing to back up ... a stale backup already exists at install_path.bak` | A previous `update` run was interrupted (killed, host rebooted, OOM) between backing up the old binary and consuming that backup — `install_path.bak` from that run is still there. `update` refuses to touch either file rather than guessing which one is good | Inspect `install_path` and `install_path.bak` by hand. If `install_path.bak` is safe to discard (the current `install_path` is known good), remove it and re-run `update`. If `install_path.bak` looks like the good binary and `install_path` does not, restore it manually (`mv install_path.bak install_path`) |
-| `install_path` is missing entirely and only `install_path.bak` exists (no `update` error was necessarily reported for this run — it may show up as `binary not found` / the service failing to start) | The backup rename (`install_path` → `install_path.bak`) completed but the crash happened before the replacing rename (`install_path.new` → `install_path`) landed a new binary — these are two separate syscalls, not one atomic operation (known, accepted gap, see "Redeploying" above) | Manually restore the last-known-good binary: `mv install_path.bak install_path` (or reinstall from a known-good build), then re-run `update` |
+| `install_path` is missing entirely and only `install_path.bak` exists (no `update` error was necessarily reported for this run — it may show up as `binary not found` / the service failing to start) | The backup rename (`install_path` → `install_path.bak`) completed but a prior `update` was killed before the replacing rename (`install_path.new` → `install_path`) landed a new binary — these are two separate syscalls, not one atomic operation (known, accepted gap, see "Redeploying" above). `backupInstalledBinary` recognizes this exact state and treats the existing `.bak` as this run's backup (lr-c69197 fourth fold-in) | **No manual action needed** — just re-run `update`. It self-recovers: on success the pending `.bak` is consumed/removed automatically; on a subsequent install failure, it restores from that `.bak` and reports "previous binary restored", not "no previous binary existed to roll back to". Only intervene by hand (`mv install_path.bak install_path`) if you need the service running again *before* the next `update` run completes |
 
 ### Client token resolution (lr-92ee18 B3)
 
