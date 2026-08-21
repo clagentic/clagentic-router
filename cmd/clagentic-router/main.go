@@ -648,8 +648,21 @@ func parseClientFlags(args []string) (clientFlags, []string, error) {
 		if err != nil {
 			return f, nil, fmt.Errorf("--token-file %s: %w", tokenFilePath, err)
 		}
-		f.token = strings.TrimSpace(string(data))
-		f.tokenSource = "--token-file " + tokenFilePath
+		trimmed := strings.TrimSpace(string(data))
+		// Only record tokenSource when the trimmed content is non-empty —
+		// an empty/whitespace-only --token-file must fall through to the
+		// remaining resolution steps (env vars, deployment env file) per
+		// the "first non-empty value wins" contract documented above.
+		// Setting tokenSource unconditionally here previously made
+		// enrichAuthError report "a token was resolved from --token-file
+		// ... but the server rejected it" even though no token was ever
+		// sent (empty Authorization header), which misdirects the
+		// operator toward a stale-token diagnosis instead of the correct
+		// no-token-found one (lr-92ee18 PEACHES fold-in).
+		if trimmed != "" {
+			f.token = trimmed
+			f.tokenSource = "--token-file " + tokenFilePath
+		}
 	}
 
 	if f.token == "" {
@@ -779,25 +792,24 @@ func cmdGet(args []string, path string) error {
 	return prettyPrint(body)
 }
 
+// cmdGetText fetches path as a client subcommand and prints the raw response
+// body verbatim (unlike cmdGet, which pretty-prints JSON) — used for
+// /metrics, whose body is Prometheus text exposition format, not JSON. It
+// shares apiGet's status-code handling and enrichAuthError diagnostics: a
+// bare GET here previously ignored resp.StatusCode entirely, so a 401 (or
+// any other error) printed the response body to stdout and exited 0 instead
+// of surfacing the same "checked --token, --token-file, ..." diagnostic
+// every other client subcommand gives (lr-92ee18 PEACHES fold-in).
 func cmdGetText(args []string, path string) error {
 	f, _, err := parseClientFlags(args)
 	if err != nil {
 		return err
 	}
-	url := f.server + path
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+	body, err := apiGet(f, path)
 	if err != nil {
 		return err
 	}
-	if f.token != "" {
-		req.Header.Set("Authorization", "Bearer "+f.token)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("GET %s: %w", url, err)
-	}
-	defer resp.Body.Close()
-	_, err = io.Copy(os.Stdout, resp.Body)
+	_, err = os.Stdout.Write(body)
 	return err
 }
 
