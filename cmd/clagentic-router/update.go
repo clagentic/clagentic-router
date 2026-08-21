@@ -20,6 +20,19 @@
 // `git pull --ff-only` it before building. Non-fast-forwardable state and a
 // missing Go toolchain both fail loudly with an actionable message instead
 // of a raw `go build`/`git` error from an unexpected directory.
+//
+// READBACK (lr-c69197): a PASS from this command used to mean only "every
+// exec.Command exited 0" — installBinary's os.Rename and
+// restartSystemdService's `systemctl restart` were both taken at their exit
+// code alone, with nothing re-reading the result. runUpdate now verifies
+// each mutating step after it runs: verifyInstalledBinary re-stats
+// install_path and compares it against the freshly built artifact;
+// restartAndVerifySystemdService compares the unit's ActiveEnterTimestamp
+// and MainPID before and after the restart call, so a restart that did not
+// actually restart the unit is a hard error, not a silent pass. The final
+// report line names the hostname, the resolved install_path, and the
+// resolved unit+scope actually acted on — see runUpdate's own doc for why
+// this makes a PASS falsifiable rather than a pre-action echo of intent.
 package main
 
 import (
@@ -97,6 +110,19 @@ func runUpdate(deploy config.DeployConfig, out *os.File) error {
 	installPath := deploy.ResolvedInstallPath()
 	serviceManager := deploy.ResolvedServiceManager()
 
+	// hostname is resolved once, up front, purely for the report line —
+	// naming the machine an action actually landed on is the core fix this
+	// change makes (lr-c69197 MILLER item: "PASS naming neither host nor
+	// verified outcome is unfalsifiable by construction"). A resolution
+	// failure (rare — a container with no /etc/hostname) must not block the
+	// update itself; it degrades to a literal "(unknown)" in the report
+	// rather than failing an otherwise-successful deploy over a cosmetic
+	// field.
+	hostname, hostnameErr := os.Hostname()
+	if hostnameErr != nil {
+		hostname = "(unknown)"
+	}
+
 	if sourceDir == "" {
 		return fmt.Errorf("deploy.source_dir could not be resolved: neither an explicit " +
 			"deploy.source_dir/--source-dir nor $XDG_DATA_HOME nor $HOME is set, so there is no " +
@@ -127,22 +153,40 @@ func runUpdate(deploy config.DeployConfig, out *os.File) error {
 		return fmt.Errorf("build: %w", err)
 	}
 
+	stagedInfo, err := os.Stat(stagedPath)
+	if err != nil {
+		return fmt.Errorf("install: stat freshly built binary %s: %w", stagedPath, err)
+	}
+
 	fmt.Fprintf(out, "update: installing %s -> %s (atomic rename)\n", stagedPath, installPath)
 	if err := installBinary(stagedPath, installPath); err != nil {
 		return fmt.Errorf("install: %w", err)
 	}
 
+	// READBACK (lr-c69197 MILLER item 2): installBinary's os.Rename returning
+	// nil means "the syscall succeeded", not "the binary that is now running
+	// is the one just staged". verifyInstalledBinary re-stats installPath —
+	// the exact path a running service execs — and compares it against what
+	// was staged, so a PASS here is falsifiable: if installPath does not
+	// exist, or its size/mode don't match the staged artifact, this is a
+	// hard error, not a silently-swallowed mismatch.
+	if err := verifyInstalledBinary(installPath, stagedInfo); err != nil {
+		return fmt.Errorf("install: post-install verification failed: %w", err)
+	}
+	fmt.Fprintf(out, "update: verified %s on %s (size=%d bytes, mode=%s)\n",
+		installPath, hostname, stagedInfo.Size(), stagedInfo.Mode().Perm())
+
 	switch serviceManager {
 	case "systemd":
 		serviceName := deploy.ResolvedServiceName()
-		fmt.Fprintf(out, "update: restarting systemd unit %s.service (system scope)\n", serviceName)
-		if err := restartSystemdService(serviceName, systemdScopeSystem); err != nil {
+		fmt.Fprintf(out, "update: restarting systemd unit %s.service (system scope) on %s\n", serviceName, hostname)
+		if err := restartAndVerifySystemdService(serviceName, systemdScopeSystem, out); err != nil {
 			return fmt.Errorf("restart: %w", err)
 		}
 	case "systemd-user":
 		serviceName := deploy.ResolvedServiceName()
-		fmt.Fprintf(out, "update: restarting systemd unit %s.service (user scope)\n", serviceName)
-		if err := restartSystemdService(serviceName, systemdScopeUser); err != nil {
+		fmt.Fprintf(out, "update: restarting systemd unit %s.service (user scope) on %s\n", serviceName, hostname)
+		if err := restartAndVerifySystemdService(serviceName, systemdScopeUser, out); err != nil {
 			return fmt.Errorf("restart: %w", err)
 		}
 	case "none":
@@ -151,7 +195,22 @@ func runUpdate(deploy config.DeployConfig, out *os.File) error {
 		return fmt.Errorf("deploy.service_manager: unknown value %q (want \"systemd\", \"systemd-user\", or \"none\")", serviceManager)
 	}
 
-	fmt.Fprintln(out, "update: done")
+	// Falsifiable summary line (lr-c69197): names the host, the resolved
+	// install path, and the resolved unit+scope actually acted on — the
+	// three facts MILLER's diagnosis found the pre-existing "installed X,
+	// restarted Y" pre-action echo never carried. Emitted only after every
+	// readback above has already returned nil, so its mere presence in a
+	// captured log is itself evidence of a verified outcome, not a
+	// pre-action intent statement.
+	unitDesc := "none (service_manager=none)"
+	if serviceManager == "systemd" || serviceManager == "systemd-user" {
+		scopeDesc := "system"
+		if serviceManager == "systemd-user" {
+			scopeDesc = "user"
+		}
+		unitDesc = fmt.Sprintf("%s.service (%s scope)", deploy.ResolvedServiceName(), scopeDesc)
+	}
+	fmt.Fprintf(out, "update: done — host=%s install_path=%s unit=%s\n", hostname, installPath, unitDesc)
 	return nil
 }
 
@@ -426,6 +485,42 @@ func installBinary(stagedPath, installPath string) error {
 	return nil
 }
 
+// verifyInstalledBinary is the readback half of the install step (lr-c69197
+// MILLER item 2: "installBinary returns nil on exit 0 and that is the whole
+// contract — nothing re-reads the result"). It re-stats installPath — the
+// exact path a running service execs from, not the staged temp file — and
+// compares size and permission bits against stagedInfo (captured from the
+// freshly built artifact before the rename). A version-string comparison
+// (running `<installPath> version` and matching the expected revision) was
+// considered, since lr-92ee18 made the version linkable via -ldflags -X, but
+// is deliberately NOT used here: this repo's build does not thread an
+// expected revision string into runUpdate at all (the Makefile's -X flag is
+// applied by `make build`, not by the `go build -o` this file invokes
+// directly), so a version check here would either need a second,
+// out-of-band way to learn the expected revision or would silently compare
+// against the empty-string default on every unmodified build — neither is
+// reliable enough to gate a deploy on. Size+mode is real, always available,
+// and directly answers the question a PASS must be falsifiable against: did
+// the artifact that was just built actually land at the path the service
+// execs from.
+func verifyInstalledBinary(installPath string, stagedInfo os.FileInfo) error {
+	installedInfo, err := os.Stat(installPath)
+	if err != nil {
+		return fmt.Errorf("expected an installed binary at %s after install, but stat failed: %w "+
+			"(a PASS that installed nothing to a path nothing runs from is exactly the defect this "+
+			"check exists to catch)", installPath, err)
+	}
+	if installedInfo.Size() != stagedInfo.Size() {
+		return fmt.Errorf("installed binary at %s has size %d bytes, want %d (the freshly built "+
+			"artifact's size) — the file at install_path does not match what was just built",
+			installPath, installedInfo.Size(), stagedInfo.Size())
+	}
+	if installedInfo.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("installed binary at %s is not executable (mode %s)", installPath, installedInfo.Mode().Perm())
+	}
+	return nil
+}
+
 // systemdScope selects whether restartSystemdService targets the system
 // systemd manager (PID 1, root-run units under /etc/systemd/system) or the
 // per-user systemd manager (`systemctl --user`, units under
@@ -466,6 +561,123 @@ func restartSystemdService(serviceName string, scope systemdScope) error {
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("systemctl %s failed: %w\n%s", strings.Join(args, " "), err, output)
+	}
+	return nil
+}
+
+// systemctlShowArgs builds the argv for reading a unit property via
+// `systemctl show`, without the leading "systemctl" — mirrors
+// systemctlRestartArgs's split so the argument shape ("--user" ahead of
+// "show", "--property=" as one token, unit name always +".service") is
+// unit-testable without invoking systemctl.
+func systemctlShowArgs(serviceName string, scope systemdScope, property string) []string {
+	unit := serviceName + ".service"
+	args := []string{}
+	if scope == systemdScopeUser {
+		args = append(args, "--user")
+	}
+	args = append(args, "show", "--property="+property, "--value", unit)
+	return args
+}
+
+// systemdUnitSnapshot is a restart's before/after fingerprint (lr-c69197
+// MILLER item 2: "no systemctl is-active/ActiveEnterTimestamp comparison, no
+// PID delta"). Both fields are read via `systemctl show`, not `systemctl
+// status` — show's --value output is a single stable machine-readable line
+// per property, not prose meant for a human terminal.
+type systemdUnitSnapshot struct {
+	activeEnterTimestamp string
+	mainPID              string
+}
+
+// readSystemdUnitSnapshot reads ActiveEnterTimestamp and MainPID for the
+// named unit at the given scope. A unit that does not exist yet (e.g. the
+// very first restart before the unit was ever started) returns an error —
+// callers use this only around a restart that is expected to succeed, so an
+// unreadable unit here is itself informative, not a case to paper over.
+func readSystemdUnitSnapshot(serviceName string, scope systemdScope) (systemdUnitSnapshot, error) {
+	activeEnter, err := systemctlShowValue(serviceName, scope, "ActiveEnterTimestamp")
+	if err != nil {
+		return systemdUnitSnapshot{}, err
+	}
+	mainPID, err := systemctlShowValue(serviceName, scope, "MainPID")
+	if err != nil {
+		return systemdUnitSnapshot{}, err
+	}
+	return systemdUnitSnapshot{activeEnterTimestamp: activeEnter, mainPID: mainPID}, nil
+}
+
+// systemctlShowValue runs `systemctl [--user] show --property=<property>
+// --value <unit>.service` and returns its trimmed stdout.
+func systemctlShowValue(serviceName string, scope systemdScope, property string) (string, error) {
+	args := systemctlShowArgs(serviceName, scope, property)
+	cmd := exec.Command("systemctl", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("systemctl %s failed: %w\n%s", strings.Join(args, " "), err, output)
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+// restartAndVerifySystemdService is restartSystemdService plus the readback
+// half of the restart step (lr-c69197 MILLER item 2): a `systemctl restart`
+// that exits 0 only means systemd accepted the request, not that the unit
+// actually cycled — restarting an already-stopped unit, or a unit whose
+// ExecStart silently no-ops, can both exit 0 without the daemon actually
+// having restarted. This captures the unit's ActiveEnterTimestamp and
+// MainPID before and after the restart call and requires at least one of
+// them to have changed; neither changing is treated as a restart that did
+// not restart, per the task's explicit acceptance criterion ("a restart
+// that did not restart must be an error, not a silent pass").
+//
+// The before-snapshot is best-effort: a unit that has never been started
+// (first-ever deploy) has no ActiveEnterTimestamp/MainPID to read yet, and
+// failing the whole restart over that would regress the pre-existing
+// first-install case. Only the after-snapshot is required to succeed — if
+// systemctl show cannot read the unit at all after a restart that itself
+// reported success, that is a real error worth surfacing.
+func restartAndVerifySystemdService(serviceName string, scope systemdScope, out *os.File) error {
+	before, beforeErr := readSystemdUnitSnapshot(serviceName, scope)
+	if beforeErr != nil {
+		fmt.Fprintf(out, "update: could not read pre-restart unit state for %s.service (%v) — "+
+			"proceeding, this is expected on a first-ever start\n", serviceName, beforeErr)
+	}
+
+	if err := restartSystemdService(serviceName, scope); err != nil {
+		return err
+	}
+
+	after, err := readSystemdUnitSnapshot(serviceName, scope)
+	if err != nil {
+		return fmt.Errorf("restart reported success but post-restart unit state could not be read: %w "+
+			"(a PASS that cannot confirm the unit is actually running is not a PASS)", err)
+	}
+
+	if err := verifyRestartAdvanced(serviceName, before, beforeErr, after); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(out, "update: verified restart of %s.service (ActiveEnterTimestamp=%s, MainPID=%s)\n",
+		serviceName, after.activeEnterTimestamp, after.mainPID)
+	return nil
+}
+
+// verifyRestartAdvanced is the pure comparison at the heart of the restart
+// readback, split out from restartAndVerifySystemdService so it is
+// unit-testable with synthetic before/after snapshots — no systemctl or
+// systemd session required. Per the task's explicit acceptance criterion
+// ("a restart that did not restart must be an error, not a silent pass"):
+// when a pre-restart snapshot was successfully read (beforeErr == nil) and
+// the ActiveEnterTimestamp/MainPID pair is byte-identical after the restart
+// call reported success, that is treated as the unit never having actually
+// cycled, regardless of the "systemctl restart" exit code. beforeErr != nil
+// (no pre-restart snapshot available — first-ever start) always passes this
+// check; there is nothing to compare against.
+func verifyRestartAdvanced(serviceName string, before systemdUnitSnapshot, beforeErr error, after systemdUnitSnapshot) error {
+	if beforeErr == nil && before == after {
+		return fmt.Errorf("restart of %s.service reported success but the unit's ActiveEnterTimestamp (%s) "+
+			"and MainPID (%s) are unchanged from before the restart — the service was not actually restarted",
+			serviceName, after.activeEnterTimestamp, after.mainPID)
 	}
 	return nil
 }

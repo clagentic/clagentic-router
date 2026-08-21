@@ -9,6 +9,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -285,6 +286,153 @@ func TestRunUpdate_ServiceManagerSystemdUser_DispatchesUserScopeRestart(t *testi
 	}
 	if !strings.Contains(err.Error(), "--user") {
 		t.Errorf("runUpdate with service_manager=systemd-user error = %q, want it to name the --user restart invocation it attempted", err.Error())
+	}
+}
+
+// TestVerifyInstalledBinary_MatchesStagedArtifact verifies the readback half
+// of the install step (lr-c69197): a re-stat of installPath after a
+// successful installBinary must succeed when the installed file's
+// size/executability match what was staged.
+func TestVerifyInstalledBinary_MatchesStagedArtifact(t *testing.T) {
+	dir := t.TempDir()
+	staged := filepath.Join(dir, "clagentic-router.new")
+	target := filepath.Join(dir, "clagentic-router")
+
+	if err := os.WriteFile(staged, []byte("fake binary contents"), 0o644); err != nil {
+		t.Fatalf("write staged file: %v", err)
+	}
+	stagedInfo, err := os.Stat(staged)
+	if err != nil {
+		t.Fatalf("stat staged file: %v", err)
+	}
+
+	if err := installBinary(staged, target); err != nil {
+		t.Fatalf("installBinary: %v", err)
+	}
+
+	if err := verifyInstalledBinary(target, stagedInfo); err != nil {
+		t.Errorf("verifyInstalledBinary: unexpected error: %v", err)
+	}
+}
+
+// TestVerifyInstalledBinary_MissingInstallPath verifies acceptance item 2's
+// explicit requirement: "a PASS that installed nothing to a path nothing
+// runs from is the core defect" — a missing install_path after install must
+// be a hard error, not a silent pass.
+func TestVerifyInstalledBinary_MissingInstallPath(t *testing.T) {
+	dir := t.TempDir()
+	staged := filepath.Join(dir, "clagentic-router.new")
+	if err := os.WriteFile(staged, []byte("fake binary contents"), 0o644); err != nil {
+		t.Fatalf("write staged file: %v", err)
+	}
+	stagedInfo, err := os.Stat(staged)
+	if err != nil {
+		t.Fatalf("stat staged file: %v", err)
+	}
+
+	missing := filepath.Join(dir, "does-not-exist")
+	if err := verifyInstalledBinary(missing, stagedInfo); err == nil {
+		t.Fatal("expected error for missing install path, got nil")
+	}
+}
+
+// TestVerifyInstalledBinary_SizeMismatch verifies a file present at
+// installPath but NOT matching the freshly built artifact (e.g. a stale
+// leftover from an unrelated process) is rejected rather than accepted as
+// "something is there."
+func TestVerifyInstalledBinary_SizeMismatch(t *testing.T) {
+	dir := t.TempDir()
+	staged := filepath.Join(dir, "clagentic-router.new")
+	if err := os.WriteFile(staged, []byte("fake binary contents, this one is longer"), 0o644); err != nil {
+		t.Fatalf("write staged file: %v", err)
+	}
+	stagedInfo, err := os.Stat(staged)
+	if err != nil {
+		t.Fatalf("stat staged file: %v", err)
+	}
+
+	target := filepath.Join(dir, "clagentic-router")
+	if err := os.WriteFile(target, []byte("short"), 0o755); err != nil {
+		t.Fatalf("write mismatched target: %v", err)
+	}
+
+	if err := verifyInstalledBinary(target, stagedInfo); err == nil {
+		t.Fatal("expected error for size mismatch between installed and staged artifacts, got nil")
+	}
+}
+
+// TestVerifyRestartAdvanced_UnchangedSnapshot_IsError is the regression test
+// named explicitly in the lr-c69197 dispatch: "a restart that did NOT
+// restart must be an error, not a silent pass." A restart call that exits 0
+// but whose before/after ActiveEnterTimestamp+MainPID are identical (e.g.
+// systemd accepted the restart request against an already-running unit that
+// for some reason didn't actually cycle, or the unit silently no-op'd) must
+// be reported as a failed restart.
+func TestVerifyRestartAdvanced_UnchangedSnapshot_IsError(t *testing.T) {
+	snap := systemdUnitSnapshot{activeEnterTimestamp: "Thu 2026-08-20 19:15:06 EDT", mainPID: "2577441"}
+
+	err := verifyRestartAdvanced("clagentic-router", snap, nil, snap)
+	if err == nil {
+		t.Fatal("expected error for unchanged ActiveEnterTimestamp/MainPID across a restart, got nil")
+	}
+	if !strings.Contains(err.Error(), "not actually restarted") {
+		t.Errorf("error = %q, want it to name that the service was not actually restarted", err.Error())
+	}
+}
+
+// TestVerifyRestartAdvanced_TimestampAdvanced_Passes verifies the normal
+// case: ActiveEnterTimestamp changing (the unit actually cycled) is accepted
+// even if MainPID is unavailable/unchanged for some reason.
+func TestVerifyRestartAdvanced_TimestampAdvanced_Passes(t *testing.T) {
+	before := systemdUnitSnapshot{activeEnterTimestamp: "Thu 2026-08-20 09:00:00 EDT", mainPID: "111"}
+	after := systemdUnitSnapshot{activeEnterTimestamp: "Thu 2026-08-20 19:15:06 EDT", mainPID: "222"}
+
+	if err := verifyRestartAdvanced("clagentic-router", before, nil, after); err != nil {
+		t.Errorf("verifyRestartAdvanced: unexpected error for an advanced snapshot: %v", err)
+	}
+}
+
+// TestVerifyRestartAdvanced_NoBeforeSnapshot_Passes verifies the first-ever
+// start case: when a pre-restart snapshot could not be read at all
+// (beforeErr != nil — the unit has never been started before), there is
+// nothing to compare against, so this must not fail merely because the
+// after-snapshot happens to look the same as the (unset) zero value.
+func TestVerifyRestartAdvanced_NoBeforeSnapshot_Passes(t *testing.T) {
+	after := systemdUnitSnapshot{activeEnterTimestamp: "Thu 2026-08-20 19:15:06 EDT", mainPID: "2577441"}
+	beforeErr := fmt.Errorf("unit not found")
+
+	if err := verifyRestartAdvanced("clagentic-router", systemdUnitSnapshot{}, beforeErr, after); err != nil {
+		t.Errorf("verifyRestartAdvanced: unexpected error when no before-snapshot was available: %v", err)
+	}
+}
+
+// TestSystemctlShowArgs verifies the argv shape for both scopes, mirroring
+// TestSystemctlRestartArgs's coverage for the sibling restart-args builder.
+func TestSystemctlShowArgs(t *testing.T) {
+	cases := []struct {
+		name        string
+		serviceName string
+		scope       systemdScope
+		property    string
+		want        []string
+	}{
+		{"system scope", "clagentic-router", systemdScopeSystem, "ActiveEnterTimestamp",
+			[]string{"show", "--property=ActiveEnterTimestamp", "--value", "clagentic-router.service"}},
+		{"user scope", "clagentic-router", systemdScopeUser, "MainPID",
+			[]string{"--user", "show", "--property=MainPID", "--value", "clagentic-router.service"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := systemctlShowArgs(tc.serviceName, tc.scope, tc.property)
+			if len(got) != len(tc.want) {
+				t.Fatalf("systemctlShowArgs(...) = %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("systemctlShowArgs(...)[%d] = %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
 	}
 }
 
