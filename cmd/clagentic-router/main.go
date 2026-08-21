@@ -589,15 +589,50 @@ type clientFlags struct {
 }
 
 // parseClientFlags parses the shared --server/--token/--token-file flags
-// used by every client subcommand (health, doctor, quota, logs, call,
-// backend ...) and resolves the bearer token.
+// for a client subcommand that authenticates against the router's
+// inference token (currently only "call", which hits
+// /v1/chat/completions) — CLAGENTIC_ROUTER_TOKEN is checked before
+// CLAGENTIC_ROUTER_ADMIN_TOKEN. Every other client subcommand (health,
+// doctor, quota, logs, metrics, backend reset/disable/enable) talks to an
+// adminAuth-gated route instead and must use parseAdminClientFlags, whose
+// priority is reversed. See tokenEnvVarPriority for why the order matters
+// in a split-token deployment (lr-92ee18 PEACHES re-review, comment
+// 5371343493 finding 1). This wrapper exists to keep the original
+// TOKEN-first signature and behavior stable for callers/tests that predate
+// the admin/inference split.
+func parseClientFlags(args []string) (clientFlags, []string, error) {
+	return parseClientFlagsWithPriority(args, false)
+}
+
+// parseAdminClientFlags is parseClientFlags for a client subcommand that
+// authenticates against an adminAuth-gated route (health, doctor, quota,
+// logs, metrics, backend reset/disable/enable — see server.go's adminAuth
+// registrations): CLAGENTIC_ROUTER_ADMIN_TOKEN is checked before
+// CLAGENTIC_ROUTER_TOKEN, both in the caller's shell environment and in the
+// deployment EnvironmentFile. In a split-token deployment (admin_token
+// configured separately from token — see ProxyConfig.ResolvedAdminToken),
+// checking TOKEN first meant that when an operator's shell had both
+// variables set, the (inference-only) token was resolved and sent, and
+// adminAuth rejected it with a 401 despite the correct admin token being
+// present in the same environment (lr-92ee18 PEACHES re-review, comment
+// 5371343493 finding 1).
+func parseAdminClientFlags(args []string) (clientFlags, []string, error) {
+	return parseClientFlagsWithPriority(args, true)
+}
+
+// parseClientFlagsWithPriority is the shared implementation behind
+// parseClientFlags and parseAdminClientFlags. admin selects which
+// CLAGENTIC_ROUTER_*_TOKEN environment variable wins when both are set
+// (see tokenEnvVarPriority).
 //
 // Resolution order (lr-92ee18 B3):
 //  1. --token / -t flag (explicit, wins outright)
 //  2. --token-file flag (reads and trims the file's contents)
 //  3. CLAGENTIC_ROUTER_TOKEN / CLAGENTIC_ROUTER_ADMIN_TOKEN in the CALLER's
-//     own environment (pre-existing behavior)
-//  4. The deployment's EnvironmentFile (see resolveTokenFromEnvFile) —
+//     own environment, checked in the order tokenEnvVarPriority(admin)
+//     returns (pre-existing behavior; order made admin-aware lr-92ee18
+//     PEACHES re-review)
+//  4. The deployment's EnvironmentFile (see resolveTokenFromEnvFileOrdered) —
 //     the daemon's systemd unit loads CLAGENTIC_ROUTER_TOKEN from
 //     EnvironmentFile=/etc/clagentic/router/env (see
 //     deploy/clagentic-router.service), which is NOT sourced into an
@@ -607,11 +642,12 @@ type clientFlags struct {
 //     diagnostic surface for a broken deployment effectively did not exist
 //     for the default (systemd EnvironmentFile) deployment shape. This step
 //     reads the same file the daemon itself was configured to load from,
-//     so the common case resolves with zero extra operator action.
+//     so the common case resolves with zero extra operator action. Same
+//     variable-name ordering as step 3 applies here too.
 //
 // Token material itself is never logged; only the SOURCE it resolved from
 // is recorded in tokenSource, for error diagnostics.
-func parseClientFlags(args []string) (clientFlags, []string, error) {
+func parseClientFlagsWithPriority(args []string, admin bool) (clientFlags, []string, error) {
 	f := clientFlags{
 		server: defaultServerURL(),
 	}
@@ -665,20 +701,22 @@ func parseClientFlags(args []string) (clientFlags, []string, error) {
 		}
 	}
 
+	envVarOrder := tokenEnvVarPriority(admin)
+
 	if f.token == "" {
-		if v := os.Getenv("CLAGENTIC_ROUTER_TOKEN"); v != "" {
-			f.token = v
-			f.tokenSource = "env:CLAGENTIC_ROUTER_TOKEN"
-		} else if v := os.Getenv("CLAGENTIC_ROUTER_ADMIN_TOKEN"); v != "" {
-			f.token = v
-			f.tokenSource = "env:CLAGENTIC_ROUTER_ADMIN_TOKEN"
+		for _, name := range envVarOrder {
+			if v := os.Getenv(name); v != "" {
+				f.token = v
+				f.tokenSource = "env:" + name
+				break
+			}
 		}
 	}
 
 	if f.token == "" {
 		envFile := resolveDeploymentEnvFilePath()
 		f.envFileTried = envFile
-		if v, ok := resolveTokenFromEnvFile(envFile); ok {
+		if v, ok := resolveTokenFromEnvFileOrdered(envFile, envVarOrder); ok {
 			f.token = v
 			f.tokenSource = "envfile:" + envFile
 		}
@@ -702,20 +740,60 @@ func resolveDeploymentEnvFilePath() string {
 	return "/etc/clagentic/router/env"
 }
 
+// tokenEnvVarPriority returns the CLAGENTIC_ROUTER_*_TOKEN environment
+// variable names in the order they should be checked, for a client
+// subcommand that talks to an admin-only route (health, doctor, quota,
+// logs, metrics, backend reset/disable/enable) versus an inference route
+// (call, which hits /v1/chat/completions).
+//
+// Admin subcommands must prefer CLAGENTIC_ROUTER_ADMIN_TOKEN: in a
+// split-token deployment (admin_token configured separately from token —
+// see ProxyConfig.ResolvedAdminToken), the server's adminAuth middleware
+// only accepts the admin token on these routes. Checking
+// CLAGENTIC_ROUTER_TOKEN first meant that when an operator's shell had
+// both variables set, the (inference-only) token was resolved and sent,
+// and adminAuth rejected it with a 401 despite the correct admin token
+// being present in the same environment (lr-92ee18 PEACHES re-review,
+// comment 5371343493 finding 1). Inference subcommands keep the opposite
+// order: TOKEN is the credential that actually authenticates
+// /v1/chat/completions, and ADMIN_TOKEN is not accepted there at all (see
+// Handler.auth in internal/server/server.go), so preferring it first would
+// only paper over a misconfigured shell, not fix one.
+//
+// When admin_token is not separately configured, ResolvedAdminToken falls
+// back to token — the two variables are then equal in practice and the
+// order does not change behaviour, only which name gets recorded as the
+// tokenSource.
+func tokenEnvVarPriority(admin bool) []string {
+	if admin {
+		return []string{"CLAGENTIC_ROUTER_ADMIN_TOKEN", "CLAGENTIC_ROUTER_TOKEN"}
+	}
+	return []string{"CLAGENTIC_ROUTER_TOKEN", "CLAGENTIC_ROUTER_ADMIN_TOKEN"}
+}
+
 // resolveTokenFromEnvFile reads a systemd EnvironmentFile-style file
 // (KEY=VALUE per line, '#' comments, blank lines ignored) and returns the
 // first non-empty value of CLAGENTIC_ROUTER_TOKEN or
-// CLAGENTIC_ROUTER_ADMIN_TOKEN found (TOKEN checked first, matching
-// ProxyConfig.ResolvedAdminToken's "admin_token falls back to token" — the
-// same bearer value authenticates both inference and admin routes unless
-// admin_token is separately set, and this file cannot distinguish which the
-// daemon actually resolved, so the more commonly-set var is tried first).
+// CLAGENTIC_ROUTER_ADMIN_TOKEN found (TOKEN checked first — the priority
+// used by inference subcommands; admin subcommands use
+// resolveTokenFromEnvFileOrdered with tokenEnvVarPriority(true) instead,
+// see parseClientFlags).
 // ok is false when the file does not exist, cannot be read, or contains
 // neither variable — never an error: this is a best-effort fallback, not a
 // required config source, and a missing/unreadable file must never abort a
 // client subcommand that could otherwise proceed via --token/--token-file/
 // the caller's own env.
 func resolveTokenFromEnvFile(path string) (value string, ok bool) {
+	return resolveTokenFromEnvFileOrdered(path, tokenEnvVarPriority(false))
+}
+
+// resolveTokenFromEnvFileOrdered is resolveTokenFromEnvFile's implementation,
+// parameterized by which CLAGENTIC_ROUTER_*_TOKEN variable name to check
+// first — TOKEN before ADMIN_TOKEN for inference subcommands, ADMIN_TOKEN
+// before TOKEN for admin subcommands (see tokenEnvVarPriority), matching the
+// same split-token precedence used for the caller's shell environment
+// (lr-92ee18 PEACHES re-review, comment 5371343493 finding 1).
+func resolveTokenFromEnvFileOrdered(path string, envVarOrder []string) (value string, ok bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", false
@@ -738,7 +816,7 @@ func resolveTokenFromEnvFile(path string) (value string, ok bool) {
 		val = strings.Trim(val, `"'`)
 		values[key] = val
 	}
-	for _, key := range []string{"CLAGENTIC_ROUTER_TOKEN", "CLAGENTIC_ROUTER_ADMIN_TOKEN"} {
+	for _, key := range envVarOrder {
 		if v := values[key]; v != "" {
 			return v, true
 		}
@@ -780,8 +858,11 @@ func defaultServerURL() string {
 	return "http://localhost:8765"
 }
 
+// cmdGet is used only for admin-token-gated GET routes (health, doctor,
+// quota — see server.go's adminAuth registrations), so it always resolves
+// the token via parseAdminClientFlags.
 func cmdGet(args []string, path string) error {
-	f, _, err := parseClientFlags(args)
+	f, _, err := parseAdminClientFlags(args)
 	if err != nil {
 		return err
 	}
@@ -800,8 +881,11 @@ func cmdGet(args []string, path string) error {
 // any other error) printed the response body to stdout and exited 0 instead
 // of surfacing the same "checked --token, --token-file, ..." diagnostic
 // every other client subcommand gives (lr-92ee18 PEACHES fold-in).
+// cmdGetText is used only for /metrics, an admin-token-gated route (see
+// server.go's adminAuth registration), so it always resolves the token
+// via parseAdminClientFlags.
 func cmdGetText(args []string, path string) error {
-	f, _, err := parseClientFlags(args)
+	f, _, err := parseAdminClientFlags(args)
 	if err != nil {
 		return err
 	}
@@ -813,8 +897,11 @@ func cmdGetText(args []string, path string) error {
 	return err
 }
 
+// cmdLogs hits /logs, an admin-token-gated route (see server.go's
+// adminAuth registration), so it always resolves the token via
+// parseAdminClientFlags.
 func cmdLogs(args []string) error {
-	f, remaining, err := parseClientFlags(args)
+	f, remaining, err := parseAdminClientFlags(args)
 	if err != nil {
 		return err
 	}
@@ -849,6 +936,10 @@ func cmdLogs(args []string) error {
 	return prettyPrint(body)
 }
 
+// cmdCall hits /v1/chat/completions, an inference-token-gated route (see
+// server.go's Handler.auth registration, not adminAuth), so it uses
+// parseClientFlags (TOKEN-first) — the opposite priority from every other
+// client subcommand in this file.
 func cmdCall(args []string) error {
 	f, remaining, err := parseClientFlags(args)
 	if err != nil {
@@ -946,7 +1037,10 @@ func cmdBackend(args []string) error {
 		return fmt.Errorf("unknown backend action %q (reset|disable|enable)", action)
 	}
 
-	f, remaining, err := parseClientFlags(args[1:])
+	// backend reset/disable/enable hit /backends/{id}/..., admin-token-gated
+	// routes (see server.go's adminAuth registration), so resolve the token
+	// via parseAdminClientFlags.
+	f, remaining, err := parseAdminClientFlags(args[1:])
 	if err != nil {
 		return err
 	}
