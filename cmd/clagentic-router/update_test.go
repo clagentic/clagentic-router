@@ -268,7 +268,22 @@ func TestRunUpdate_ServiceManagerSystemdUser_DispatchesUserScopeRestart(t *testi
 	if _, statErr := os.Stat(installPath); statErr != nil {
 		t.Errorf("expected installed binary at %s even if restart fails, stat err: %v", installPath, statErr)
 	}
-	if err != nil && !strings.Contains(err.Error(), "--user") {
+	// This host's test environment has no reachable `systemctl --user`
+	// session (guarded by the t.Skip above only when systemctl itself is
+	// entirely absent from PATH), so the restart is expected to fail here —
+	// runUpdate must return a non-nil error, and that error must name the
+	// "--user" restart invocation it actually attempted. Asserting only
+	// "IF err != nil THEN it names --user" (the prior form of this check) is
+	// vacuously satisfied by err == nil, which would also be the observed
+	// result if the systemd-user routing regressed to a silent no-op or to
+	// dispatching a system-scope restart that happened to succeed — neither
+	// of which this test is allowed to let pass silently.
+	if err == nil {
+		t.Fatalf("runUpdate with service_manager=systemd-user: want a restart error in this sandboxed " +
+			"test environment (no systemctl --user session reachable), got nil — the user-scope restart " +
+			"dispatch may not have run at all")
+	}
+	if !strings.Contains(err.Error(), "--user") {
 		t.Errorf("runUpdate with service_manager=systemd-user error = %q, want it to name the --user restart invocation it attempted", err.Error())
 	}
 }
