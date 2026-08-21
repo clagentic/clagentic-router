@@ -258,23 +258,52 @@ The final report line names the hostname, the resolved `install_path`, and
 the resolved unit+scope actually acted on, so a PASS is falsifiable against
 those facts rather than an echo of pre-action intent.
 
-**Post-install verification failure rolls back the binary, it does not
-merely fail loudly (lr-c69197 fold-in).** `installBinary`'s atomic rename
+**Post-install verification failure, and an installBinary failure itself,
+both roll back the binary — neither merely fails loudly (lr-c69197
+fold-in, extended by a second fold-in).** `installBinary`'s atomic rename
 already replaces `install_path` with the newly built artifact BEFORE
 verification runs, so a verification failure at that point does not find
 `install_path` "untouched" — it finds the new (bad) binary sitting there.
 `update` backs up the previous binary to `install_path.bak` immediately
-before the replacing rename, and restores it from that backup if
-verification fails, so `install_path` ends up back at its pre-update
-contents rather than left holding the artifact that just failed
-verification. This is a real restore, not a no-op — see
-`cmd/clagentic-router/update.go`'s `installAndVerifyWithRollback` for the
-implementation and its failure-path error text (which also names whether
-the restore itself succeeded). The service is deliberately **not**
+before the replacing rename, and restores it from that backup if either (a)
+`installBinary` itself fails (e.g. the chmod or the rename fails partway,
+after the backup already moved the old binary aside) or (b) verification
+fails — both cases leave `install_path` in a state a rollback is needed for,
+and both are restored via the exact same code path
+(`restoreBackupOrReport` in `cmd/clagentic-router/update.go`) rather than
+two parallel restore implementations that could drift out of sync. Either
+way `install_path` ends up back at its pre-update contents rather than left
+holding a bad or half-written artifact. This is a real restore, not a
+no-op — see `cmd/clagentic-router/update.go`'s `installAndVerifyWithRollback`
+for the implementation and its failure-path error text (which also names
+whether the restore itself succeeded). The service is deliberately **not**
 restarted after a rollback (see "Keeping a user-scope host current
 automatically" below for why), so the already-running process is
 unaffected either way — this only concerns what is on disk at
 `install_path` for the next successful update or manual restart to pick up.
+
+**A stale `install_path.bak` from a previous interrupted run is never
+silently overwritten.** If `update` is killed, the host reboots, or the
+process is OOM-killed between the backup rename and the later
+cleanup/restore rename that would normally consume it, `install_path.bak`
+can already exist the next time `update` runs. `backupInstalledBinary`
+refuses to proceed in that case — it does not clobber the stale file (it
+may be the only known-good binary left to roll back to) and it does not
+fail every future update forever either (both files are left exactly as
+found, so removing the stale `.bak` by hand, or restoring it manually if it
+turns out to be the good binary, unblocks the very next run). See the
+troubleshooting table below for the exact error text and the by-hand
+resolution.
+
+**Known availability gap, not closed here (BOBBIE, lr-c69197 second
+fold-in):** `backupInstalledBinary`'s rename-away and `installBinary`'s
+replacing rename are two separate syscalls, not one atomic operation. A
+crash between them leaves `install_path` absent with only `install_path.bak`
+present — a narrow but real window where nothing execs from `install_path`
+at all. BOBBIE classified this as an availability gap, not a security
+exposure, and it is deliberately not made atomic here (that would need a
+different mechanism entirely, e.g. a symlink swap). See the troubleshooting
+table below for what to do if you find a host in this state.
 
 ```yaml
 deploy:
@@ -491,6 +520,8 @@ backend, before tagging a release, and after deploying a new binary.
 | `update` reports `install: post-install verification failed: ... size mismatch ... (previous binary restored from ...)` | Something other than the artifact `update` just built ended up at `install_path` (leftover from another process, or an unrelated file at that path). `update` rolled the previous binary back onto `install_path` before returning | Verify `deploy.install_path` points at the path your service actually execs; remove/replace the stray file |
 | `update` reports `install: post-install verification failed: ...; additionally, restoring the previous binary from ... FAILED` | Both the new build failed verification AND the rollback itself could not rename the backup back into place (e.g. `install_path.bak` was itself removed or made unwritable between backup and restore) — `install_path` is left in an unknown state, not guaranteed to hold either binary | Manually inspect `install_path` and `install_path.bak` (if it still exists) and restore by hand; this is the one failure path `update`'s rollback cannot self-heal |
 | `update` reports `restart: ... was not actually restarted` | `systemctl restart` exited 0, but the unit's `ActiveEnterTimestamp`/`MainPID` did not change — the unit did not actually cycle (e.g. `ExecStart` no-op, or the wrong unit was targeted) | Confirm `deploy.service_name`/`deploy.service_manager` name the unit that's actually running; check `systemctl [--user] status <unit>` by hand |
+| `update` reports `install: back up previous binary before replacing it: refusing to back up ... a stale backup already exists at install_path.bak` | A previous `update` run was interrupted (killed, host rebooted, OOM) between backing up the old binary and consuming that backup — `install_path.bak` from that run is still there. `update` refuses to touch either file rather than guessing which one is good | Inspect `install_path` and `install_path.bak` by hand. If `install_path.bak` is safe to discard (the current `install_path` is known good), remove it and re-run `update`. If `install_path.bak` looks like the good binary and `install_path` does not, restore it manually (`mv install_path.bak install_path`) |
+| `install_path` is missing entirely and only `install_path.bak` exists (no `update` error was necessarily reported for this run — it may show up as `binary not found` / the service failing to start) | The backup rename (`install_path` → `install_path.bak`) completed but the crash happened before the replacing rename (`install_path.new` → `install_path`) landed a new binary — these are two separate syscalls, not one atomic operation (known, accepted gap, see "Redeploying" above) | Manually restore the last-known-good binary: `mv install_path.bak install_path` (or reinstall from a known-good build), then re-run `update` |
 
 ### Client token resolution (lr-92ee18 B3)
 

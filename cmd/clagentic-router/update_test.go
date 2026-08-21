@@ -470,6 +470,111 @@ func TestInstallAndVerifyWithRollback_VerificationFailure_RestoresPreviousBinary
 	}
 }
 
+// TestInstallAndVerifyWithRollback_InstallFailure_RestoresPreviousBinary is
+// the regression test the lr-c69197 second fold-in dispatch requires: an
+// installBinary failure AFTER backupInstalledBinary has already renamed the
+// old binary away must restore from that backup exactly as a verification
+// failure does (PEACHES nit 1 — "close the remaining rollback hole"). The
+// staged path is deliberately missing so installBinary's os.Chmod fails
+// before any rename is attempted, forcing the install-failure branch
+// deterministically without depending on a corrupted `go build` output.
+func TestInstallAndVerifyWithRollback_InstallFailure_RestoresPreviousBinary(t *testing.T) {
+	dir := t.TempDir()
+	installPath := filepath.Join(dir, "clagentic-router")
+	stagedPath := installPath + ".new" // deliberately never created
+
+	previousContents := []byte("previous, working binary contents")
+	if err := os.WriteFile(installPath, previousContents, 0o755); err != nil {
+		t.Fatalf("write pre-existing installed binary: %v", err)
+	}
+
+	// stagedInfo would normally come from stat'ing the real staged file
+	// before installBinary runs; here it is irrelevant to the failure being
+	// forced (installBinary fails before verifyInstalledBinary is ever
+	// reached), so any valid os.FileInfo works — reuse installPath's own.
+	stagedInfo, err := os.Stat(installPath)
+	if err != nil {
+		t.Fatalf("stat installPath for stagedInfo: %v", err)
+	}
+
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open devnull: %v", err)
+	}
+	defer devNull.Close()
+
+	err = installAndVerifyWithRollback(stagedPath, installPath, stagedInfo, "test-host", devNull)
+	if err == nil {
+		t.Fatal("expected an error for the forced installBinary failure (missing staged file), got nil")
+	}
+	if !strings.Contains(err.Error(), "previous binary restored") {
+		t.Errorf("error = %q, want it to confirm the previous binary was restored", err.Error())
+	}
+
+	restored, err := os.ReadFile(installPath)
+	if err != nil {
+		t.Fatalf("read installPath after rollback: %v (installPath must not be left stranded/absent "+
+			"after an installBinary failure post-backup)", err)
+	}
+	if string(restored) != string(previousContents) {
+		t.Errorf("installPath contents after rollback = %q, want the previous binary's contents %q",
+			string(restored), string(previousContents))
+	}
+	if _, err := os.Stat(installPath + ".bak"); !os.IsNotExist(err) {
+		t.Errorf("backup path %s.bak should no longer exist after being renamed back, stat err = %v", installPath, err)
+	}
+}
+
+// TestBackupInstalledBinary_StaleBakAlreadyExists_RefusesWithoutClobbering
+// covers the stale-artifact case both PEACHES and BOBBIE raised: a prior
+// interrupted update left installPath.bak sitting there from before this
+// run. backupInstalledBinary must not silently overwrite it (it may be the
+// only known-good binary left) and must not fail forever either (both files
+// are left exactly as found, so removing the stale .bak by hand unblocks
+// the very next run).
+func TestBackupInstalledBinary_StaleBakAlreadyExists_RefusesWithoutClobbering(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "clagentic-router")
+	backupPath := target + ".bak"
+
+	currentContents := []byte("current binary, about to be replaced")
+	staleBackupContents := []byte("stale backup from an interrupted prior run")
+	if err := os.WriteFile(target, currentContents, 0o755); err != nil {
+		t.Fatalf("write target file: %v", err)
+	}
+	if err := os.WriteFile(backupPath, staleBackupContents, 0o755); err != nil {
+		t.Fatalf("write stale backup file: %v", err)
+	}
+
+	gotBackupPath, err := backupInstalledBinary(target)
+	if err == nil {
+		t.Fatal("expected error for a pre-existing stale .bak file, got nil")
+	}
+	if gotBackupPath != "" {
+		t.Errorf("backupInstalledBinary returned backupPath = %q on error, want empty string", gotBackupPath)
+	}
+	if !strings.Contains(err.Error(), backupPath) {
+		t.Errorf("error %q does not name the stale backup path %q", err.Error(), backupPath)
+	}
+
+	// Neither file may be clobbered — both must retain their original
+	// contents exactly as found.
+	targetContent, readErr := os.ReadFile(target)
+	if readErr != nil {
+		t.Fatalf("read target after refused backup: %v", readErr)
+	}
+	if string(targetContent) != string(currentContents) {
+		t.Errorf("target contents after refused backup = %q, want unchanged %q", string(targetContent), string(currentContents))
+	}
+	backupContent, readErr := os.ReadFile(backupPath)
+	if readErr != nil {
+		t.Fatalf("read stale backup after refused backup: %v", readErr)
+	}
+	if string(backupContent) != string(staleBackupContents) {
+		t.Errorf("stale backup contents after refused backup = %q, want unchanged %q", string(backupContent), string(staleBackupContents))
+	}
+}
+
 // TestInstallAndVerifyWithRollback_Success_RemovesBackup verifies the
 // non-failure path: a successful install+verify removes the backup file
 // rather than leaving a stale ".bak" artifact behind permanently.

@@ -485,6 +485,27 @@ func installBinary(stagedPath, installPath string) error {
 // install) — there is nothing to back up, and that is not an error; a
 // caller checks for the empty return to know rollback-on-failure has
 // nothing to restore.
+//
+// STALE .bak HANDLING (lr-c69197 second fold-in, PEACHES nit 1 / BOBBIE):
+// installPath+".bak" can already exist on entry — a prior update run was
+// interrupted (killed, host rebooted, OOM) between this rename and the
+// later cleanup/restore rename that would have consumed it. Two wrong
+// answers were considered and rejected:
+//   - Silently overwrite it: the stale .bak may be the ONLY good binary on
+//     the box (the interrupted run may have failed AFTER this backup but
+//     BEFORE a working install ever completed) — clobbering it destroys the
+//     one known-good artifact left to roll back to.
+//   - Fail forever until an operator intervenes: a single interrupted run
+//     would then permanently wedge every future update, which is worse than
+//     the problem this rollback mechanism exists to solve.
+// The chosen behavior: refuse to proceed with THIS backup, but do not
+// destroy either file — hard error naming both installPath and the stale
+// backupPath, so the update fails loudly (same as any other pre-install
+// error: install_path itself is untouched) and an operator resolves the
+// ambiguity by hand (inspect .bak, then either remove it if it is known-bad
+// or restore it manually if it is the good one). This is a pre-existing
+// stale artifact, not a new failure this run caused, so leaving both files
+// exactly as found is the safe default.
 func backupInstalledBinary(installPath string) (string, error) {
 	if _, err := os.Stat(installPath); err != nil {
 		if os.IsNotExist(err) {
@@ -493,10 +514,50 @@ func backupInstalledBinary(installPath string) (string, error) {
 		return "", fmt.Errorf("stat existing binary at %s: %w", installPath, err)
 	}
 	backupPath := installPath + ".bak"
+	if _, err := os.Stat(backupPath); err == nil {
+		return "", fmt.Errorf("refusing to back up %s: a stale backup already exists at %s from a "+
+			"previous interrupted update — it may be the only known-good binary left to roll back to, "+
+			"so it is never silently overwritten. Inspect %s by hand: if it is safe to discard, remove "+
+			"it and re-run update; if it looks like the good binary and %s does not, restore it "+
+			"manually (mv %s %s)", installPath, backupPath, backupPath, installPath, backupPath, installPath)
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("stat existing backup at %s: %w", backupPath, err)
+	}
 	if err := os.Rename(installPath, backupPath); err != nil {
 		return "", fmt.Errorf("rename %s -> %s: %w (backup and target must be on the same filesystem)", installPath, backupPath, err)
 	}
 	return backupPath, nil
+}
+
+// restoreBackupOrReport is the ONE restore path used by every post-backup
+// failure mode in installAndVerifyWithRollback (lr-c69197 second fold-in,
+// PEACHES nit 1): both an installBinary failure (the rename that would
+// replace installPath never completed, or completed only partially) and a
+// verifyInstalledBinary failure (the rename completed, but the result is
+// wrong) need the exact same recovery — rename backupPath back onto
+// installPath — and previously only the verification-failure branch did
+// this, leaving installBinary's own failure branch to return the raw error
+// with installPath potentially stranded (old binary at .bak, nothing or a
+// half-written file at installPath). Routing both callers through this one
+// function means there is a single place that can drift, not two.
+//
+// backupPath == "" (first-ever install, nothing to roll back to) always
+// returns originalErr unchanged — see backupInstalledBinary's own doc. A
+// restore failure is reported ALONGSIDE originalErr, never in place of it:
+// an operator needs to know both that the step failed AND whether the
+// restore itself worked.
+func restoreBackupOrReport(originalErr error, backupPath, installPath string) error {
+	if backupPath == "" {
+		return fmt.Errorf("%w (no previous binary existed to roll back to — this was a first-ever "+
+			"install at %s)", originalErr, installPath)
+	}
+	if restoreErr := os.Rename(backupPath, installPath); restoreErr != nil {
+		return fmt.Errorf("%w; additionally, restoring the previous binary from %s FAILED: %v — %s "+
+			"may now be missing or in an inconsistent state, check it by hand",
+			originalErr, backupPath, restoreErr, installPath)
+	}
+	return fmt.Errorf("%w (previous binary restored from %s — the running service's on-disk binary "+
+		"is back to its pre-update state)", originalErr, backupPath)
 }
 
 // verifyInstalledBinary is the readback half of the install step (lr-c69197
@@ -537,12 +598,18 @@ func verifyInstalledBinary(installPath string, stagedInfo os.FileInfo) error {
 
 // installAndVerifyWithRollback is runUpdate's install step: back up any
 // existing binary, atomically replace it with the freshly built one, verify
-// the replacement, and — on a verification failure — restore the backup so
-// installPath ends up in a real, falsifiable state rather than holding
-// whatever installBinary's rename just put there. Split out from runUpdate
-// so it is independently unit-testable with synthetic staged/installed
-// files, no real `go build` required (lr-c69197 fold-in regression test:
-// "a failed verification restores the prior binary").
+// the replacement, and — on EITHER an installBinary failure or a
+// verification failure — restore the backup so installPath ends up in a
+// real, falsifiable state rather than holding whatever installBinary's
+// rename left there. Both failure modes are the same class ("installPath is
+// not what it should be, and a good backup exists to restore from") and are
+// routed through the single restoreBackupOrReport helper rather than two
+// parallel restore implementations that could drift out of sync (lr-c69197
+// second fold-in, PEACHES nit 1). Split out from runUpdate so it is
+// independently unit-testable with synthetic staged/installed files, no
+// real `go build` required (lr-c69197 fold-in regression test: "a failed
+// verification restores the prior binary"; second fold-in regression test:
+// "a failed installBinary restores the prior binary").
 //
 // hostname is used only for the success log line, matching runUpdate's own
 // pre-fold-in wording.
@@ -559,8 +626,18 @@ func installAndVerifyWithRollback(stagedPath, installPath string, stagedInfo os.
 	}
 
 	fmt.Fprintf(out, "update: installing %s -> %s (atomic rename)\n", stagedPath, installPath)
+	// ROLLBACK ON INSTALL FAILURE (lr-c69197 second fold-in, PEACHES nit 1):
+	// installBinary itself can fail AFTER backupInstalledBinary has already
+	// renamed the old binary away — os.Chmod on the staged file failing, or
+	// the replacing os.Rename failing partway (cross-device, permissions
+	// change mid-flight). Either leaves installPath stranded (absent, or
+	// still holding whatever a partial rename left) with the good binary
+	// sitting only at backupPath. This is the exact same "installPath is not
+	// in a state matching what documentation claims" class the verification
+	// rollback below closes — routed through the same restoreBackupOrReport
+	// so there is one restore path, not two that can drift.
 	if err := installBinary(stagedPath, installPath); err != nil {
-		return fmt.Errorf("install: %w", err)
+		return fmt.Errorf("install: %w", restoreBackupOrReport(err, backupPath, installPath))
 	}
 
 	// READBACK (lr-c69197 MILLER item 2): installBinary's os.Rename returning
@@ -575,25 +652,33 @@ func installAndVerifyWithRollback(stagedPath, installPath string, stagedInfo os.
 	// used to leave installPath holding whatever installBinary's rename just
 	// put there — the bad artifact, not the previously-working one, despite
 	// documentation elsewhere claiming the old binary was "untouched". It is
-	// restored from backupPath (best-effort: if the restore itself fails,
-	// that failure is reported ALONGSIDE the verification failure, never in
-	// place of it — an operator needs to know both that verification failed
-	// AND whether the restore actually worked).
+	// restored from backupPath via the same restoreBackupOrReport used above
+	// (best-effort: if the restore itself fails, that failure is reported
+	// ALONGSIDE the verification failure, never in place of it — an operator
+	// needs to know both that verification failed AND whether the restore
+	// actually worked).
 	if err := verifyInstalledBinary(installPath, stagedInfo); err != nil {
-		if backupPath == "" {
-			return fmt.Errorf("install: post-install verification failed: %w (no previous binary existed "+
-				"to roll back to — this was a first-ever install at %s)", err, installPath)
-		}
-		if restoreErr := os.Rename(backupPath, installPath); restoreErr != nil {
-			return fmt.Errorf("install: post-install verification failed: %w; additionally, restoring the "+
-				"previous binary from %s FAILED: %v — %s may now be missing or in an inconsistent state, "+
-				"check it by hand", err, backupPath, restoreErr, installPath)
-		}
-		return fmt.Errorf("install: post-install verification failed: %w (previous binary restored from "+
-			"%s — the running service's on-disk binary is back to its pre-update state)", err, backupPath)
+		return fmt.Errorf("install: post-install verification failed: %w",
+			restoreBackupOrReport(err, backupPath, installPath))
+	}
+
+	// Re-stat installPath rather than reporting stagedInfo's pre-chmod mode
+	// (lr-c69197 second fold-in, PEACHES nit 3): stagedInfo was captured
+	// before installBinary's os.Chmod(0o755) ran, so it still carries the
+	// staged artifact's original (often 0o644, from `go build`'s default
+	// output mode) permission bits — logging it here claimed a mode that was
+	// never actually on disk at installPath. installedInfo reflects what
+	// verifyInstalledBinary itself just confirmed is really there.
+	installedInfo, statErr := os.Stat(installPath)
+	if statErr != nil {
+		// Unreachable in practice — verifyInstalledBinary above just
+		// successfully stat'd this exact path — but a stat failure here must
+		// still not silently fall back to the misleading pre-chmod value.
+		return fmt.Errorf("install: verified %s but a follow-up stat for the report line failed: %w",
+			installPath, statErr)
 	}
 	fmt.Fprintf(out, "update: verified %s on %s (size=%d bytes, mode=%s)\n",
-		installPath, hostname, stagedInfo.Size(), stagedInfo.Mode().Perm())
+		installPath, hostname, installedInfo.Size(), installedInfo.Mode().Perm())
 
 	// The backup has served its purpose once verification passes — remove it
 	// rather than leaving a stale ".bak" artifact sitting next to installPath
