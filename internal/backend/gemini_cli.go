@@ -225,21 +225,19 @@ func (a *GeminiCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 
 	// Stderr always contains noise lines (keychain errors, credential messages).
 	// Classify using stderr+stdout combined but do NOT fail on non-empty stderr alone.
-	stderrStr := truncate(stderr.String(), 500)
-
 	if err != nil || exitCode != 0 {
-		// In --output-format json mode error JSON goes to stderr.
-		// Classify (and parse reset time) against the FULL stderr+stdout, not
-		// the truncated display string above (lr-807319) — a head-truncation
-		// window can silently drop tail-positioned error text. truncate() is
-		// still used for the Raw display field only.
+		// classificationText and Raw are now the SAME string (lr-151fa7,
+		// following PR #61/lr-c1d353's invariant): classify (and parse reset
+		// time) against the FULL stderr+stdout, not a separately-computed
+		// stderr-only (or stdout-head) string — a head-truncation window can
+		// silently drop tail-positioned error text (lr-807319). truncate()
+		// is applied to the SAME text used for classification so Raw is
+		// never a window on a different buffer than what
+		// ClassifyErrorWithPattern/ClassifiedTextExcerpt saw. In
+		// --output-format json mode error JSON goes to stderr.
 		full := stderr.String() + stdout.String()
 		errType, patternID := ClassifyErrorWithPattern(full, exitCode)
 		resetAt := ParseResetTime(full)
-		raw := stderrStr
-		if raw == "" {
-			raw = truncate(stdout.String(), 500)
-		}
 		slog.Info("gemini_cli invoke failed",
 			"backend", a.id, "exit_code", exitCode, "error_type", errType, "reset_at", resetAt,
 			"request_id", RequestIDFromCtx(ctx),
@@ -247,7 +245,7 @@ func (a *GeminiCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 		slog.Debug("gemini_cli invoke failed: classified text excerpt",
 			"backend", a.id, "request_id", RequestIDFromCtx(ctx),
 			"classified_text_excerpt", ClassifiedTextExcerpt(full, patternID))
-		return nil, &InvokeError{Type: errType, Raw: raw}
+		return nil, &InvokeError{Type: errType, Raw: truncate(full, 500)}
 	}
 
 	// Parse JSON output.

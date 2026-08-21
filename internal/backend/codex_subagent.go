@@ -193,26 +193,25 @@ func (a *CodexSubagentAdapter) Invoke(ctx context.Context, req *Request) (*Respo
 		}
 	}
 
-	stderrStr := truncate(stderr.String(), 500)
-
 	if err != nil || exitCode != 0 {
-		// Classify against the FULL stderr+stdout, not the truncated display
-		// string above (lr-807319) — see codex_cli.go's Invoke for the full
-		// rationale (this adapter shares codex_cli's exec-and-scan shape).
-		// truncate() is still used for the Raw display field only.
+		// classificationText and Raw are now the SAME string (lr-151fa7,
+		// following PR #61/lr-c1d353's invariant): classify against the FULL
+		// stderr+stdout, not a separately-computed stderr-only (or
+		// stdout-head) string — see claude_cli.go's Invoke for the full
+		// rationale (this adapter shares claude_cli's exec-and-scan shape).
+		// truncate() is applied to the SAME text used for classification so
+		// Raw is never a window on a different buffer than what
+		// ClassifyErrorWithPattern/ClassifiedTextExcerpt saw.
 		combined := stderr.String() + stdout.String()
 		errType, patternID := ClassifyErrorWithPattern(combined, exitCode)
 		slog.Info("codex_subagent invoke failed",
 			"backend", a.id, "exit_code", exitCode, "error_type", errType,
+			"request_id", RequestIDFromCtx(ctx),
 			"stderr_len", stderr.Len(), "stdout_len", stdout.Len(), "matched_pattern_id", patternID)
 		slog.Debug("codex_subagent invoke failed: classified text excerpt",
-			"backend", a.id,
+			"backend", a.id, "request_id", RequestIDFromCtx(ctx),
 			"classified_text_excerpt", ClassifiedTextExcerpt(combined, patternID))
-		raw := stderrStr
-		if raw == "" {
-			raw = truncate(stdout.String(), 500)
-		}
-		return nil, &InvokeError{Type: errType, Raw: raw}
+		return nil, &InvokeError{Type: errType, Raw: truncate(combined, 500)}
 	}
 
 	// Try JSON parse (claude --output-format json)
