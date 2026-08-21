@@ -20,10 +20,40 @@
 // `git pull --ff-only` it before building. Non-fast-forwardable state and a
 // missing Go toolchain both fail loudly with an actionable message instead
 // of a raw `go build`/`git` error from an unexpected directory.
+//
+// READBACK (lr-c69197): a PASS from this command used to mean only "every
+// exec.Command exited 0" — installBinary's os.Rename and
+// restartSystemdService's `systemctl restart` were both taken at their exit
+// code alone, with nothing re-reading the result. runUpdate now verifies
+// each mutating step after it runs: verifyInstalledBinary re-stats
+// install_path and compares it — size, EXACT mode (eighth fold-in: any
+// execute bit used to be accepted, letting a 0o777 world-writable binary
+// pass), AND a SHA-256 content hash (fifth fold-in: size+mode alone passes a
+// same-size wrong artifact) — against the freshly built artifact;
+// restartAndVerifySystemdService compares the unit's ActiveEnterTimestamp,
+// ActiveEnterTimestampMonotonic (fifth fold-in: the wall-clock field alone
+// is second-granular and can false-fail a fast same-second restart combined
+// with PID reuse), and MainPID before and after the restart call, so a
+// restart that did not actually restart the unit is a hard error, not a
+// silent pass. The final report line names the hostname, the resolved
+// install_path, and the resolved unit+scope actually acted on — see
+// runUpdate's own doc for why this makes a PASS falsifiable rather than a
+// pre-action echo of intent. A crash-window .bak adoption
+// (backupInstalledBinary state 3) is logged loudly and named in the report
+// rather than proceeding silently (fifth fold-in, BOBBIE comment
+// 5373968195). The ROLLBACK path gets the same readback treatment (eighth
+// fold-in, BOBBIE bobbie.uncat.1): restoreBackupOrReport now verifies every
+// restore rename the same way, mode always and content whenever a genuine
+// pre-image hash exists (the normal-rollback case); a crash-window-adopted
+// .bak has no pre-image to compare against, so that path is checked for
+// mode/non-emptiness and its content is reported as explicitly unverified,
+// never silently skipped and never backed by a fabricated hash.
 package main
 
 import (
+	"crypto/sha256"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"os/exec"
@@ -97,6 +127,19 @@ func runUpdate(deploy config.DeployConfig, out *os.File) error {
 	installPath := deploy.ResolvedInstallPath()
 	serviceManager := deploy.ResolvedServiceManager()
 
+	// hostname is resolved once, up front, purely for the report line —
+	// naming the machine an action actually landed on is the core fix this
+	// change makes (lr-c69197 MILLER item: "PASS naming neither host nor
+	// verified outcome is unfalsifiable by construction"). A resolution
+	// failure (rare — a container with no /etc/hostname) must not block the
+	// update itself; it degrades to a literal "(unknown)" in the report
+	// rather than failing an otherwise-successful deploy over a cosmetic
+	// field.
+	hostname, hostnameErr := os.Hostname()
+	if hostnameErr != nil {
+		hostname = "(unknown)"
+	}
+
 	if sourceDir == "" {
 		return fmt.Errorf("deploy.source_dir could not be resolved: neither an explicit " +
 			"deploy.source_dir/--source-dir nor $XDG_DATA_HOME nor $HOME is set, so there is no " +
@@ -127,22 +170,35 @@ func runUpdate(deploy config.DeployConfig, out *os.File) error {
 		return fmt.Errorf("build: %w", err)
 	}
 
-	fmt.Fprintf(out, "update: installing %s -> %s (atomic rename)\n", stagedPath, installPath)
-	if err := installBinary(stagedPath, installPath); err != nil {
-		return fmt.Errorf("install: %w", err)
+	stagedInfo, err := os.Stat(stagedPath)
+	if err != nil {
+		return fmt.Errorf("install: stat freshly built binary %s: %w", stagedPath, err)
+	}
+	// Hashed here, right after the build succeeded and before anything else
+	// touches stagedPath — the natural point where the staged artifact is
+	// guaranteed to exist and be exactly what buildBinary just produced. See
+	// verifyInstalledBinary's own doc for why this must be the pre-rename
+	// content, not a re-read of installPath afterward.
+	stagedHash, err := hashFile(stagedPath)
+	if err != nil {
+		return fmt.Errorf("install: hash freshly built binary %s: %w", stagedPath, err)
+	}
+
+	if err := installAndVerifyWithRollback(stagedPath, installPath, stagedInfo, stagedHash, hostname, out); err != nil {
+		return err
 	}
 
 	switch serviceManager {
 	case "systemd":
 		serviceName := deploy.ResolvedServiceName()
-		fmt.Fprintf(out, "update: restarting systemd unit %s.service (system scope)\n", serviceName)
-		if err := restartSystemdService(serviceName, systemdScopeSystem); err != nil {
+		fmt.Fprintf(out, "update: restarting systemd unit %s.service (system scope) on %s\n", serviceName, hostname)
+		if err := restartAndVerifySystemdService(serviceName, systemdScopeSystem, out); err != nil {
 			return fmt.Errorf("restart: %w", err)
 		}
 	case "systemd-user":
 		serviceName := deploy.ResolvedServiceName()
-		fmt.Fprintf(out, "update: restarting systemd unit %s.service (user scope)\n", serviceName)
-		if err := restartSystemdService(serviceName, systemdScopeUser); err != nil {
+		fmt.Fprintf(out, "update: restarting systemd unit %s.service (user scope) on %s\n", serviceName, hostname)
+		if err := restartAndVerifySystemdService(serviceName, systemdScopeUser, out); err != nil {
 			return fmt.Errorf("restart: %w", err)
 		}
 	case "none":
@@ -151,7 +207,22 @@ func runUpdate(deploy config.DeployConfig, out *os.File) error {
 		return fmt.Errorf("deploy.service_manager: unknown value %q (want \"systemd\", \"systemd-user\", or \"none\")", serviceManager)
 	}
 
-	fmt.Fprintln(out, "update: done")
+	// Falsifiable summary line (lr-c69197): names the host, the resolved
+	// install path, and the resolved unit+scope actually acted on — the
+	// three facts MILLER's diagnosis found the pre-existing "installed X,
+	// restarted Y" pre-action echo never carried. Emitted only after every
+	// readback above has already returned nil, so its mere presence in a
+	// captured log is itself evidence of a verified outcome, not a
+	// pre-action intent statement.
+	unitDesc := "none (service_manager=none)"
+	if serviceManager == "systemd" || serviceManager == "systemd-user" {
+		scopeDesc := "system"
+		if serviceManager == "systemd-user" {
+			scopeDesc = "user"
+		}
+		unitDesc = fmt.Sprintf("%s.service (%s scope)", deploy.ResolvedServiceName(), scopeDesc)
+	}
+	fmt.Fprintf(out, "update: done — host=%s install_path=%s unit=%s\n", hostname, installPath, unitDesc)
 	return nil
 }
 
@@ -411,17 +482,480 @@ func buildBinary(sourceDir, outputPath string) error {
 	return nil
 }
 
+// installedBinaryMode is the exact permission bits installBinary sets on
+// every artifact it installs (below). verifyInstalledBinary and
+// verifyRestoredBinary both assert this EXACT value, not merely "some
+// execute bit set" — see verifyInstalledBinary's own doc (eighth fold-in,
+// PEACHES nit) for why "any of 0o111" was too weak (a 0o777 world-writable
+// binary passed it).
+const installedBinaryMode = 0o755
+
 // installBinary atomically replaces installPath with stagedPath via
 // os.Rename. A plain copy over a running systemd-held binary fails with
 // "text file busy"; rename on the same filesystem is atomic and succeeds
 // even while the old inode is held open by the running process — the
 // service keeps serving the old inode until it is restarted.
 func installBinary(stagedPath, installPath string) error {
-	if err := os.Chmod(stagedPath, 0o755); err != nil {
+	if err := os.Chmod(stagedPath, installedBinaryMode); err != nil {
 		return fmt.Errorf("chmod staged binary: %w", err)
 	}
 	if err := os.Rename(stagedPath, installPath); err != nil {
 		return fmt.Errorf("rename %s -> %s: %w (stage and target must be on the same filesystem)", stagedPath, installPath, err)
+	}
+	return nil
+}
+
+// backupInstalledBinary preserves the current contents of installPath at
+// installPath+".bak" (same directory, so the later restore is a same-
+// filesystem rename — atomic, no partial-write window) before it is
+// replaced. This is the rollback fold-in (lr-c69197, PEACHES comment
+// 5373517397 / BOBBIE comment 5373549900): both the update.user.service unit
+// comment and OPERATOR-GUIDE.md previously claimed a failed update leaves
+// the previous binary "untouched", which was false — verifyInstalledBinary
+// runs AFTER installBinary's os.Rename has already replaced installPath.
+// This closes that gap for real rather than only correcting the claim.
+//
+// Returns ("", nil) ONLY for genuine first-ever install: neither
+// installPath nor installPath+".bak" exists — there is nothing to back up
+// and nothing to roll back to, and that is not an error; a caller checks
+// for the empty return to know rollback-on-failure has nothing to restore.
+//
+// STALE .bak HANDLING (lr-c69197 second fold-in, PEACHES nit 1 / BOBBIE;
+// crash-window fix, lr-c69197 fourth fold-in, PEACHES comment 5373781420):
+// installPath+".bak" can already exist on entry — a prior update run was
+// interrupted (killed, host rebooted, OOM) between this rename and the
+// later cleanup/restore rename that would have consumed it. There are three
+// distinct states to disambiguate, not two, and each wants different
+// behavior:
+//
+//  1. Neither installPath nor .bak present: genuine first-ever install.
+//     Nothing to back up, nothing to roll back to. Returns ("", nil).
+//  2. installPath present, .bak present: a stale backup from an interrupted
+//     run that crashed AFTER a working install had already completed and
+//     been backed up again (or, more commonly, an operator/process placed a
+//     .bak there by hand). Two wrong answers were considered and rejected:
+//     - Silently overwrite it: the stale .bak may be the ONLY good binary
+//     on the box (the interrupted run may have failed AFTER this backup
+//     but BEFORE a working install ever completed) — clobbering it
+//     destroys the one known-good artifact left to roll back to.
+//     - Fail forever until an operator intervenes: a single interrupted
+//     run would then permanently wedge every future update, which is
+//     worse than the problem this rollback mechanism exists to solve.
+//     The chosen behavior: refuse to proceed with THIS backup, but do not
+//     destroy either file — hard error naming both installPath and the
+//     stale backupPath, so the update fails loudly (same as any other
+//     pre-install error: install_path itself is untouched) and an operator
+//     resolves the ambiguity by hand.
+//  3. installPath ABSENT, .bak present: the narrow crash window documented
+//     in OPERATOR-GUIDE.md — a prior run's backup rename (installPath ->
+//     .bak) completed but the crash landed before the replacing rename
+//     (staged -> installPath) ever put a new binary at installPath. Unlike
+//     case 2, there is no ambiguity about which file is "the current one"
+//     to protect: installPath is empty, so .bak is unambiguously the only
+//     candidate good binary on the box, and refusing here (treating this as
+//     "first-ever install", the bug this fix closes) would (a) make a
+//     SUBSEQUENT install failure claim "no previous binary existed to roll
+//     back to" despite .bak sitting right there, restorable, and (b) on
+//     install SUCCESS leave the stale .bak behind to wedge the very next
+//     update against case 2's refusal — a single crash permanently wedging
+//     every future update, exactly the outcome the case-2 guard exists to
+//     prevent. The chosen behavior: treat .bak as the existing backup
+//     in-place — return its path directly (no rename needed; installPath is
+//     already empty, there is nothing to move aside) so the caller's
+//     rollback-on-failure path can restore it, and a successful install
+//     naturally consumes/removes it via the same cleanup as any other run.
+//     This self-recovers the crash window without an operator having to
+//     intervene, while never fabricating a rollback target that isn't
+//     genuinely there.
+//
+// The bool return is crashWindowAdopted (lr-c69197 fifth fold-in, BOBBIE
+// comment 5373968195): true only for case 3 below — an existing .bak was
+// silently adopted as the rollback source because installPath itself was
+// absent. BOBBIE's assessment is that this adoption carries no capability
+// escalation (anyone able to write .bak could already write installPath
+// directly), but it was invisible to the operator and now runs unattended
+// under the update timer — the caller uses this bool to log the adoption
+// loudly and name it in the report line rather than silently proceeding, as
+// case 2's stale-.bak refusal already does loudly for its own branch.
+//
+// RESTORE-VERIFICATION HASH (lr-c69197 eighth fold-in, BOBBIE bobbie.uncat.1
+// — narrowed but not closed at the seventh fold-in's SHA): a restore
+// (backupPath renamed back onto installPath by restoreBackupOrReport) used
+// to be a bare os.Rename with no readback at all, on either backup path.
+// The returned [sha256.Size]byte + bool here is what makes a POST-RESTORE
+// verification possible for the NORMAL rollback case (case 2's mirror —
+// installPath existed and was renamed to backupPath by this very call): the
+// content is hashed HERE, immediately before the rename away, which is the
+// one moment this function is guaranteed to be looking at exactly the bytes
+// that are about to become the rollback source — exactly the same
+// before-the-rename-not-after reasoning verifyInstalledBinary's own doc
+// already establishes for the forward install path. The bool is false (no
+// expected hash available) for the crash-window-adopted case (case 3): this
+// function never saw that .bak get created, so there is no pre-image to
+// compare a restore against — see verifyRestoredBinary's own doc for what
+// is checked instead in that case, and why fabricating an expected hash
+// here would be worse than not having one.
+func backupInstalledBinary(installPath string) (string, bool, [sha256.Size]byte, bool, error) {
+	var noHash [sha256.Size]byte
+	backupPath := installPath + ".bak"
+	_, backupStatErr := os.Stat(backupPath)
+	if backupStatErr != nil && !os.IsNotExist(backupStatErr) {
+		return "", false, noHash, false, fmt.Errorf("stat existing backup at %s: %w", backupPath, backupStatErr)
+	}
+	backupExists := backupStatErr == nil
+
+	if _, err := os.Stat(installPath); err != nil {
+		if !os.IsNotExist(err) {
+			return "", false, noHash, false, fmt.Errorf("stat existing binary at %s: %w", installPath, err)
+		}
+		// installPath is absent. Case 3 (backupExists) vs. case 1 (it doesn't).
+		// Case 3: no pre-image hash — this run never saw backupPath's content
+		// created, only adopted it after the fact. hasExpectedHash is false.
+		if backupExists {
+			return backupPath, true, noHash, false, nil
+		}
+		return "", false, noHash, false, nil
+	}
+
+	// installPath exists — case 2 if .bak also exists.
+	if backupExists {
+		return "", false, noHash, false, fmt.Errorf("refusing to back up %s: a stale backup already exists at %s from a "+
+			"previous interrupted update — it may be the only known-good binary left to roll back to, "+
+			"so it is never silently overwritten. Inspect %s by hand: if it is safe to discard, remove "+
+			"it and re-run update; if it looks like the good binary and %s does not, restore it "+
+			"manually (mv %s %s)", installPath, backupPath, backupPath, installPath, backupPath, installPath)
+	}
+	// Hashed BEFORE the rename away, while installPath still holds the
+	// content that is about to become the rollback source — see the doc
+	// above for why this must be pre-rename, not a re-read of backupPath
+	// afterward.
+	preBackupHash, hashErr := hashFile(installPath)
+	if hashErr != nil {
+		return "", false, noHash, false, fmt.Errorf("hash existing binary at %s before backing it up: %w", installPath, hashErr)
+	}
+	if err := os.Rename(installPath, backupPath); err != nil {
+		return "", false, noHash, false, fmt.Errorf("rename %s -> %s: %w (backup and target must be on the same filesystem)", installPath, backupPath, err)
+	}
+	return backupPath, false, preBackupHash, true, nil
+}
+
+// restoreBackupOrReport is the ONE restore path used by every post-backup
+// failure mode in installAndVerifyWithRollback (lr-c69197 second fold-in,
+// PEACHES nit 1): both an installBinary failure (the rename that would
+// replace installPath never completed, or completed only partially) and a
+// verifyInstalledBinary failure (the rename completed, but the result is
+// wrong) need the exact same recovery — rename backupPath back onto
+// installPath — and previously only the verification-failure branch did
+// this, leaving installBinary's own failure branch to return the raw error
+// with installPath potentially stranded (old binary at .bak, nothing or a
+// half-written file at installPath). Routing both callers through this one
+// function means there is a single place that can drift, not two.
+//
+// backupPath == "" (first-ever install, nothing to roll back to) always
+// returns originalErr unchanged — see backupInstalledBinary's own doc. A
+// restore failure is reported ALONGSIDE originalErr, never in place of it:
+// an operator needs to know both that the step failed AND whether the
+// restore itself worked.
+//
+// POST-RESTORE VERIFICATION (lr-c69197 eighth fold-in, BOBBIE bobbie.uncat.1
+// — narrowed but not closed at the seventh fold-in's SHA): a restore used to
+// be a bare os.Rename with no readback at all — the forward install path
+// (installBinary -> verifyInstalledBinary) gets a full readback, but the
+// rollback path did not get the mirror-image check, despite landing the
+// binary that becomes the running service's on-disk executable in exactly
+// the same way. verifyRestoredBinary (below) is that mirror: called here,
+// after the rename, on every restore. A verification FAILURE at this point
+// is deliberately NOT treated as license to delete or further rename
+// anything — this function is already on a failure path (originalErr is
+// non-nil in every caller), and turning a recoverable "the restored binary
+// looks wrong, an operator needs to look at it" into an unrecoverable "and
+// then update deleted the only remaining binary on the box trying to fix
+// it" would be strictly worse. The verification failure is reported
+// ALONGSIDE originalErr and the restore-succeeded confirmation, same as a
+// restoreErr already is above — installPath is left exactly as the rename
+// left it, for an operator to inspect by hand.
+func restoreBackupOrReport(originalErr error, backupPath, installPath string, hasExpectedHash bool, expectedHash [sha256.Size]byte) error {
+	if backupPath == "" {
+		return fmt.Errorf("%w (no previous binary existed to roll back to — this was a first-ever "+
+			"install at %s)", originalErr, installPath)
+	}
+	if restoreErr := os.Rename(backupPath, installPath); restoreErr != nil {
+		return fmt.Errorf("%w; additionally, restoring the previous binary from %s FAILED: %v — %s "+
+			"may now be missing or in an inconsistent state, check it by hand",
+			originalErr, backupPath, restoreErr, installPath)
+	}
+	if verifyErr := verifyRestoredBinary(installPath, hasExpectedHash, expectedHash); verifyErr != nil {
+		return fmt.Errorf("%w (previous binary renamed back from %s, but POST-RESTORE VERIFICATION "+
+			"FAILED: %v — install_path is left exactly as the restore rename produced it; it is NOT "+
+			"deleted or renamed again, so the only remaining binary on the box is not lost; inspect it "+
+			"by hand before trusting it)", originalErr, backupPath, verifyErr)
+	}
+	return fmt.Errorf("%w (previous binary restored from %s and verified — the running service's "+
+		"on-disk binary is back to its pre-update state)", originalErr, backupPath)
+}
+
+// verifyRestoredBinary is restoreBackupOrReport's readback half — the
+// rollback-path mirror of verifyInstalledBinary on the forward install path
+// (lr-c69197 eighth fold-in, closing BOBBIE bobbie.uncat.1's residual gap:
+// "restoreBackupOrReport still restores an adopted .bak via a bare
+// os.Rename with no integrity check and no mode check"). Two distinct
+// scenarios, deliberately checked differently rather than papered over with
+// one code path:
+//
+//   - hasExpectedHash == true (NORMAL rollback — backupInstalledBinary's
+//     case 2 mirror: installPath existed and was backed up by THIS run):
+//     backupInstalledBinary hashed the binary immediately before renaming it
+//     to backupPath, so expectedHash is a genuine pre-image — the exact
+//     bytes that are supposed to come back. This is verified fully: exact
+//     mode (installedBinaryMode, same as the forward path — see eighth
+//     fold-in's PEACHES nit 1) AND content hash.
+//   - hasExpectedHash == false (CRASH-WINDOW ADOPTED .bak — case 3:
+//     installPath was absent, so this run never saw the .bak's content get
+//     created and has no pre-image to compare against): there is no honest
+//     way to assert "this is the right content" here — fabricating an
+//     expected hash for a file this process never observed being written
+//     would be worse than not checking at all (a false PASS is more
+//     dangerous than an honest "unverified"). What CAN be checked without
+//     inventing anything: the restored file exists, is non-empty, and has
+//     exactly installedBinaryMode — catching, at minimum, an empty/
+//     truncated/wrong-permission file. The content gap is logged loudly as
+//     UNVERIFIED, not silently skipped, so an operator has a clear signal to
+//     go compare the restored binary against a known-good copy by hand.
+func verifyRestoredBinary(installPath string, hasExpectedHash bool, expectedHash [sha256.Size]byte) error {
+	info, err := os.Stat(installPath)
+	if err != nil {
+		return fmt.Errorf("expected a restored binary at %s, but stat failed: %w", installPath, err)
+	}
+	if info.Size() == 0 {
+		return fmt.Errorf("restored binary at %s is empty (0 bytes) — this cannot be a working binary", installPath)
+	}
+	if info.Mode().Perm() != installedBinaryMode {
+		return fmt.Errorf("restored binary at %s has mode %s, want exactly %s", installPath,
+			info.Mode().Perm(), os.FileMode(installedBinaryMode))
+	}
+	if !hasExpectedHash {
+		// CRASH-WINDOW ADOPTED .bak: no pre-image hash exists to compare
+		// against — see this function's own doc for why fabricating one here
+		// would be dishonest. Mode/non-emptiness above is the most that can be
+		// verified; the content gap is reported, not silently skipped.
+		return fmt.Errorf("restored binary at %s passed mode/non-emptiness checks, but its CONTENT COULD "+
+			"NOT BE VERIFIED against a known-good hash — this was a crash-window-adopted backup (update "+
+			"never observed this file's content being written, so it has no pre-image to compare "+
+			"against); inspect %s by hand against a known-good build before trusting it", installPath, installPath)
+	}
+	restoredHash, hashErr := hashFile(installPath)
+	if hashErr != nil {
+		return fmt.Errorf("restored binary at %s matched mode but its content could not be hashed for "+
+			"verification: %w", installPath, hashErr)
+	}
+	if restoredHash != expectedHash {
+		return fmt.Errorf("restored binary at %s has a DIFFERENT content hash (got %x, want %x — the "+
+			"hash taken of this exact file immediately before it was backed up) — the restore rename "+
+			"did not bring back the binary that was actually backed up", installPath, restoredHash, expectedHash)
+	}
+	return nil
+}
+
+// verifyInstalledBinary is the readback half of the install step (lr-c69197
+// MILLER item 2: "installBinary returns nil on exit 0 and that is the whole
+// contract — nothing re-reads the result"). It re-stats installPath — the
+// exact path a running service execs from, not the staged temp file — and
+// compares size, permission bits, and content hash against stagedInfo/
+// stagedHash (captured from the freshly built artifact before the rename). A
+// version-string comparison (running `<installPath> version` and matching
+// the expected revision) was considered, since lr-92ee18 made the version
+// linkable via -ldflags -X, but is deliberately NOT used here: this repo's
+// build does not thread an expected revision string into runUpdate at all
+// (the Makefile's -X flag is applied by `make build`, not by the `go build
+// -o` this file invokes directly), so a version check here would either need
+// a second, out-of-band way to learn the expected revision or would silently
+// compare against the empty-string default on every unmodified build —
+// neither is reliable enough to gate a deploy on.
+//
+// CONTENT HASH (lr-c69197 fifth fold-in, PEACHES nit): size+mode alone
+// passes a same-size WRONG artifact — two different binaries of identical
+// length and identical permission bits satisfy both checks despite being
+// genuinely different files. stagedHash is a SHA-256 of the staged artifact,
+// computed by the caller (installAndVerifyWithRollback) BEFORE installBinary
+// renames it into place — hashing must happen on the pre-rename staged file,
+// not read back from installPath afterward, since the whole point is
+// confirming the bytes that landed at installPath are the bytes that were
+// actually built. This is a one-time cost per update (one full read of a
+// binary that was just written, still hot in the page cache) — cheap
+// relative to the `go build` that preceded it, and it is what makes
+// "verified" mean the artifact's actual content, not just its size class.
+//
+// EXACT MODE (lr-c69197 eighth fold-in, PEACHES nit): this used to accept
+// ANY execute bit (installedInfo.Mode().Perm()&0o111 != 0), which passes a
+// 0o777 world-writable binary — installBinary (above) always chmods the
+// staged artifact to exactly installedBinaryMode (0o755) before the
+// replacing rename, so verification asserts that exact value rather than
+// merely "executable by someone."
+func verifyInstalledBinary(installPath string, stagedInfo os.FileInfo, stagedHash [sha256.Size]byte) error {
+	installedInfo, err := os.Stat(installPath)
+	if err != nil {
+		return fmt.Errorf("expected an installed binary at %s after install, but stat failed: %w "+
+			"(a PASS that installed nothing to a path nothing runs from is exactly the defect this "+
+			"check exists to catch)", installPath, err)
+	}
+	if installedInfo.Size() != stagedInfo.Size() {
+		return fmt.Errorf("installed binary at %s has size %d bytes, want %d (the freshly built "+
+			"artifact's size) — the file at install_path does not match what was just built",
+			installPath, installedInfo.Size(), stagedInfo.Size())
+	}
+	if installedInfo.Mode().Perm() != installedBinaryMode {
+		return fmt.Errorf("installed binary at %s has mode %s, want exactly %s (the mode installBinary "+
+			"sets) — ANY execute bit (mode&0o111 != 0) used to pass here, which let a 0o777 "+
+			"world-writable binary through verification undetected (eighth fold-in, PEACHES nit)",
+			installPath, installedInfo.Mode().Perm(), os.FileMode(installedBinaryMode))
+	}
+	installedHash, err := hashFile(installPath)
+	if err != nil {
+		return fmt.Errorf("installed binary at %s matched size/mode but its content could not be "+
+			"hashed for verification: %w", installPath, err)
+	}
+	if installedHash != stagedHash {
+		return fmt.Errorf("installed binary at %s has the same size and mode as the freshly built "+
+			"artifact but a DIFFERENT content hash (got %x, want %x) — the file at install_path is not "+
+			"byte-identical to what was just built", installPath, installedHash, stagedHash)
+	}
+	return nil
+}
+
+// hashFile returns the SHA-256 digest of the file at path. Used by both
+// halves of the install readback: the caller hashes the staged artifact
+// before installBinary's rename, and verifyInstalledBinary hashes
+// installPath after, so the comparison spans the actual rename rather than
+// trusting os.Rename's exit code alone.
+func hashFile(path string) ([sha256.Size]byte, error) {
+	var digest [sha256.Size]byte
+	f, err := os.Open(path)
+	if err != nil {
+		return digest, fmt.Errorf("open %s for hashing: %w", path, err)
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return digest, fmt.Errorf("read %s for hashing: %w", path, err)
+	}
+	copy(digest[:], h.Sum(nil))
+	return digest, nil
+}
+
+// installAndVerifyWithRollback is runUpdate's install step: back up any
+// existing binary, atomically replace it with the freshly built one, verify
+// the replacement, and — on EITHER an installBinary failure or a
+// verification failure — restore the backup so installPath ends up in a
+// real, falsifiable state rather than holding whatever installBinary's
+// rename left there. Both failure modes are the same class ("installPath is
+// not what it should be, and a good backup exists to restore from") and are
+// routed through the single restoreBackupOrReport helper rather than two
+// parallel restore implementations that could drift out of sync (lr-c69197
+// second fold-in, PEACHES nit 1). Split out from runUpdate so it is
+// independently unit-testable with synthetic staged/installed files, no
+// real `go build` required (lr-c69197 fold-in regression test: "a failed
+// verification restores the prior binary"; second fold-in regression test:
+// "a failed installBinary restores the prior binary").
+//
+// hostname is used only for the success log line, matching runUpdate's own
+// pre-fold-in wording. stagedHash is the SHA-256 of stagedPath's content,
+// computed by the caller BEFORE this function runs (runUpdate hashes it
+// immediately after the build that produced it, guaranteeing the file
+// exists and is exactly what buildBinary emitted) — see verifyInstalledBinary's
+// own doc for why the hash must be captured pre-rename.
+func installAndVerifyWithRollback(stagedPath, installPath string, stagedInfo os.FileInfo, stagedHash [sha256.Size]byte, hostname string, out *os.File) error {
+	// ROLLBACK (lr-c69197 fold-in, PEACHES comment 5373517397 / BOBBIE comment
+	// 5373549900): the previously-installed binary is preserved BEFORE the
+	// replace, at installPath+".bak", specifically so a verification failure
+	// below has something real to restore — see backupInstalledBinary's own
+	// doc for why a missing pre-existing binary (first-ever install) is not
+	// an error here.
+	backupPath, crashWindowAdopted, backupHash, hasBackupHash, backupErr := backupInstalledBinary(installPath)
+	if backupErr != nil {
+		return fmt.Errorf("install: back up previous binary before replacing it: %w", backupErr)
+	}
+	// VISIBILITY (lr-c69197 fifth fold-in, BOBBIE comment 5373968195): a
+	// crash-window adoption of a pre-existing .bak of unknown provenance used
+	// to be silent — indistinguishable in the log from any other run. Named
+	// loudly here, and in the final success/failure report lines below, so an
+	// operator running unattended hourly under the timer can see a recovery
+	// adoption happened rather than it passing unremarked.
+	if crashWindowAdopted {
+		fmt.Fprintf(out, "update: RECOVERY: install_path %s was absent but a pre-existing backup was "+
+			"found at %s (crash-window state — a prior update was interrupted after backing up but "+
+			"before completing the replace) — adopting it as this run's rollback source\n",
+			installPath, backupPath)
+	}
+
+	fmt.Fprintf(out, "update: installing %s -> %s (atomic rename)\n", stagedPath, installPath)
+	// ROLLBACK ON INSTALL FAILURE (lr-c69197 second fold-in, PEACHES nit 1):
+	// installBinary itself can fail AFTER backupInstalledBinary has already
+	// renamed the old binary away — os.Chmod on the staged file failing, or
+	// the replacing os.Rename failing partway (cross-device, permissions
+	// change mid-flight). Either leaves installPath stranded (absent, or
+	// still holding whatever a partial rename left) with the good binary
+	// sitting only at backupPath. This is the exact same "installPath is not
+	// in a state matching what documentation claims" class the verification
+	// rollback below closes — routed through the same restoreBackupOrReport
+	// so there is one restore path, not two that can drift.
+	if err := installBinary(stagedPath, installPath); err != nil {
+		return fmt.Errorf("install: %w", restoreBackupOrReport(err, backupPath, installPath, hasBackupHash, backupHash))
+	}
+
+	// READBACK (lr-c69197 MILLER item 2): installBinary's os.Rename returning
+	// nil means "the syscall succeeded", not "the binary that is now running
+	// is the one just staged". verifyInstalledBinary re-stats installPath —
+	// the exact path a running service execs — and compares it against what
+	// was staged, so a PASS here is falsifiable: if installPath does not
+	// exist, or its size/mode don't match the staged artifact, this is a
+	// hard error, not a silently-swallowed mismatch.
+	//
+	// ROLLBACK ON FAILURE (lr-c69197 fold-in): a verification failure here
+	// used to leave installPath holding whatever installBinary's rename just
+	// put there — the bad artifact, not the previously-working one, despite
+	// documentation elsewhere claiming the old binary was "untouched". It is
+	// restored from backupPath via the same restoreBackupOrReport used above
+	// (best-effort: if the restore itself fails, that failure is reported
+	// ALONGSIDE the verification failure, never in place of it — an operator
+	// needs to know both that verification failed AND whether the restore
+	// actually worked).
+	if err := verifyInstalledBinary(installPath, stagedInfo, stagedHash); err != nil {
+		return fmt.Errorf("install: post-install verification failed: %w",
+			restoreBackupOrReport(err, backupPath, installPath, hasBackupHash, backupHash))
+	}
+
+	// Re-stat installPath rather than reporting stagedInfo's pre-chmod mode
+	// (lr-c69197 second fold-in, PEACHES nit 3): stagedInfo was captured
+	// before installBinary's os.Chmod(0o755) ran, so it still carries the
+	// staged artifact's original (often 0o644, from `go build`'s default
+	// output mode) permission bits — logging it here claimed a mode that was
+	// never actually on disk at installPath. installedInfo reflects what
+	// verifyInstalledBinary itself just confirmed is really there.
+	installedInfo, statErr := os.Stat(installPath)
+	if statErr != nil {
+		// Unreachable in practice — verifyInstalledBinary above just
+		// successfully stat'd this exact path — but a stat failure here must
+		// still not silently fall back to the misleading pre-chmod value.
+		return fmt.Errorf("install: verified %s but a follow-up stat for the report line failed: %w",
+			installPath, statErr)
+	}
+	fmt.Fprintf(out, "update: verified %s on %s (size=%d bytes, mode=%s)\n",
+		installPath, hostname, installedInfo.Size(), installedInfo.Mode().Perm())
+	if crashWindowAdopted {
+		fmt.Fprintf(out, "update: RECOVERY COMPLETE: install succeeded after adopting the crash-window "+
+			"backup at %s — the previous update's interrupted run has been fully recovered from\n", backupPath)
+	}
+
+	// The backup has served its purpose once verification passes — remove it
+	// rather than leaving a stale ".bak" artifact sitting next to installPath
+	// forever. Best-effort: a removal failure here is a real problem (disk
+	// full, permissions) but must not turn an otherwise-successful update
+	// into a reported failure — it is logged, not returned.
+	if backupPath != "" {
+		if err := os.Remove(backupPath); err != nil {
+			fmt.Fprintf(out, "update: warning: verified install succeeded, but removing the backup at %s failed: %v (harmless leftover file, safe to delete by hand)\n", backupPath, err)
+		}
 	}
 	return nil
 }
@@ -466,6 +1000,270 @@ func restartSystemdService(serviceName string, scope systemdScope) error {
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("systemctl %s failed: %w\n%s", strings.Join(args, " "), err, output)
+	}
+	return nil
+}
+
+// systemctlShowArgs builds the argv for reading a unit property via
+// `systemctl show`, without the leading "systemctl" — mirrors
+// systemctlRestartArgs's split so the argument shape ("--user" ahead of
+// "show", "--property=" as one token, unit name always +".service") is
+// unit-testable without invoking systemctl.
+func systemctlShowArgs(serviceName string, scope systemdScope, property string) []string {
+	unit := serviceName + ".service"
+	args := []string{}
+	if scope == systemdScopeUser {
+		args = append(args, "--user")
+	}
+	args = append(args, "show", "--property="+property, "--value", unit)
+	return args
+}
+
+// systemdUnitSnapshot is a restart's before/after fingerprint (lr-c69197
+// MILLER item 2: "no systemctl is-active/ActiveEnterTimestamp comparison, no
+// PID delta"). All fields are read via `systemctl show`, not `systemctl
+// status` — show's --value output is a single stable machine-readable line
+// per property, not prose meant for a human terminal.
+//
+// GRANULARITY (lr-c69197 fifth fold-in, PEACHES nit): ActiveEnterTimestamp is
+// second-granular (systemd formats it as a locale string with no sub-second
+// component). A restart that completes within the same wall-clock second —
+// the common case for this daemon's own binary, well under a second to
+// re-exec — combined with PID reuse by the kernel, can leave BOTH
+// activeEnterTimestamp and mainPID byte-identical before/after despite the
+// unit having genuinely cycled, producing a FALSE "restart did not happen"
+// error from verifyRestartAdvanced. activeEnterTimestampMonotonic reads
+// ActiveEnterTimestampMonotonic instead/in addition — a microsecond-precision
+// CLOCK_MONOTONIC value with no formatting-imposed floor — so a same-second
+// restart still advances it. Both are captured and compared (not monotonic
+// alone) because the monotonic clock resets on reboot: after a host reboot,
+// a fresh comparison base is nil anyway (readSystemdUnitSnapshot's
+// before-snapshot only exists once the unit has started up before), but
+// keeping the wall-clock field too costs nothing and keeps the report line
+// human-readable.
+//
+// VERIFICATION CAVEAT: "ActiveEnterTimestampMonotonic" is systemd's
+// documented D-Bus/`systemctl show` unit property name for the monotonic
+// counterpart of ActiveEnterTimestamp (paired properties, same prefix
+// convention as e.g. InactiveExitTimestamp/InactiveExitTimestampMonotonic).
+// CONFIRMED (lr-c69197 sixth fold-in, MILLER diagnosis): verified against
+// systemd's own shipped D-Bus interface definition,
+// /usr/share/dbus-1/interfaces/org.freedesktop.systemd1.Unit.xml lines
+// 166-185 (systemd 255) — `<property name="ActiveEnterTimestampMonotonic"
+// type="t" access="read">`, type 't' = uint64, CLOCK_MONOTONIC microseconds
+// since boot — and corroborated against the compiled property vtable in the
+// running manager (libsystemd-core-255.so). `systemctl show`'s property
+// names are these D-Bus property names; nothing here is asserted from
+// naming convention alone any more. See readSystemdUnitSnapshot below for
+// the guard against a *different*, wrong property name reaching this code
+// path undetected in the future.
+type systemdUnitSnapshot struct {
+	activeEnterTimestamp          string
+	activeEnterTimestampMonotonic string
+	mainPID                       string
+	activeState                   string
+}
+
+// readSystemdUnitSnapshot reads ActiveEnterTimestamp,
+// ActiveEnterTimestampMonotonic, MainPID, and ActiveState for the named unit
+// at the given scope.
+//
+// CORRECTED (lr-c69197 fifth fold-in, PEACHES nit): this comment previously
+// claimed `systemctl show` fails/errors against a unit that has never been
+// started (first-ever restart before the unit exists in systemd's runtime
+// state). That is not how `systemctl show` behaves: it exits 0 and returns
+// empty property values for a valid-but-never-started (or nonexistent) unit
+// name — show reads whatever the manager currently knows about that unit
+// name, which for "never started" is simply empty fields, not a query
+// failure. The systemctlShowValue error path is real (it can still fail if
+// systemctl itself is missing from PATH, the manager is unreachable, or the
+// scope's session doesn't exist), but "the unit was never started" does not
+// reach it — that case instead returns a zero-value snapshot with empty
+// string fields, which verifyRestartAdvanced's beforeErr==nil-but-empty
+// comparison already treats correctly (an empty before-snapshot differs from
+// any real after-snapshot, so the "unchanged" false-failure this fifth
+// fold-in is otherwise about does not apply to first-ever starts). Kept as a
+// real (not dead) code path: callers still treat a non-nil error here as
+// "proceed anyway, this may be expected" rather than failing the whole
+// restart over it — that degrade-on-error behavior is meaningful for the
+// systemctl-itself-unreachable case, not just the never-started case this
+// comment used to (incorrectly) claim it covered.
+//
+// WHAT "NEVER STARTED" ACTUALLY LOOKS LIKE (lr-c69197 seventh fold-in,
+// MILLER adjudication — correcting the sixth fold-in's premise): the sixth
+// fold-in's comment here previously claimed a never-started unit leaves ALL
+// of ActiveEnterTimestamp/ActiveEnterTimestampMonotonic/MainPID empty
+// together, and treated any OTHER combination (some populated, some not) as
+// proof of a misspelled property name. That premise is false. MainPID is a
+// D-Bus type='u' (uint32, org.freedesktop.systemd1.Service.xml:455) and
+// ActiveEnterTimestamp/...Monotonic are both type='t' (uint64, Unit.xml:174,
+// 176) — D-Bus numeric types have no empty representation. A unit with no
+// running main process reports MainPID=0, a POPULATED value, not an empty
+// one; `systemctl show --value` prints the formatted number, it does not
+// omit the line. This holds for every observed unit lifecycle state
+// (oneshot after its process exits, failed, socket-activated, previously-
+// active-now-inactive — verified directly on-host against
+// systemd-remount-fs.service, claude-relay.service, and
+// systemd-random-seed.service, none of which ever produced an empty numeric
+// field). Line omission — and therefore an empty string from
+// systemctlShowValue's --value output — happens ONLY when `systemctl show`
+// is asked for a property name it does not recognize. There is no
+// legitimate unit state that produces a partially- or fully-empty snapshot
+// for these fields; empty is unconditionally a wrong-property-name signal.
+// See systemctlShowValue below for the resulting per-field check, which
+// replaced the sixth fold-in's cross-field validateSystemdUnitSnapshot.
+func readSystemdUnitSnapshot(serviceName string, scope systemdScope) (systemdUnitSnapshot, error) {
+	activeEnter, err := systemctlShowValue(serviceName, scope, "ActiveEnterTimestamp")
+	if err != nil {
+		return systemdUnitSnapshot{}, err
+	}
+	activeEnterMonotonic, err := systemctlShowValue(serviceName, scope, "ActiveEnterTimestampMonotonic")
+	if err != nil {
+		return systemdUnitSnapshot{}, err
+	}
+	mainPID, err := systemctlShowValue(serviceName, scope, "MainPID")
+	if err != nil {
+		return systemdUnitSnapshot{}, err
+	}
+	activeState, err := systemctlShowValue(serviceName, scope, "ActiveState")
+	if err != nil {
+		return systemdUnitSnapshot{}, err
+	}
+	return systemdUnitSnapshot{
+		activeEnterTimestamp:          activeEnter,
+		activeEnterTimestampMonotonic: activeEnterMonotonic,
+		mainPID:                       mainPID,
+		activeState:                   activeState,
+	}, nil
+}
+
+// systemctlShowValue runs `systemctl [--user] show --property=<property>
+// --value <unit>.service` and returns its trimmed stdout.
+//
+// PER-FIELD EMPTY CHECK (lr-c69197 seventh fold-in, MILLER adjudication,
+// replacing the sixth fold-in's validateSystemdUnitSnapshot): `systemctl
+// show --property=<unknown-name> --value` exits 0 with empty stdout for a
+// property systemd does not recognize — a misspelled property name is
+// otherwise silently indistinguishable from a real read. Unlike the
+// deleted cross-field guard, this needs no assumption about sibling
+// fields: every property this function is used for (ActiveEnterTimestamp,
+// ActiveEnterTimestampMonotonic, MainPID — all numeric D-Bus types with no
+// empty representation) is populated in every legitimate unit lifecycle
+// state, including "never started" (see readSystemdUnitSnapshot's doc
+// above), so empty stdout on a successful (exit 0) call is unconditionally
+// a wrong-property-name signal for those fields. ActiveState is the one
+// exception: it is a string enum (type='s', Unit.xml:145) that IS legitimately
+// non-empty for every state systemd tracks a unit in at all, so the same
+// "empty means wrong name" reasoning still applies to it too — there is no
+// unit systemd knows about with an empty ActiveState.
+func systemctlShowValue(serviceName string, scope systemdScope, property string) (string, error) {
+	args := systemctlShowArgs(serviceName, scope, property)
+	cmd := exec.Command("systemctl", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("systemctl %s failed: %w\n%s", strings.Join(args, " "), err, output)
+	}
+	value := strings.TrimSpace(string(output))
+	if value == "" {
+		return "", fmt.Errorf("systemctl %s succeeded but returned an empty value for property %q — "+
+			"this property has no legitimate empty state (numeric D-Bus types report 0, not empty; "+
+			"ActiveState is never unset for a unit systemd knows about), so an empty result means the "+
+			"property name is wrong, not that the unit has never started", strings.Join(args, " "), property)
+	}
+	return value, nil
+}
+
+// restartAndVerifySystemdService is restartSystemdService plus the readback
+// half of the restart step (lr-c69197 MILLER item 2): a `systemctl restart`
+// that exits 0 only means systemd accepted the request, not that the unit
+// actually cycled — restarting an already-stopped unit, or a unit whose
+// ExecStart silently no-ops, can both exit 0 without the daemon actually
+// having restarted. This captures the unit's ActiveEnterTimestamp and
+// MainPID before and after the restart call and requires at least one of
+// them to have changed; neither changing is treated as a restart that did
+// not restart, per the task's explicit acceptance criterion ("a restart
+// that did not restart must be an error, not a silent pass").
+//
+// The before-snapshot is best-effort: a unit that has never been started
+// (first-ever deploy) has no ActiveEnterTimestamp/MainPID to read yet, and
+// failing the whole restart over that would regress the pre-existing
+// first-install case. Only the after-snapshot is required to succeed — if
+// systemctl show cannot read the unit at all after a restart that itself
+// reported success, that is a real error worth surfacing.
+func restartAndVerifySystemdService(serviceName string, scope systemdScope, out *os.File) error {
+	before, beforeErr := readSystemdUnitSnapshot(serviceName, scope)
+	if beforeErr != nil {
+		fmt.Fprintf(out, "update: could not read pre-restart unit state for %s.service (%v) — "+
+			"proceeding, this is expected on a first-ever start\n", serviceName, beforeErr)
+	}
+
+	if err := restartSystemdService(serviceName, scope); err != nil {
+		return err
+	}
+
+	after, err := readSystemdUnitSnapshot(serviceName, scope)
+	if err != nil {
+		return fmt.Errorf("restart reported success but post-restart unit state could not be read: %w "+
+			"(a PASS that cannot confirm the unit is actually running is not a PASS)", err)
+	}
+
+	if err := verifyRestartAdvanced(serviceName, before, beforeErr, after); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(out, "update: verified restart of %s.service (ActiveEnterTimestamp=%s, MainPID=%s, ActiveState=%s)\n",
+		serviceName, after.activeEnterTimestamp, after.mainPID, after.activeState)
+	return nil
+}
+
+// verifyRestartAdvanced is the pure comparison at the heart of the restart
+// readback, split out from restartAndVerifySystemdService so it is
+// unit-testable with synthetic before/after snapshots — no systemctl or
+// systemd session required. Per the task's explicit acceptance criterion
+// ("a restart that did not restart must be an error, not a silent pass"):
+// when a pre-restart snapshot was successfully read (beforeErr == nil) and
+// the full snapshot (ActiveEnterTimestamp, ActiveEnterTimestampMonotonic, and
+// MainPID together) is byte-identical after the restart call reported
+// success, that is treated as the unit never having actually cycled,
+// regardless of the "systemctl restart" exit code. beforeErr != nil (no
+// pre-restart snapshot available — first-ever start) always passes this
+// check; there is nothing to compare against.
+//
+// FAST-RESTART CORRECTNESS (lr-c69197 fifth fold-in): comparing the whole
+// struct (not just ActiveEnterTimestamp+MainPID) matters specifically
+// because ActiveEnterTimestamp alone is second-granular — a restart
+// completing within the same wall-clock second, combined with the kernel
+// reusing the previous PID, would leave the old two-field comparison
+// byte-identical despite a genuine restart, misreporting it as a failure.
+// activeEnterTimestampMonotonic carries microsecond precision and has no
+// such same-second collision floor, so it still differs even when the
+// wall-clock field and PID do not.
+//
+// ACTIVESTATE REQUIREMENT (lr-c69197 seventh fold-in, PEACHES finding,
+// MILLER-confirmed): a snapshot delta alone is not sufficient. A restart can
+// advance ActiveEnterTimestampMonotonic AND MainPID and then have the unit
+// die immediately afterward — demonstrated on-host via claude-relay.service,
+// whose timestamps/PID advanced at a restart attempt and whose unit was
+// `failed` three seconds later. That sequence passes the delta check above
+// (before != after) while reporting a restart that did NOT end with the
+// service running, which is the same false-PASS class as the defect this
+// whole readback exists to close. ActiveState is a D-Bus type='s' string
+// enum (Unit.xml:145) — unlike the numeric fields above, an empty value
+// here (already rejected by systemctlShowValue) is the wrong-name signal,
+// and "failed"/"inactive"/etc. are legitimate-but-unwanted values to reject
+// on their own terms, not by absence.
+func verifyRestartAdvanced(serviceName string, before systemdUnitSnapshot, beforeErr error, after systemdUnitSnapshot) error {
+	if beforeErr == nil && before == after {
+		return fmt.Errorf("restart of %s.service reported success but the unit's ActiveEnterTimestamp (%s), "+
+			"ActiveEnterTimestampMonotonic (%s), MainPID (%s), and ActiveState (%s) are all unchanged from "+
+			"before the restart — the service was not actually restarted",
+			serviceName, after.activeEnterTimestamp, after.activeEnterTimestampMonotonic, after.mainPID, after.activeState)
+	}
+	if after.activeState != "active" {
+		return fmt.Errorf("restart of %s.service advanced the unit's snapshot (ActiveEnterTimestamp=%s, "+
+			"ActiveEnterTimestampMonotonic=%s, MainPID=%s) but its post-restart ActiveState is %q, not "+
+			"\"active\" — the unit cycled but did not end up running", serviceName,
+			after.activeEnterTimestamp, after.activeEnterTimestampMonotonic, after.mainPID, after.activeState)
 	}
 	return nil
 }

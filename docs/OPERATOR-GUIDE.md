@@ -246,6 +246,160 @@ restarts the service. It reuses the same config file `serve` uses (no
 second config surface); every setting is optional and defaults to a stock
 systemd install:
 
+**Every mutating step is verified after it runs, not just assumed to have
+succeeded on exit code 0 (lr-c69197).** After install, `update` re-stats
+`install_path` — the exact path the running service execs from — and
+compares it against the artifact it just built: size, EXACT permission mode
+(`0o755` — lr-c69197 eighth fold-in tightened this from "any execute bit
+set" to the precise value `installBinary` always chmods to; a `0o777`
+world-writable binary used to pass), AND (lr-c69197 fifth fold-in) a SHA-256
+content hash of the staged artifact, computed before the install rename and
+compared against a hash of `install_path` after it. Size+mode alone would
+pass a same-size WRONG artifact; the content hash is what makes "verified"
+mean the actual bytes match, not just the size class. A missing or
+mismatched file is a hard error, never a silent pass. After restart, it
+compares the unit's
+`ActiveEnterTimestamp`, `ActiveEnterTimestampMonotonic`, and `MainPID` (via
+`systemctl show`) before and after the restart call; a restart that reports
+success but left all three unchanged (the unit did not actually cycle) is
+also a hard error. The monotonic timestamp (fifth fold-in) is what makes
+this reliable for a fast restart: `ActiveEnterTimestamp` alone is
+second-granular, so a restart completing within the same wall-clock second
+combined with the kernel reusing the previous PID could otherwise
+false-report a genuine restart as a failure. The final report line names
+the hostname, the resolved `install_path`, and the resolved unit+scope
+actually acted on, so a PASS is falsifiable against those facts rather than
+an echo of pre-action intent.
+
+**Post-install verification failure, and an installBinary failure itself,
+both roll back the binary — neither merely fails loudly (lr-c69197
+fold-in, extended by a second fold-in).** `installBinary`'s atomic rename
+already replaces `install_path` with the newly built artifact BEFORE
+verification runs, so a verification failure at that point does not find
+`install_path` "untouched" — it finds the new (bad) binary sitting there.
+`update` backs up the previous binary to `install_path.bak` immediately
+before the replacing rename, and restores it from that backup if either (a)
+`installBinary` itself fails (e.g. the chmod or the rename fails partway,
+after the backup already moved the old binary aside) or (b) verification
+fails — both cases leave `install_path` in a state a rollback is needed for,
+and both are restored via the exact same code path
+(`restoreBackupOrReport` in `cmd/clagentic-router/update.go`) rather than
+two parallel restore implementations that could drift out of sync. Either
+way `install_path` ends up back at its pre-update contents rather than left
+holding a bad or half-written artifact. This is a real restore, not a
+no-op — see `cmd/clagentic-router/update.go`'s `installAndVerifyWithRollback`
+for the implementation and its failure-path error text (which also names
+whether the restore itself succeeded). The service is deliberately **not**
+restarted after a rollback (see "Keeping a user-scope host current
+automatically" below for why), so the already-running process is
+unaffected either way — this only concerns what is on disk at
+`install_path` for the next successful update or manual restart to pick up.
+
+**The restore rename itself is verified after it runs, not merely assumed
+to have worked (lr-c69197 eighth fold-in, BOBBIE bobbie.uncat.1).** Earlier
+fold-ins verified the FORWARD install path (`installBinary` ->
+`verifyInstalledBinary`) with size, exact mode, and a content hash, but the
+ROLLBACK path (`restoreBackupOrReport`'s `os.Rename(backupPath,
+installPath)`) had no readback at all — a `.bak` of unknown provenance
+could be renamed into `install_path` and become the executable the service
+runs, unverified. `restoreBackupOrReport` now calls `verifyRestoredBinary`
+after every restore rename, and the depth of that check depends on whether
+a genuine pre-image hash is available:
+
+- **Normal rollback** (`install_path` existed and this run backed it up
+  itself — `backupInstalledBinary` hashes the file immediately BEFORE
+  renaming it to `.bak`, the same before-the-rename-not-after discipline
+  `verifyInstalledBinary` already uses on the forward path): the restore is
+  verified fully — exact mode (`install_path`'s permission bits must equal
+  `installedBinaryMode`, 0o755, exactly the same requirement the forward
+  path now enforces — see the exact-mode note above) AND a SHA-256 content
+  hash against that genuine pre-image. A mismatch here means the restore
+  rename did not bring back the binary that was actually backed up.
+- **Crash-window-adopted `.bak`** (the state documented below where
+  `install_path` was absent and a pre-existing `.bak` was adopted as this
+  run's rollback source): `update` never observed this file's content
+  being written, so there is no honest pre-image hash to compare against —
+  fabricating one would be worse than not checking at all. What IS checked:
+  exact mode and non-emptiness. The content gap is not silently skipped —
+  a verification "failure" for this path is reported as the restored
+  binary's **content could not be verified against a known-good hash**,
+  naming the crash-window-adoption explicitly, so an operator has a clear
+  signal to compare the restored binary against a known-good build by hand
+  rather than trusting it blindly.
+
+**A post-restore verification failure never deletes or further renames
+`install_path`.** Both `restoreBackupOrReport` and `verifyRestoredBinary`
+are already on a failure path when this check runs (there is always an
+`originalErr` from the install/verify step that triggered the rollback in
+the first place) — turning a recoverable "the restored binary looks wrong,
+inspect it by hand" into an unrecoverable "and then `update` deleted the
+only remaining binary on the box trying to fix it" would be strictly worse.
+`install_path` is left exactly as the restore rename produced it, and the
+verification failure is reported ALONGSIDE the original error, so an
+operator always has something on disk to inspect.
+
+**`backupInstalledBinary` disambiguates three states on entry, not two
+(lr-c69197 fourth fold-in, PEACHES comment 5373781420) — whether
+`install_path` exists and whether `install_path.bak` exists are checked
+independently, and each of the four combinations that matters gets its own
+behavior:**
+
+1. **Neither `install_path` nor `.bak` present** — genuine first-ever
+   install. Nothing to back up, nothing to roll back to; `update` proceeds.
+2. **`install_path` present, `.bak` present** — a stale backup from a
+   previous interrupted run (killed, host rebooted, OOM-killed) between the
+   backup rename and the later cleanup/restore rename that would normally
+   have consumed it. `backupInstalledBinary` refuses to proceed with a NEW
+   backup here — it does not clobber the stale file (it may be the only
+   known-good binary left to roll back to) and it does not fail every future
+   update forever either (both files are left exactly as found, so removing
+   the stale `.bak` by hand, or restoring it manually if it turns out to be
+   the good binary, unblocks the very next run). See the troubleshooting
+   table below for the exact error text and the by-hand resolution.
+3. **`install_path` ABSENT, `.bak` present — the crash window described
+   below — now self-recovers, LOUDLY (lr-c69197 fifth fold-in, BOBBIE comment
+   5373968195).** `backupInstalledBinary`'s rename-away and `installBinary`'s
+   replacing rename are two separate syscalls, not one atomic operation; a
+   crash between them leaves exactly this state. `install_path.bak` is
+   unambiguously the only candidate good binary on the box in this state
+   (there is no existing `install_path` to protect from being clobbered,
+   unlike case 2), so `update` treats it as the backup for this run: a
+   subsequent `installBinary` failure restores from it (the operator sees a
+   restore confirmation naming this `.bak`, not "no previous binary existed
+   to roll back to" — the false claim a prior version of this logic made;
+   see "The restore rename itself is verified..." above for why this
+   specific restore is reported as content-UNVERIFIED rather than an
+   unqualified "restored" — there is no pre-image hash for an adopted
+   `.bak`), and a subsequent successful install/verify consumes it via the
+   same cleanup as
+   any other run, so it does not survive to wedge the *next* update against
+   case 2's refusal. No operator action is required to recover from this
+   state — the next `update` run does it automatically. This adoption is
+   never silent: `update` logs an explicit `RECOVERY:` line naming
+   `install_path` and the adopted backup path the moment it is detected, and
+   (on a successful recovery) a `RECOVERY COMPLETE:` line in the final
+   report — the capability delta of adopting an unknown `.bak` is nil
+   (anyone able to write `.bak` could already write `install_path` directly),
+   but running unattended hourly under the self-update timer means an
+   operator needs to be able to SEE that a recovery adoption happened, not
+   just that it worked.
+4. **A `stat` failure on either path that isn't "does not exist"**
+   (permissions, I/O error) — hard error naming which path and why, same as
+   any other pre-install error.
+
+**Known, narrower availability gap, not closed here (BOBBIE, lr-c69197
+second fold-in):** the crash window itself (case 3 above) is not made
+atomic — `backupInstalledBinary`'s rename-away and `installBinary`'s
+replacing rename remain two separate syscalls, so there is still a real
+(if narrow) window where nothing execs from `install_path` at all if the
+process dies between them. BOBBIE classified this as an availability gap,
+not a security exposure. What lr-c69197's fourth fold-in closes is only the
+*consequence* that used to follow a crash in this window (a permanently
+wedged host requiring manual intervention) — the update mechanism now
+self-recovers on its next run rather than needing an operator. Making the
+window itself atomic would need a different mechanism entirely (e.g. a
+symlink swap) and remains out of scope here.
+
 ```yaml
 deploy:
   source_dir: ""                                   # default: a managed checkout (see below); set explicitly to opt out
@@ -323,6 +477,109 @@ so all *other* host-specific detail (install path, unit name, checkout
 location for the deployed-host case) lives in `router.yaml`'s `deploy:`
 block, not in the committed post-merge step.
 
+### Keeping a user-scope host current automatically (lr-c69197)
+
+`clagentic-router update` (above) makes a redeploy a single command, but
+something still has to run that command after each merge. For the crew's
+own host this happens automatically as a post-merge step; for an
+operator-owned `systemd --user` workstation (see "Systemd, user scope"
+above) it does not — the crew's post-merge automation runs entirely on the
+crew's own host with no transport, credential, or agent reaching any
+operator machine, so a merge landing on `main` has no path to that host at
+all. This is a known, permanent architectural boundary, not a bug to be
+closed by adding a remote-exec transport (see `deploy/clagentic-router-update.user.timer`'s
+own comment for the full "why pull, not push" rationale).
+
+**Opt-in, pull-based self-update:** two systemd `--user` unit templates —
+[`deploy/clagentic-router-update.user.service`](../deploy/clagentic-router-update.user.service)
+(a oneshot that runs `clagentic-router update` against your own
+`router.yaml`) and
+[`deploy/clagentic-router-update.user.timer`](../deploy/clagentic-router-update.user.timer)
+(activates it on a schedule) — let a `systemd --user` host keep itself
+current without any push mechanism. Neither is installed or enabled by
+anything in this repo automatically; you opt in explicitly:
+
+```bash
+# Assumes you already completed "Systemd, user scope" above (the long-running
+# clagentic-router.service is installed and your router.yaml has a [deploy]
+# block with service_manager: systemd-user).
+
+# 1. Install both units
+cp deploy/clagentic-router-update.user.service ~/.config/systemd/user/clagentic-router-update.service
+cp deploy/clagentic-router-update.user.timer ~/.config/systemd/user/clagentic-router-update.timer
+systemctl --user daemon-reload
+
+# 2. Set deploy.repo_url in router.yaml if it is not already set — the
+#    managed-checkout clone path (see "Where does the source come from?"
+#    above) requires it on a host with no pre-existing source checkout.
+
+# 3. Enable the TIMER (not the service — the service has no [Install]
+#    section and is only ever activated by the timer)
+systemctl --user enable --now clagentic-router-update.timer
+
+# 4. Check it
+systemctl --user list-timers clagentic-router-update.timer
+journalctl --user -u clagentic-router-update    # after it has fired at least once
+```
+
+**Design decisions, stated explicitly:**
+
+- **How staleness is detected without a full rebuild every interval:** it
+  isn't, today — every timer activation runs the real `update` path, which
+  itself fetches/pulls the managed checkout first (cheap, network-bound —
+  git reports "already up to date" when there is nothing new) and then
+  rebuilds. This repo's discovery doctrine (see the top-level CLAUDE.md,
+  "Discover, don't hardcode — but only what you can actually verify by
+  calling it") rules out inventing a lightweight remote "is there a new
+  build" check against an endpoint nothing here has ever called. A real
+  optimization — compare the checkout's post-pull HEAD against the
+  *installed* binary's own reported revision (`GET /version` or
+  `clagentic-router version`, both linkable since lr-92ee18) before
+  deciding whether to build at all — is a concrete, scoped follow-up, not
+  implemented here.
+- **What happens on failure:** the paired `.service` unit is a plain
+  `oneshot` with no `Restart=` of its own — a failed run (pull rejected,
+  build failure, a failed post-install verification, or a failed
+  restart readback, see "Redeploying" above) waits for the timer's next
+  scheduled activation rather than retrying in a tight loop. What ends up
+  on disk at `install_path` differs by which step failed: a build failure
+  never touches it at all; a post-install verification failure rolls the
+  previous binary back onto it (a real restore — see "Redeploying" above's
+  "Post-install verification failure rolls back the binary" paragraph, not
+  merely "was never touched"). **A restart failure is different and is NOT
+  safe** (MILLER, lr-c69197 seventh fold-in): `systemctl restart` is
+  stop-then-start, not an atomic swap — if the stop half succeeds and the
+  start half fails, the unit ends in `failed` with **no process running at
+  all**; the previously-running process was already killed by the stop half
+  and is not "left alone". install_path holds the newly-installed,
+  already-verified binary, but the service is down, not degraded, until the
+  next timer activation — up to `OnUnitActiveSec` + `RandomizedDelaySec`
+  later (see "Interval and jitter" below), since `Restart=` is deliberately
+  unset. For the build-failure and post-install-verification-failure cases
+  above, the **running process itself** genuinely is left alone — `update`
+  never kills or restarts the service before verification passes — so those
+  two failure modes never hand control to a half-built or unverified binary.
+  Only the restart-failure case ends with the service down. Check
+  `journalctl --user -u clagentic-router-update` after a failure.
+- **Interval and jitter:** `OnUnitActiveSec=1h` with `RandomizedDelaySec=10m`
+  — frequent enough that a merged fix does not sit unpropagated for an
+  extended period with no signal (the incident this mechanism exists to
+  close), infrequent enough that a failed run's next attempt is not itself
+  a thrashing loop. Both are plain systemd timer directives — edit your
+  installed copy if a different cadence fits your host.
+- **Opt-in, not default:** neither unit's install step above happens as a
+  side effect of anything else in this repo — an operator who has not run
+  the install sequence above gets no self-update behavior at all, exactly
+  as before this change.
+
+**Known remaining gap (explicitly out of scope for this mechanism):**
+`clagentic-loadout`'s `post_merge.py` PASS log line names only `cwd`, never
+the hostname it actually ran on — a separate repo's fix, tracked
+independently, not addressed by the pull-based mechanism above (which
+solves a different problem: reaching a host post_merge_steps has no path
+to at all, not improving what post_merge_steps itself reports about the
+host it does reach).
+
 ### Docker (API-only mode)
 
 ```bash
@@ -362,6 +619,16 @@ backend, before tagging a release, and after deploying a new binary.
 | `systemd --user` deployment: service is `active (running)`, but a `claude_cli` backend never responds, `GET /health` reports `status` other than `"ok"` with that backend in `unresolved_binaries`, and the startup log has an ERROR-level `binary not found at startup name=claude` line | A `systemd --user` unit inherits a minimal `PATH` lacking `~/.local/bin`, where `claude` installs | "Systemd, user scope" above — the shipped user template sets `PATH` including `%h/.local/bin`; if you wrote your own unit instead of copying the template, add that |
 | `update` reports `restart: systemctl restart ... failed` (note: NO `--user` in the command text) on a host that is actually running the unit at user scope | `deploy.service_manager` is still `systemd` (system scope) even though the unit was installed under `~/.config/systemd/user/` — `update` is issuing a system-scope `systemctl restart`, which cannot see a user-scope unit at all | Set `deploy.service_manager: systemd-user` in `router.yaml` |
 | `update` reports `restart: systemctl --user restart ... failed` (command text DOES include `--user`) | `deploy.service_manager` is correctly `systemd-user`, but the per-user systemd manager instance isn't reachable (e.g. no active login session and `loginctl enable-linger` not set) | Run `loginctl enable-linger "$USER"`; confirm with `systemctl --user status` |
+| `update` reports `install: post-install verification failed: ... stat failed ... (previous binary restored from ...)` | The binary was staged and renamed, but nothing now exists at `install_path` — a mount, permissions change, or a concurrent process removed it between rename and readback. `update` rolled the previous binary back onto `install_path` before returning (see "Redeploying" above's rollback paragraph), so `install_path` should hold the pre-update binary, not be empty | Check `install_path` exists and is writable by the user `update` runs as; re-run `update` |
+| `update` reports `install: post-install verification failed: ... size mismatch ... (previous binary restored from ...)` | Something other than the artifact `update` just built ended up at `install_path` (leftover from another process, or an unrelated file at that path). `update` rolled the previous binary back onto `install_path` before returning | Verify `deploy.install_path` points at the path your service actually execs; remove/replace the stray file |
+| `update` reports `install: post-install verification failed: ... DIFFERENT content hash ... (previous binary restored from ...)` | The installed file at `install_path` matched the freshly built artifact's size and mode but not its content (lr-c69197 fifth fold-in content-hash check) — a same-size wrong artifact, or a concurrent process wrote something else to `install_path` between rename and readback. `update` rolled the previous binary back onto `install_path` before returning | Verify `deploy.install_path` points at the path your service actually execs; check for another process writing to that path concurrently; re-run `update` |
+| `update` reports `install: post-install verification failed: ...; additionally, restoring the previous binary from ... FAILED` | Both the new build failed verification AND the rollback itself could not rename the backup back into place (e.g. `install_path.bak` was itself removed or made unwritable between backup and restore) — `install_path` is left in an unknown state, not guaranteed to hold either binary | Manually inspect `install_path` and `install_path.bak` (if it still exists) and restore by hand; this is the one failure path `update`'s rollback cannot self-heal |
+| `update` reports `... POST-RESTORE VERIFICATION FAILED: restored binary at ... has mode ..., want exactly ...` | The restore rename (`install_path.bak` → `install_path`) completed, but the resulting file's permission bits are not exactly `0o755` (lr-c69197 eighth fold-in restore-mode check) — either a tampered/corrupted `.bak`, or (for a crash-window-adopted `.bak`) a backup that never had the mode `installBinary` normally sets | `install_path` is left exactly as the restore rename produced it — inspect it and `install_path.bak`'s history by hand; if the content is otherwise trustworthy, `chmod 0755 install_path` and re-run `update` to re-verify |
+| `update` reports `... POST-RESTORE VERIFICATION FAILED: restored binary at ... its CONTENT COULD NOT BE VERIFIED against a known-good hash ... this was a crash-window-adopted backup` | This is the honest, expected report for a restore that used a crash-window-adopted `.bak` (see case 3 below) — `update` never observed that `.bak`'s content being written, so it has no pre-image hash to compare the restored file against; mode and non-emptiness were still checked and passed | Not necessarily a failure — inspect `install_path` by hand against a known-good build of the router before trusting it; if it looks right, no further action is needed |
+| `update` reports `restart: ... was not actually restarted` | `systemctl restart` exited 0, but the unit's `ActiveEnterTimestamp`/`ActiveEnterTimestampMonotonic`/`MainPID` did not change — the unit did not actually cycle (e.g. `ExecStart` no-op, or the wrong unit was targeted) | Confirm `deploy.service_name`/`deploy.service_manager` name the unit that's actually running; check `systemctl [--user] status <unit>` by hand |
+| `update` reports `install: back up previous binary before replacing it: refusing to back up ... a stale backup already exists at install_path.bak` | A previous `update` run was interrupted (killed, host rebooted, OOM) between backing up the old binary and consuming that backup — `install_path.bak` from that run is still there. `update` refuses to touch either file rather than guessing which one is good | Inspect `install_path` and `install_path.bak` by hand. If `install_path.bak` is safe to discard (the current `install_path` is known good), remove it and re-run `update`. If `install_path.bak` looks like the good binary and `install_path` does not, restore it manually (`mv install_path.bak install_path`) |
+| `update` reports `update: RECOVERY: install_path ... was absent but a pre-existing backup was found at ...` | This is not a failure — it is the loud crash-window adoption notice (lr-c69197 fifth fold-in): a prior `update` run was interrupted after backing up `install_path` but before completing the replace, and this run is adopting the pre-existing `.bak` as its rollback source. Look for a following `update: RECOVERY COMPLETE: ...` line confirming the recovery finished | No action needed if `RECOVERY COMPLETE` follows; if the run then fails, follow the failure's own error text (the recovered `.bak` is still available as a rollback source, and any subsequent restore from it will be reported as content-unverified — see the row above) |
+| `install_path` is missing entirely and only `install_path.bak` exists (no `update` error was necessarily reported for this run — it may show up as `binary not found` / the service failing to start) | The backup rename (`install_path` → `install_path.bak`) completed but a prior `update` was killed before the replacing rename (`install_path.new` → `install_path`) landed a new binary — these are two separate syscalls, not one atomic operation (known, accepted gap, see "Redeploying" above). `backupInstalledBinary` recognizes this exact state and treats the existing `.bak` as this run's backup (lr-c69197 fourth fold-in) | **No manual action needed** — just re-run `update`. It self-recovers: on success the pending `.bak` is consumed/removed automatically; on a subsequent install failure, it restores from that `.bak` (reported as content-unverified — see the CONTENT COULD NOT BE VERIFIED row above), not "no previous binary existed to roll back to". Only intervene by hand (`mv install_path.bak install_path`) if you need the service running again *before* the next `update` run completes |
 
 ### Client token resolution (lr-92ee18 B3)
 
