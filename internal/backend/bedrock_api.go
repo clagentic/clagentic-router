@@ -291,15 +291,57 @@ func bedrockToolUseBlockToToolUse(b types.ToolUseBlock) ToolUse {
 	return tu
 }
 
+// modelIDValidationMarkers are substrings AWS's ValidationException message
+// uses specifically for an unrecognized/malformed model identifier (as
+// opposed to any other Converse API validation failure — e.g. a missing
+// required field, an oversized payload, or an invalid parameter value,
+// none of which are a model-configuration fault). Checked case-sensitively
+// against the exact AWS wording; matching is deliberately narrow (word
+// "model" plus one of the id-specific complaints) rather than reclassifying
+// every ValidationException, since most validation failures are genuine
+// request-shape bugs, not a misconfigured model string (lr-2f35bd, B5).
+var modelIDValidationMarkers = []string{
+	"model identifier is invalid",
+	"model id",
+	"could not find model",
+	"is not a valid model",
+	"invalid model",
+}
+
+// isModelIDValidationError reports whether a Bedrock ValidationException's
+// message describes an unrecognized/malformed model identifier specifically
+// — the Bedrock analogue of claude CLI's "provided model identifier is
+// invalid" 400 (see B5's claude_cli-side fix in claude_cli.go's
+// errorTextFromStreamJSON/parseStreamJSON init-frame skip). nil Message
+// (never observed live, but the SDK types it as a pointer) falls through to
+// false — the generic ErrTypeSchema classification, not a guessed
+// model-config fault.
+func isModelIDValidationError(v *types.ValidationException) bool {
+	if v == nil || v.Message == nil {
+		return false
+	}
+	lower := strings.ToLower(*v.Message)
+	for _, marker := range modelIDValidationMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // classifyBedrockError maps typed Bedrock Runtime SDK errors onto the
 // router's existing ErrorType taxonomy using errors.As, never string
-// matching. The router's ErrorType enum (backend/adapter.go) has no
-// separate "downstream" or "validation" category, so the Bedrock-specific
-// taxonomy in the task brief is folded onto the closest existing type:
+// matching on the error's own Error() text — the one exception being
+// isModelIDValidationError above, which narrows ValidationException by its
+// typed Message field, not by re-parsing err.Error(). The router's
+// ErrorType enum (backend/adapter.go) has no separate "downstream" or
+// "validation" category, so the Bedrock-specific taxonomy in the task brief
+// is folded onto the closest existing type:
 //
-//	ThrottlingException, ModelNotReadyException   -> ErrTypeRateLimit (throttled)
-//	AccessDeniedException                         -> ErrTypeAuth
-//	ValidationException, ResourceNotFoundException -> ErrTypeSchema (bad request)
+//	ThrottlingException, ModelNotReadyException    -> ErrTypeRateLimit (throttled)
+//	AccessDeniedException                          -> ErrTypeAuth
+//	ValidationException (model-id specifically)    -> ErrTypeModelConfig (lr-2f35bd, B5)
+//	ValidationException (other), ResourceNotFoundException -> ErrTypeSchema (bad request)
 //	ModelTimeoutException                          -> ErrTypeTimeout
 //	ModelErrorException, InternalServerException,
 //	ServiceUnavailableException                    -> ErrTypeNetwork (retriable
@@ -325,6 +367,9 @@ func classifyBedrockError(err error) ErrorType {
 	}
 	var validation *types.ValidationException
 	if errors.As(err, &validation) {
+		if isModelIDValidationError(validation) {
+			return ErrTypeModelConfig
+		}
 		return ErrTypeSchema
 	}
 	var notFound *types.ResourceNotFoundException
