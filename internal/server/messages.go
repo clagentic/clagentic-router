@@ -33,6 +33,7 @@ import (
 
 	"github.com/clagentic/clagentic-router/internal/backend"
 	"github.com/clagentic/clagentic-router/internal/router"
+	"github.com/clagentic/clagentic-router/internal/state"
 )
 
 // --- Anthropic Messages API wire types (request/response subset) ---
@@ -229,10 +230,26 @@ func writeAnthropicError(w http.ResponseWriter, status int, message string) {
 // writeAnthropicChainExhaustedError writes the 503 chain-exhaustion response,
 // additionally carrying lastErrorType when known (empty = omitted). See
 // anthropicMsgError.LastErrorType's doc for the redaction contract this reuses.
+//
+// error.type is NOT always the blanket status-based "overloaded_error"
+// (lr-2f35bd, B5): a chain exhausted because every candidate backend is
+// offline for a locally misconfigured model identifier
+// (state.ErrTypeModelConfig) is a permanent local config fault, not
+// transient capacity exhaustion — reporting it as overloaded_error reads as
+// "retry later," which is actively misleading (no retry or backoff fixes a
+// bad model string; see backend.ErrTypeModelConfig's doc). That one case is
+// reported as invalid_request_error instead — the closest Anthropic
+// taxonomy entry for "the request names something the provider does not
+// recognize" — every other lastErrorType keeps the existing
+// status-based overloaded_error mapping unchanged.
 func writeAnthropicChainExhaustedError(w http.ResponseWriter, lastErrorType string) {
 	var resp anthropicMsgError
 	resp.Type = "error"
-	resp.Error.Type = anthropicErrorTypeForStatus(http.StatusServiceUnavailable)
+	if lastErrorType == string(state.ErrTypeModelConfig) {
+		resp.Error.Type = "invalid_request_error"
+	} else {
+		resp.Error.Type = anthropicErrorTypeForStatus(http.StatusServiceUnavailable)
+	}
 	resp.Error.Message = "no available backends in chain"
 	resp.Error.LastErrorType = lastErrorType
 	writeJSON(w, http.StatusServiceUnavailable, resp)
