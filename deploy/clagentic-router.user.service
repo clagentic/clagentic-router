@@ -59,13 +59,18 @@ ExecStart=%h/.local/bin/clagentic-router serve --config %h/.config/clagentic/rou
 # PATH: a systemd --user unit inherits a minimal PATH (typically
 # /usr/bin:/bin) that does NOT include %h/.local/bin, where `claude`
 # (and other user-installed CLIs, e.g. via npm/pipx --user installs)
-# commonly live. Verified live: without this, the daemon logged 3x
-# "binary not found at startup name=claude" at WARN on startup, the
-# service stayed "active (running)", GET /health reported "ok", and
-# every claude_cli-backed chain silently fell through to whatever
-# backend came next (here, codex in /usr/bin) — nothing about the
-# service's own status surfaced the missing binary. Prepending
-# %h/.local/bin closes that.
+# commonly live. Verified live (pre-lr-92ee18 B2 fix): without this, the
+# daemon logged 3x "binary not found at startup name=claude" at WARN on
+# startup, the service stayed "active (running)", GET /health reported
+# "ok", and every claude_cli-backed chain silently fell through to
+# whatever backend came next (here, codex in /usr/bin) — nothing about
+# the service's own status surfaced the missing binary. As of lr-92ee18
+# (internal/backend/binpath.go, internal/server/handlers.go) that log
+# line is ERROR-level and GET /health reports a non-"ok" status with the
+# backend listed in unresolved_binaries — but the chain still silently
+# falls through to the next configured backend either way, so the PATH
+# fix below remains necessary regardless of log level or /health status.
+# Prepending %h/.local/bin closes the underlying gap.
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 # State directory — see the "WHY StateDirectory= ALONE IS NOT ENOUGH" note
