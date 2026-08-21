@@ -9,6 +9,7 @@ package backend
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -281,6 +282,22 @@ const (
 	// lets an operator raise max_turns for that backend instead of chasing
 	// an auth/network red herring.
 	ErrTypeMaxTurns ErrorType = "max_turns"
+
+	// ErrTypeModelConfig marks a failure whose root cause is a locally
+	// misconfigured model identifier — the configured model string is one
+	// the provider/endpoint does not recognize (claude CLI's "provided model
+	// identifier is invalid" 400, or Bedrock's ValidationException for an
+	// unrecognized model id) — not a transient capacity or auth problem
+	// (lr-2f35bd, folded-in defect B5). This is deliberately distinct from
+	// ErrTypeRateLimit/ErrTypeUnknown: no probe interval, retry, or backoff
+	// makes an invalid model name valid, so a chain exhausted for this
+	// reason must never surface as capacity exhaustion (overloaded_error) —
+	// that reading sends an operator chasing a transient-capacity red
+	// herring for a fault that requires editing router.yaml. See
+	// state.BackendState.RecordFailure's ErrTypeModelConfig case for the
+	// sticky (never-auto-recovered) state-machine transition this type
+	// drives.
+	ErrTypeModelConfig ErrorType = "model_config"
 )
 
 // InvokeError is returned by adapters when invocation fails.
@@ -392,6 +409,44 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// IsContextDeadlineKill reports whether a subprocess failure was caused by
+// its own invocation context's deadline elapsing — i.e. exec.CommandContext
+// killed the subprocess because ctx timed out, not because the subprocess
+// exited on its own for an unrelated reason (lr-2f35bd).
+//
+// Callers pass the SAME ctx given to exec.CommandContext and the error
+// cmd.Run() returned. Checked via errors.Is(ctx.Err(), context.DeadlineExceeded)
+// — NOT errors.Is(err, context.DeadlineExceeded) on the Run() error itself.
+// Verified empirically against this repo's pinned Go toolchain (go.mod) that
+// a CommandContext-killed process's Run() error is the bare *exec.ExitError
+// / "signal: killed" — it does not wrap context.DeadlineExceeded, so
+// errors.Is on Run()'s error is always false for this case. ctx.Err() is the
+// reliable signal instead: exec.CommandContext's documented contract kills
+// the process when ctx is done, and by the time Run() returns, ctx.Err() is
+// already populated with the reason (context.DeadlineExceeded for a timeout,
+// context.Canceled for an explicit cancellation) — independent of whatever
+// shape cmd.Run()'s own returned error takes on a given OS/Go version.
+//
+// err == nil (the call actually succeeded) always returns false — a
+// deadline that fired after the subprocess had already exited successfully
+// is not this function's concern; ctx.Err() can still be non-nil in a
+// narrow race (deadline elapses in the window between the subprocess exiting
+// and Run() returning), but a nil err means Invoke's caller already has a
+// real, usable Response and must not discard it as a timeout.
+//
+// This helper is context-value-agnostic and provider-agnostic by
+// construction: it inspects only the ctx/err pair every CLI subprocess
+// adapter already has in scope after cmd.Run(), never subprocess output —
+// so it applies identically to claude_cli, codex_cli, codex_subagent, and
+// gemini_cli, and is a correct no-op for the HTTP adapters, which never call
+// exec.CommandContext and so never call this function at all.
+func IsContextDeadlineKill(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(ctx.Err(), context.DeadlineExceeded)
 }
 
 // extraBinDirs is searched in addition to PATH when resolving binaries.
