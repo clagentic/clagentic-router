@@ -26,20 +26,28 @@
 // restartSystemdService's `systemctl restart` were both taken at their exit
 // code alone, with nothing re-reading the result. runUpdate now verifies
 // each mutating step after it runs: verifyInstalledBinary re-stats
-// install_path and compares it — size, mode, AND a SHA-256 content hash
-// (fifth fold-in: size+mode alone passes a same-size wrong artifact) —
-// against the freshly built artifact; restartAndVerifySystemdService
-// compares the unit's ActiveEnterTimestamp, ActiveEnterTimestampMonotonic
-// (fifth fold-in: the wall-clock field alone is second-granular and can
-// false-fail a fast same-second restart combined with PID reuse), and
-// MainPID before and after the restart call, so a restart that did not
-// actually restart the unit is a hard error, not a silent pass. The final
-// report line names the hostname, the resolved install_path, and the
-// resolved unit+scope actually acted on — see runUpdate's own doc for why
-// this makes a PASS falsifiable rather than a pre-action echo of intent. A
-// crash-window .bak adoption (backupInstalledBinary state 3) is logged
-// loudly and named in the report rather than proceeding silently (fifth
-// fold-in, BOBBIE comment 5373968195).
+// install_path and compares it — size, EXACT mode (eighth fold-in: any
+// execute bit used to be accepted, letting a 0o777 world-writable binary
+// pass), AND a SHA-256 content hash (fifth fold-in: size+mode alone passes a
+// same-size wrong artifact) — against the freshly built artifact;
+// restartAndVerifySystemdService compares the unit's ActiveEnterTimestamp,
+// ActiveEnterTimestampMonotonic (fifth fold-in: the wall-clock field alone
+// is second-granular and can false-fail a fast same-second restart combined
+// with PID reuse), and MainPID before and after the restart call, so a
+// restart that did not actually restart the unit is a hard error, not a
+// silent pass. The final report line names the hostname, the resolved
+// install_path, and the resolved unit+scope actually acted on — see
+// runUpdate's own doc for why this makes a PASS falsifiable rather than a
+// pre-action echo of intent. A crash-window .bak adoption
+// (backupInstalledBinary state 3) is logged loudly and named in the report
+// rather than proceeding silently (fifth fold-in, BOBBIE comment
+// 5373968195). The ROLLBACK path gets the same readback treatment (eighth
+// fold-in, BOBBIE bobbie.uncat.1): restoreBackupOrReport now verifies every
+// restore rename the same way, mode always and content whenever a genuine
+// pre-image hash exists (the normal-rollback case); a crash-window-adopted
+// .bak has no pre-image to compare against, so that path is checked for
+// mode/non-emptiness and its content is reported as explicitly unverified,
+// never silently skipped and never backed by a fabricated hash.
 package main
 
 import (
@@ -474,13 +482,21 @@ func buildBinary(sourceDir, outputPath string) error {
 	return nil
 }
 
+// installedBinaryMode is the exact permission bits installBinary sets on
+// every artifact it installs (below). verifyInstalledBinary and
+// verifyRestoredBinary both assert this EXACT value, not merely "some
+// execute bit set" — see verifyInstalledBinary's own doc (eighth fold-in,
+// PEACHES nit) for why "any of 0o111" was too weak (a 0o777 world-writable
+// binary passed it).
+const installedBinaryMode = 0o755
+
 // installBinary atomically replaces installPath with stagedPath via
 // os.Rename. A plain copy over a running systemd-held binary fails with
 // "text file busy"; rename on the same filesystem is atomic and succeeds
 // even while the old inode is held open by the running process — the
 // service keeps serving the old inode until it is restarted.
 func installBinary(stagedPath, installPath string) error {
-	if err := os.Chmod(stagedPath, 0o755); err != nil {
+	if err := os.Chmod(stagedPath, installedBinaryMode); err != nil {
 		return fmt.Errorf("chmod staged binary: %w", err)
 	}
 	if err := os.Rename(stagedPath, installPath); err != nil {
@@ -561,37 +577,66 @@ func installBinary(stagedPath, installPath string) error {
 // under the update timer — the caller uses this bool to log the adoption
 // loudly and name it in the report line rather than silently proceeding, as
 // case 2's stale-.bak refusal already does loudly for its own branch.
-func backupInstalledBinary(installPath string) (string, bool, error) {
+//
+// RESTORE-VERIFICATION HASH (lr-c69197 eighth fold-in, BOBBIE bobbie.uncat.1
+// — narrowed but not closed at the seventh fold-in's SHA): a restore
+// (backupPath renamed back onto installPath by restoreBackupOrReport) used
+// to be a bare os.Rename with no readback at all, on either backup path.
+// The returned [sha256.Size]byte + bool here is what makes a POST-RESTORE
+// verification possible for the NORMAL rollback case (case 2's mirror —
+// installPath existed and was renamed to backupPath by this very call): the
+// content is hashed HERE, immediately before the rename away, which is the
+// one moment this function is guaranteed to be looking at exactly the bytes
+// that are about to become the rollback source — exactly the same
+// before-the-rename-not-after reasoning verifyInstalledBinary's own doc
+// already establishes for the forward install path. The bool is false (no
+// expected hash available) for the crash-window-adopted case (case 3): this
+// function never saw that .bak get created, so there is no pre-image to
+// compare a restore against — see verifyRestoredBinary's own doc for what
+// is checked instead in that case, and why fabricating an expected hash
+// here would be worse than not having one.
+func backupInstalledBinary(installPath string) (string, bool, [sha256.Size]byte, bool, error) {
+	var noHash [sha256.Size]byte
 	backupPath := installPath + ".bak"
 	_, backupStatErr := os.Stat(backupPath)
 	if backupStatErr != nil && !os.IsNotExist(backupStatErr) {
-		return "", false, fmt.Errorf("stat existing backup at %s: %w", backupPath, backupStatErr)
+		return "", false, noHash, false, fmt.Errorf("stat existing backup at %s: %w", backupPath, backupStatErr)
 	}
 	backupExists := backupStatErr == nil
 
 	if _, err := os.Stat(installPath); err != nil {
 		if !os.IsNotExist(err) {
-			return "", false, fmt.Errorf("stat existing binary at %s: %w", installPath, err)
+			return "", false, noHash, false, fmt.Errorf("stat existing binary at %s: %w", installPath, err)
 		}
 		// installPath is absent. Case 3 (backupExists) vs. case 1 (it doesn't).
+		// Case 3: no pre-image hash — this run never saw backupPath's content
+		// created, only adopted it after the fact. hasExpectedHash is false.
 		if backupExists {
-			return backupPath, true, nil
+			return backupPath, true, noHash, false, nil
 		}
-		return "", false, nil
+		return "", false, noHash, false, nil
 	}
 
 	// installPath exists — case 2 if .bak also exists.
 	if backupExists {
-		return "", false, fmt.Errorf("refusing to back up %s: a stale backup already exists at %s from a "+
+		return "", false, noHash, false, fmt.Errorf("refusing to back up %s: a stale backup already exists at %s from a "+
 			"previous interrupted update — it may be the only known-good binary left to roll back to, "+
 			"so it is never silently overwritten. Inspect %s by hand: if it is safe to discard, remove "+
 			"it and re-run update; if it looks like the good binary and %s does not, restore it "+
 			"manually (mv %s %s)", installPath, backupPath, backupPath, installPath, backupPath, installPath)
 	}
-	if err := os.Rename(installPath, backupPath); err != nil {
-		return "", false, fmt.Errorf("rename %s -> %s: %w (backup and target must be on the same filesystem)", installPath, backupPath, err)
+	// Hashed BEFORE the rename away, while installPath still holds the
+	// content that is about to become the rollback source — see the doc
+	// above for why this must be pre-rename, not a re-read of backupPath
+	// afterward.
+	preBackupHash, hashErr := hashFile(installPath)
+	if hashErr != nil {
+		return "", false, noHash, false, fmt.Errorf("hash existing binary at %s before backing it up: %w", installPath, hashErr)
 	}
-	return backupPath, false, nil
+	if err := os.Rename(installPath, backupPath); err != nil {
+		return "", false, noHash, false, fmt.Errorf("rename %s -> %s: %w (backup and target must be on the same filesystem)", installPath, backupPath, err)
+	}
+	return backupPath, false, preBackupHash, true, nil
 }
 
 // restoreBackupOrReport is the ONE restore path used by every post-backup
@@ -611,7 +656,25 @@ func backupInstalledBinary(installPath string) (string, bool, error) {
 // restore failure is reported ALONGSIDE originalErr, never in place of it:
 // an operator needs to know both that the step failed AND whether the
 // restore itself worked.
-func restoreBackupOrReport(originalErr error, backupPath, installPath string) error {
+//
+// POST-RESTORE VERIFICATION (lr-c69197 eighth fold-in, BOBBIE bobbie.uncat.1
+// — narrowed but not closed at the seventh fold-in's SHA): a restore used to
+// be a bare os.Rename with no readback at all — the forward install path
+// (installBinary -> verifyInstalledBinary) gets a full readback, but the
+// rollback path did not get the mirror-image check, despite landing the
+// binary that becomes the running service's on-disk executable in exactly
+// the same way. verifyRestoredBinary (below) is that mirror: called here,
+// after the rename, on every restore. A verification FAILURE at this point
+// is deliberately NOT treated as license to delete or further rename
+// anything — this function is already on a failure path (originalErr is
+// non-nil in every caller), and turning a recoverable "the restored binary
+// looks wrong, an operator needs to look at it" into an unrecoverable "and
+// then update deleted the only remaining binary on the box trying to fix
+// it" would be strictly worse. The verification failure is reported
+// ALONGSIDE originalErr and the restore-succeeded confirmation, same as a
+// restoreErr already is above — installPath is left exactly as the rename
+// left it, for an operator to inspect by hand.
+func restoreBackupOrReport(originalErr error, backupPath, installPath string, hasExpectedHash bool, expectedHash [sha256.Size]byte) error {
 	if backupPath == "" {
 		return fmt.Errorf("%w (no previous binary existed to roll back to — this was a first-ever "+
 			"install at %s)", originalErr, installPath)
@@ -621,8 +684,76 @@ func restoreBackupOrReport(originalErr error, backupPath, installPath string) er
 			"may now be missing or in an inconsistent state, check it by hand",
 			originalErr, backupPath, restoreErr, installPath)
 	}
-	return fmt.Errorf("%w (previous binary restored from %s — the running service's on-disk binary "+
-		"is back to its pre-update state)", originalErr, backupPath)
+	if verifyErr := verifyRestoredBinary(installPath, hasExpectedHash, expectedHash); verifyErr != nil {
+		return fmt.Errorf("%w (previous binary renamed back from %s, but POST-RESTORE VERIFICATION "+
+			"FAILED: %v — install_path is left exactly as the restore rename produced it; it is NOT "+
+			"deleted or renamed again, so the only remaining binary on the box is not lost; inspect it "+
+			"by hand before trusting it)", originalErr, backupPath, verifyErr)
+	}
+	return fmt.Errorf("%w (previous binary restored from %s and verified — the running service's "+
+		"on-disk binary is back to its pre-update state)", originalErr, backupPath)
+}
+
+// verifyRestoredBinary is restoreBackupOrReport's readback half — the
+// rollback-path mirror of verifyInstalledBinary on the forward install path
+// (lr-c69197 eighth fold-in, closing BOBBIE bobbie.uncat.1's residual gap:
+// "restoreBackupOrReport still restores an adopted .bak via a bare
+// os.Rename with no integrity check and no mode check"). Two distinct
+// scenarios, deliberately checked differently rather than papered over with
+// one code path:
+//
+//   - hasExpectedHash == true (NORMAL rollback — backupInstalledBinary's
+//     case 2 mirror: installPath existed and was backed up by THIS run):
+//     backupInstalledBinary hashed the binary immediately before renaming it
+//     to backupPath, so expectedHash is a genuine pre-image — the exact
+//     bytes that are supposed to come back. This is verified fully: exact
+//     mode (installedBinaryMode, same as the forward path — see eighth
+//     fold-in's PEACHES nit 1) AND content hash.
+//   - hasExpectedHash == false (CRASH-WINDOW ADOPTED .bak — case 3:
+//     installPath was absent, so this run never saw the .bak's content get
+//     created and has no pre-image to compare against): there is no honest
+//     way to assert "this is the right content" here — fabricating an
+//     expected hash for a file this process never observed being written
+//     would be worse than not checking at all (a false PASS is more
+//     dangerous than an honest "unverified"). What CAN be checked without
+//     inventing anything: the restored file exists, is non-empty, and has
+//     exactly installedBinaryMode — catching, at minimum, an empty/
+//     truncated/wrong-permission file. The content gap is logged loudly as
+//     UNVERIFIED, not silently skipped, so an operator has a clear signal to
+//     go compare the restored binary against a known-good copy by hand.
+func verifyRestoredBinary(installPath string, hasExpectedHash bool, expectedHash [sha256.Size]byte) error {
+	info, err := os.Stat(installPath)
+	if err != nil {
+		return fmt.Errorf("expected a restored binary at %s, but stat failed: %w", installPath, err)
+	}
+	if info.Size() == 0 {
+		return fmt.Errorf("restored binary at %s is empty (0 bytes) — this cannot be a working binary", installPath)
+	}
+	if info.Mode().Perm() != installedBinaryMode {
+		return fmt.Errorf("restored binary at %s has mode %s, want exactly %s", installPath,
+			info.Mode().Perm(), os.FileMode(installedBinaryMode))
+	}
+	if !hasExpectedHash {
+		// CRASH-WINDOW ADOPTED .bak: no pre-image hash exists to compare
+		// against — see this function's own doc for why fabricating one here
+		// would be dishonest. Mode/non-emptiness above is the most that can be
+		// verified; the content gap is reported, not silently skipped.
+		return fmt.Errorf("restored binary at %s passed mode/non-emptiness checks, but its CONTENT COULD "+
+			"NOT BE VERIFIED against a known-good hash — this was a crash-window-adopted backup (update "+
+			"never observed this file's content being written, so it has no pre-image to compare "+
+			"against); inspect %s by hand against a known-good build before trusting it", installPath, installPath)
+	}
+	restoredHash, hashErr := hashFile(installPath)
+	if hashErr != nil {
+		return fmt.Errorf("restored binary at %s matched mode but its content could not be hashed for "+
+			"verification: %w", installPath, hashErr)
+	}
+	if restoredHash != expectedHash {
+		return fmt.Errorf("restored binary at %s has a DIFFERENT content hash (got %x, want %x — the "+
+			"hash taken of this exact file immediately before it was backed up) — the restore rename "+
+			"did not bring back the binary that was actually backed up", installPath, restoredHash, expectedHash)
+	}
+	return nil
 }
 
 // verifyInstalledBinary is the readback half of the install step (lr-c69197
@@ -653,6 +784,13 @@ func restoreBackupOrReport(originalErr error, backupPath, installPath string) er
 // binary that was just written, still hot in the page cache) — cheap
 // relative to the `go build` that preceded it, and it is what makes
 // "verified" mean the artifact's actual content, not just its size class.
+//
+// EXACT MODE (lr-c69197 eighth fold-in, PEACHES nit): this used to accept
+// ANY execute bit (installedInfo.Mode().Perm()&0o111 != 0), which passes a
+// 0o777 world-writable binary — installBinary (above) always chmods the
+// staged artifact to exactly installedBinaryMode (0o755) before the
+// replacing rename, so verification asserts that exact value rather than
+// merely "executable by someone."
 func verifyInstalledBinary(installPath string, stagedInfo os.FileInfo, stagedHash [sha256.Size]byte) error {
 	installedInfo, err := os.Stat(installPath)
 	if err != nil {
@@ -665,8 +803,11 @@ func verifyInstalledBinary(installPath string, stagedInfo os.FileInfo, stagedHas
 			"artifact's size) — the file at install_path does not match what was just built",
 			installPath, installedInfo.Size(), stagedInfo.Size())
 	}
-	if installedInfo.Mode().Perm()&0o111 == 0 {
-		return fmt.Errorf("installed binary at %s is not executable (mode %s)", installPath, installedInfo.Mode().Perm())
+	if installedInfo.Mode().Perm() != installedBinaryMode {
+		return fmt.Errorf("installed binary at %s has mode %s, want exactly %s (the mode installBinary "+
+			"sets) — ANY execute bit (mode&0o111 != 0) used to pass here, which let a 0o777 "+
+			"world-writable binary through verification undetected (eighth fold-in, PEACHES nit)",
+			installPath, installedInfo.Mode().Perm(), os.FileMode(installedBinaryMode))
 	}
 	installedHash, err := hashFile(installPath)
 	if err != nil {
@@ -730,7 +871,7 @@ func installAndVerifyWithRollback(stagedPath, installPath string, stagedInfo os.
 	// below has something real to restore — see backupInstalledBinary's own
 	// doc for why a missing pre-existing binary (first-ever install) is not
 	// an error here.
-	backupPath, crashWindowAdopted, backupErr := backupInstalledBinary(installPath)
+	backupPath, crashWindowAdopted, backupHash, hasBackupHash, backupErr := backupInstalledBinary(installPath)
 	if backupErr != nil {
 		return fmt.Errorf("install: back up previous binary before replacing it: %w", backupErr)
 	}
@@ -759,7 +900,7 @@ func installAndVerifyWithRollback(stagedPath, installPath string, stagedInfo os.
 	// rollback below closes — routed through the same restoreBackupOrReport
 	// so there is one restore path, not two that can drift.
 	if err := installBinary(stagedPath, installPath); err != nil {
-		return fmt.Errorf("install: %w", restoreBackupOrReport(err, backupPath, installPath))
+		return fmt.Errorf("install: %w", restoreBackupOrReport(err, backupPath, installPath, hasBackupHash, backupHash))
 	}
 
 	// READBACK (lr-c69197 MILLER item 2): installBinary's os.Rename returning
@@ -781,7 +922,7 @@ func installAndVerifyWithRollback(stagedPath, installPath string, stagedInfo os.
 	// actually worked).
 	if err := verifyInstalledBinary(installPath, stagedInfo, stagedHash); err != nil {
 		return fmt.Errorf("install: post-install verification failed: %w",
-			restoreBackupOrReport(err, backupPath, installPath))
+			restoreBackupOrReport(err, backupPath, installPath, hasBackupHash, backupHash))
 	}
 
 	// Re-stat installPath rather than reporting stagedInfo's pre-chmod mode

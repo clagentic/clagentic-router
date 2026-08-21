@@ -9,6 +9,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"os/exec"
@@ -110,7 +111,7 @@ func TestBackupInstalledBinary_ExistingBinary_RenamesToBak(t *testing.T) {
 		t.Fatalf("write target file: %v", err)
 	}
 
-	backupPath, crashWindowAdopted, err := backupInstalledBinary(target)
+	backupPath, crashWindowAdopted, backupHash, hasBackupHash, err := backupInstalledBinary(target)
 	if err != nil {
 		t.Fatalf("backupInstalledBinary: %v", err)
 	}
@@ -119,6 +120,9 @@ func TestBackupInstalledBinary_ExistingBinary_RenamesToBak(t *testing.T) {
 	}
 	if crashWindowAdopted {
 		t.Errorf("crashWindowAdopted = true, want false (installPath existed — this is not the crash window)")
+	}
+	if !hasBackupHash {
+		t.Errorf("hasBackupHash = false, want true (normal backup — the pre-rename content was hashed)")
 	}
 	if _, err := os.Stat(target); !os.IsNotExist(err) {
 		t.Errorf("target %s should not exist after backup rename, stat err = %v", target, err)
@@ -129,6 +133,13 @@ func TestBackupInstalledBinary_ExistingBinary_RenamesToBak(t *testing.T) {
 	}
 	if string(content) != "old binary contents" {
 		t.Errorf("backup content = %q, want the original binary's contents", string(content))
+	}
+	wantHash, err := hashFile(backupPath)
+	if err != nil {
+		t.Fatalf("hashFile(backupPath): %v", err)
+	}
+	if backupHash != wantHash {
+		t.Errorf("backupHash = %x, want %x (the hash of the file that was actually backed up)", backupHash, wantHash)
 	}
 }
 
@@ -141,7 +152,7 @@ func TestBackupInstalledBinary_NoExistingBinary_ReturnsEmptyNoError(t *testing.T
 	dir := t.TempDir()
 	target := filepath.Join(dir, "clagentic-router")
 
-	backupPath, crashWindowAdopted, err := backupInstalledBinary(target)
+	backupPath, crashWindowAdopted, _, hasBackupHash, err := backupInstalledBinary(target)
 	if err != nil {
 		t.Fatalf("backupInstalledBinary: unexpected error for first-ever install: %v", err)
 	}
@@ -150,6 +161,9 @@ func TestBackupInstalledBinary_NoExistingBinary_ReturnsEmptyNoError(t *testing.T
 	}
 	if crashWindowAdopted {
 		t.Errorf("crashWindowAdopted = true, want false (first-ever install is not the crash window)")
+	}
+	if hasBackupHash {
+		t.Errorf("hasBackupHash = true, want false (nothing was backed up, so there is no hash)")
 	}
 }
 
@@ -465,6 +479,53 @@ func TestVerifyInstalledBinary_SameSizeSameModeDifferentContent_HashMismatch(t *
 	}
 }
 
+// TestVerifyInstalledBinary_WorldWritableMode_Rejected is the regression
+// test for the lr-c69197 eighth fold-in defect (PEACHES nit): the mode
+// check used to accept ANY execute bit (mode&0o111 != 0), so a 0o777
+// world-writable binary — same size, same content hash as what was staged,
+// but permission bits installBinary never actually sets — passed
+// verification undetected. This asserts the exact-mode check rejects it.
+func TestVerifyInstalledBinary_WorldWritableMode_Rejected(t *testing.T) {
+	dir := t.TempDir()
+	staged := filepath.Join(dir, "clagentic-router.new")
+	target := filepath.Join(dir, "clagentic-router")
+
+	content := []byte("fake binary contents")
+	if err := os.WriteFile(staged, content, 0o644); err != nil {
+		t.Fatalf("write staged file: %v", err)
+	}
+	stagedInfo, err := os.Stat(staged)
+	if err != nil {
+		t.Fatalf("stat staged file: %v", err)
+	}
+	stagedHash, err := hashFile(staged)
+	if err != nil {
+		t.Fatalf("hashFile(staged): %v", err)
+	}
+
+	// Same size, same content — only the mode differs, and it differs in the
+	// specific way the old check missed: 0o777 has every bit installedBinaryMode
+	// (0o755) has, PLUS group/other write, so mode&0o111 != 0 was satisfied.
+	// os.WriteFile's mode argument is subject to the process umask (e.g. a
+	// typical 0o022 umask would silently reduce 0o777 to 0o755, defeating
+	// this test) — os.Chmod afterward sets the exact bits regardless of
+	// umask, the same way installBinary's own os.Chmod call does.
+	if err := os.WriteFile(target, content, 0o644); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	if err := os.Chmod(target, 0o777); err != nil {
+		t.Fatalf("chmod target to 0o777: %v", err)
+	}
+
+	err = verifyInstalledBinary(target, stagedInfo, stagedHash)
+	if err == nil {
+		t.Fatal("expected error for a 0o777 world-writable installed binary, got nil")
+	}
+	if !strings.Contains(err.Error(), "want exactly") {
+		t.Errorf("error = %q, want it to name the exact mode required", err.Error())
+	}
+}
+
 // TestInstallAndVerifyWithRollback_VerificationFailure_RestoresPreviousBinary
 // is the regression test the lr-c69197 fold-in dispatch requires: a failed
 // post-install verification must restore the previously-installed binary,
@@ -610,7 +671,7 @@ func TestBackupInstalledBinary_StaleBakAlreadyExists_RefusesWithoutClobbering(t 
 		t.Fatalf("write stale backup file: %v", err)
 	}
 
-	gotBackupPath, crashWindowAdopted, err := backupInstalledBinary(target)
+	gotBackupPath, crashWindowAdopted, _, hasBackupHash, err := backupInstalledBinary(target)
 	if err == nil {
 		t.Fatal("expected error for a pre-existing stale .bak file, got nil")
 	}
@@ -619,6 +680,9 @@ func TestBackupInstalledBinary_StaleBakAlreadyExists_RefusesWithoutClobbering(t 
 	}
 	if crashWindowAdopted {
 		t.Errorf("crashWindowAdopted = true on error, want false (this is the stale-refusal case, not the crash window)")
+	}
+	if hasBackupHash {
+		t.Errorf("hasBackupHash = true on error, want false (refused before any hash was taken)")
 	}
 	if !strings.Contains(err.Error(), backupPath) {
 		t.Errorf("error %q does not name the stale backup path %q", err.Error(), backupPath)
@@ -665,7 +729,7 @@ func TestBackupInstalledBinary_ThreeStates_CrashWindow(t *testing.T) {
 		dir := t.TempDir()
 		target := filepath.Join(dir, "clagentic-router")
 
-		backupPath, crashWindowAdopted, err := backupInstalledBinary(target)
+		backupPath, crashWindowAdopted, _, hasBackupHash, err := backupInstalledBinary(target)
 		if err != nil {
 			t.Fatalf("backupInstalledBinary: unexpected error: %v", err)
 		}
@@ -674,6 +738,9 @@ func TestBackupInstalledBinary_ThreeStates_CrashWindow(t *testing.T) {
 		}
 		if crashWindowAdopted {
 			t.Errorf("crashWindowAdopted = true, want false (first-ever install is not the crash window)")
+		}
+		if hasBackupHash {
+			t.Errorf("hasBackupHash = true, want false (nothing was backed up, so there is no hash)")
 		}
 	})
 
@@ -688,7 +755,7 @@ func TestBackupInstalledBinary_ThreeStates_CrashWindow(t *testing.T) {
 			t.Fatalf("write stale backup: %v", err)
 		}
 
-		gotBackupPath, crashWindowAdopted, err := backupInstalledBinary(target)
+		gotBackupPath, crashWindowAdopted, _, hasBackupHash, err := backupInstalledBinary(target)
 		if err == nil {
 			t.Fatal("expected error for installPath present + stale .bak present, got nil")
 		}
@@ -697,6 +764,9 @@ func TestBackupInstalledBinary_ThreeStates_CrashWindow(t *testing.T) {
 		}
 		if crashWindowAdopted {
 			t.Errorf("crashWindowAdopted = true on error, want false (installPath exists — not the crash window)")
+		}
+		if hasBackupHash {
+			t.Errorf("hasBackupHash = true on error, want false (refused before any hash was taken)")
 		}
 		// Neither file touched.
 		if content, readErr := os.ReadFile(target); readErr != nil || string(content) != "current" {
@@ -718,7 +788,7 @@ func TestBackupInstalledBinary_ThreeStates_CrashWindow(t *testing.T) {
 		// installPath deliberately never created — this is the crash window:
 		// the backup rename completed, the replacing rename never landed.
 
-		gotBackupPath, crashWindowAdopted, err := backupInstalledBinary(target)
+		gotBackupPath, crashWindowAdopted, _, hasBackupHash, err := backupInstalledBinary(target)
 		if err != nil {
 			t.Fatalf("backupInstalledBinary: unexpected error for the crash-window state: %v "+
 				"(a restorable .bak must not be reported as a first-ever install)", err)
@@ -730,6 +800,10 @@ func TestBackupInstalledBinary_ThreeStates_CrashWindow(t *testing.T) {
 		if !crashWindowAdopted {
 			t.Errorf("crashWindowAdopted = false, want true (this IS the crash window: installPath " +
 				"absent, .bak present — the caller must be told to log this adoption loudly)")
+		}
+		if hasBackupHash {
+			t.Errorf("hasBackupHash = true, want false (crash-window adoption never saw the .bak's " +
+				"content get created, so there is no genuine pre-image hash)")
 		}
 		// The .bak file itself must be left in place and untouched — the
 		// caller (installAndVerifyWithRollback) is responsible for consuming
@@ -748,10 +822,17 @@ func TestBackupInstalledBinary_ThreeStates_CrashWindow(t *testing.T) {
 // is the end-to-end regression test for the crash-window state through the
 // full rollback caller, not just backupInstalledBinary in isolation: when
 // installPath is absent and .bak is the only good binary on the box, and
-// the subsequent install itself fails, the operator must get "previous
-// binary restored" (using the pre-existing .bak), NOT "no previous binary
+// the subsequent install itself fails, the operator must get a restore
+// confirmation that USES the pre-existing .bak, NOT "no previous binary
 // existed to roll back to" — the exact false claim PEACHES traced as a
-// consequence of the defect.
+// consequence of the defect. The restore itself (the os.Rename) succeeds
+// either way; what differs from the normal-rollback case (see
+// TestInstallAndVerifyWithRollback_InstallFailure_RestoresPreviousBinary)
+// is the eighth fold-in's post-restore verification outcome: this is the
+// crash-window-adopted path, so there is no pre-image hash to check
+// content against, and the honest report is "restored but content
+// UNVERIFIED", not an unqualified "previous binary restored" (lr-c69197
+// eighth fold-in, BOBBIE bobbie.uncat.1).
 func TestInstallAndVerifyWithRollback_CrashWindowState_RecoversOnInstallFailure(t *testing.T) {
 	dir := t.TempDir()
 	installPath := filepath.Join(dir, "clagentic-router")
@@ -787,9 +868,19 @@ func TestInstallAndVerifyWithRollback_CrashWindowState_RecoversOnInstallFailure(
 		t.Errorf("error = %q — falsely claims no previous binary existed, despite a restorable "+
 			".bak being present at %s (the exact regression this test guards)", err.Error(), backupPath)
 	}
-	if !strings.Contains(err.Error(), "previous binary restored") {
-		t.Errorf("error = %q, want it to confirm the previous binary was restored from the "+
-			"crash-window .bak", err.Error())
+	// Eighth fold-in: the crash-window-adopted path has no pre-image hash, so
+	// the honest report names the rename as having happened AND names the
+	// content as unverified — never an unqualified "previous binary restored"
+	// for this specific path (that unqualified wording is reserved for the
+	// NORMAL-rollback path, which does have a pre-image hash — see
+	// TestInstallAndVerifyWithRollback_InstallFailure_RestoresPreviousBinary).
+	if !strings.Contains(err.Error(), "renamed back from") {
+		t.Errorf("error = %q, want it to confirm the restore rename happened from the crash-window "+
+			".bak", err.Error())
+	}
+	if !strings.Contains(err.Error(), "CONTENT COULD NOT BE VERIFIED") {
+		t.Errorf("error = %q, want it to honestly report that the crash-window-adopted content could "+
+			"not be verified against a known-good hash (no pre-image exists for this path)", err.Error())
 	}
 
 	restored, err := os.ReadFile(installPath)
@@ -921,6 +1012,186 @@ func TestInstallAndVerifyWithRollback_CrashWindowState_SuccessConsumesStaleBak(t
 	}
 	if !strings.Contains(string(report), "RECOVERY COMPLETE") {
 		t.Errorf("report output = %q, want the final success line to also confirm recovery completed", string(report))
+	}
+}
+
+// TestRestoreBackupOrReport_NormalRollback_ContentTampered_VerificationFails
+// is the regression test for the lr-c69197 eighth fold-in defect (BOBBIE
+// bobbie.uncat.1, the normal-rollback half): a bare os.Rename restoring
+// backupPath onto installPath used to be trusted with no readback at all.
+// This simulates the restore rename landing DIFFERENT content than what was
+// actually backed up (e.g. a concurrent process wrote to backupPath between
+// backup and restore) by passing a deliberately wrong expectedHash — the
+// exact scenario a genuine pre-image hash exists to catch — and asserts
+// restoreBackupOrReport reports the mismatch rather than silently trusting
+// the rename's exit code. Critically, it must NOT delete or further rename
+// installPath on this failure: the restored (if unverified) file is left in
+// place so the operator does not lose the only remaining binary on the box.
+func TestRestoreBackupOrReport_NormalRollback_ContentTampered_VerificationFails(t *testing.T) {
+	dir := t.TempDir()
+	installPath := filepath.Join(dir, "clagentic-router")
+	backupPath := installPath + ".bak"
+
+	actualBackupContents := []byte("what is actually sitting at .bak, mode 0755")
+	if err := os.WriteFile(backupPath, actualBackupContents, installedBinaryMode); err != nil {
+		t.Fatalf("write backup file: %v", err)
+	}
+
+	// A deliberately WRONG expected hash — simulates the pre-image hash
+	// taken at backup time no longer matching what actually gets restored
+	// (tampering, or a bug elsewhere threading the wrong hash through).
+	wrongExpectedHash, err := hashFile(backupPath)
+	if err != nil {
+		t.Fatalf("hashFile(backupPath): %v", err)
+	}
+	wrongExpectedHash[0] ^= 0xFF // flip a byte so it cannot possibly match
+
+	originalErr := fmt.Errorf("simulated original failure forcing a rollback")
+	err = restoreBackupOrReport(originalErr, backupPath, installPath, true, wrongExpectedHash)
+	if err == nil {
+		t.Fatal("expected an error for a post-restore content mismatch, got nil")
+	}
+	if !strings.Contains(err.Error(), "POST-RESTORE VERIFICATION FAILED") {
+		t.Errorf("error = %q, want it to name a post-restore verification failure", err.Error())
+	}
+	if !strings.Contains(err.Error(), "DIFFERENT content hash") {
+		t.Errorf("error = %q, want it to name a content hash mismatch", err.Error())
+	}
+
+	// installPath must NOT be deleted or further renamed on a verification
+	// failure — it must hold exactly what the restore rename produced, so an
+	// operator has something to inspect rather than nothing at all.
+	restored, readErr := os.ReadFile(installPath)
+	if readErr != nil {
+		t.Fatalf("read installPath after failed post-restore verification: %v (installPath must not be "+
+			"deleted on a verification failure — the operator needs something left to inspect)", readErr)
+	}
+	if string(restored) != string(actualBackupContents) {
+		t.Errorf("installPath contents = %q, want the renamed-back backup contents %q (unchanged by "+
+			"the failed verification)", string(restored), string(actualBackupContents))
+	}
+}
+
+// TestRestoreBackupOrReport_NormalRollback_Verified_Succeeds is the
+// companion success case: a genuine pre-image hash that DOES match the
+// restored content must pass verification and report an unqualified
+// "restored ... and verified" — not the crash-window path's
+// content-unverified wording.
+func TestRestoreBackupOrReport_NormalRollback_Verified_Succeeds(t *testing.T) {
+	dir := t.TempDir()
+	installPath := filepath.Join(dir, "clagentic-router")
+	backupPath := installPath + ".bak"
+
+	backupContents := []byte("the genuine backed-up binary contents")
+	if err := os.WriteFile(backupPath, backupContents, installedBinaryMode); err != nil {
+		t.Fatalf("write backup file: %v", err)
+	}
+	expectedHash, err := hashFile(backupPath)
+	if err != nil {
+		t.Fatalf("hashFile(backupPath): %v", err)
+	}
+
+	originalErr := fmt.Errorf("simulated original failure forcing a rollback")
+	err = restoreBackupOrReport(originalErr, backupPath, installPath, true, expectedHash)
+	if err == nil {
+		t.Fatal("restoreBackupOrReport should still return a non-nil error wrapping originalErr even on a successful restore")
+	}
+	if !strings.Contains(err.Error(), "restored") || !strings.Contains(err.Error(), "verified") {
+		t.Errorf("error = %q, want it to confirm the binary was restored and verified", err.Error())
+	}
+	if strings.Contains(err.Error(), "COULD NOT BE VERIFIED") {
+		t.Errorf("error = %q, want the normal-rollback (has-pre-image-hash) path to NOT use the "+
+			"crash-window content-unverified wording", err.Error())
+	}
+}
+
+// TestRestoreBackupOrReport_CrashWindowAdopted_ContentUnverified_ReportsHonestly
+// is the regression test for the lr-c69197 eighth fold-in defect (BOBBIE
+// bobbie.uncat.1, the crash-window-adoption half, the residual gap not
+// closed at the seventh fold-in's SHA): restoring an adopted .bak of
+// unknown provenance used to be a bare os.Rename with no verification and
+// no mode check at all — an adopted .bak need not even have sane
+// permissions. There is genuinely no pre-image hash available for this
+// path (update never observed the .bak's content being written), so the
+// honest, correct behavior is NOT a silent pass and NOT a fabricated hash
+// match — it is a loud, explicit "content could not be verified" report
+// alongside confirmation that mode/non-emptiness were checked.
+func TestRestoreBackupOrReport_CrashWindowAdopted_ContentUnverified_ReportsHonestly(t *testing.T) {
+	dir := t.TempDir()
+	installPath := filepath.Join(dir, "clagentic-router")
+	backupPath := installPath + ".bak"
+
+	adoptedContents := []byte("an adopted .bak of unknown provenance, mode 0755")
+	if err := os.WriteFile(backupPath, adoptedContents, installedBinaryMode); err != nil {
+		t.Fatalf("write adopted backup file: %v", err)
+	}
+
+	originalErr := fmt.Errorf("simulated original failure forcing a rollback")
+	// hasExpectedHash=false: the crash-window-adoption case never has a
+	// genuine pre-image hash — see backupInstalledBinary's own doc.
+	var noHash [sha256.Size]byte
+	err := restoreBackupOrReport(originalErr, backupPath, installPath, false, noHash)
+	if err == nil {
+		t.Fatal("restoreBackupOrReport should still return a non-nil error wrapping originalErr")
+	}
+	if !strings.Contains(err.Error(), "CONTENT COULD NOT BE VERIFIED") {
+		t.Errorf("error = %q, want it to honestly report the content as unverified for the "+
+			"crash-window-adopted path (no pre-image hash exists to compare against)", err.Error())
+	}
+	if !strings.Contains(err.Error(), "renamed back from") {
+		t.Errorf("error = %q, want it to confirm the restore rename itself happened", err.Error())
+	}
+
+	// installPath must still hold the adopted content — an honest
+	// "unverified" report is not license to delete it.
+	restored, readErr := os.ReadFile(installPath)
+	if readErr != nil {
+		t.Fatalf("read installPath after crash-window restore: %v", readErr)
+	}
+	if string(restored) != string(adoptedContents) {
+		t.Errorf("installPath contents = %q, want the renamed-back adopted contents %q",
+			string(restored), string(adoptedContents))
+	}
+}
+
+// TestRestoreBackupOrReport_CrashWindowAdopted_BadMode_VerificationFails is
+// the mode-check half of the crash-window-adoption gap (lr-c69197 eighth
+// fold-in, BOBBIE bobbie.uncat.1: "with (1) unfixed it need not even have
+// sane permissions"): an adopted .bak with a world-writable mode (0o777,
+// not the 0o755 install always sets) must fail post-restore verification on
+// the mode check alone, independent of the (unavailable) content check.
+func TestRestoreBackupOrReport_CrashWindowAdopted_BadMode_VerificationFails(t *testing.T) {
+	dir := t.TempDir()
+	installPath := filepath.Join(dir, "clagentic-router")
+	backupPath := installPath + ".bak"
+
+	// os.WriteFile's mode is subject to the process umask — os.Chmod
+	// afterward forces the exact 0o777 regardless (see the sibling
+	// world-writable test above for the full explanation).
+	if err := os.WriteFile(backupPath, []byte("adopted .bak, wrong mode"), 0o644); err != nil {
+		t.Fatalf("write adopted backup file: %v", err)
+	}
+	if err := os.Chmod(backupPath, 0o777); err != nil {
+		t.Fatalf("chmod backup file to 0o777: %v", err)
+	}
+
+	originalErr := fmt.Errorf("simulated original failure forcing a rollback")
+	var noHash [sha256.Size]byte
+	err := restoreBackupOrReport(originalErr, backupPath, installPath, false, noHash)
+	if err == nil {
+		t.Fatal("expected an error for a world-writable restored binary, got nil")
+	}
+	if !strings.Contains(err.Error(), "POST-RESTORE VERIFICATION FAILED") {
+		t.Errorf("error = %q, want it to name a post-restore verification failure", err.Error())
+	}
+	if !strings.Contains(err.Error(), "want exactly") {
+		t.Errorf("error = %q, want it to name the exact mode required", err.Error())
+	}
+
+	// installPath must not be deleted on this failure either.
+	if _, statErr := os.Stat(installPath); statErr != nil {
+		t.Errorf("installPath should still exist after a failed post-restore mode check, stat err = %v "+
+			"(a verification failure must never delete the only remaining binary on the box)", statErr)
 	}
 }
 

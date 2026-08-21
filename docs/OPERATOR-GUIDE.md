@@ -249,13 +249,16 @@ systemd install:
 **Every mutating step is verified after it runs, not just assumed to have
 succeeded on exit code 0 (lr-c69197).** After install, `update` re-stats
 `install_path` — the exact path the running service execs from — and
-compares it against the artifact it just built: size, executable mode, AND
-(lr-c69197 fifth fold-in) a SHA-256 content hash of the staged artifact,
-computed before the install rename and compared against a hash of
-`install_path` after it. Size+mode alone would pass a same-size WRONG
-artifact; the content hash is what makes "verified" mean the actual bytes
-match, not just the size class. A missing or mismatched file is a hard
-error, never a silent pass. After restart, it compares the unit's
+compares it against the artifact it just built: size, EXACT permission mode
+(`0o755` — lr-c69197 eighth fold-in tightened this from "any execute bit
+set" to the precise value `installBinary` always chmods to; a `0o777`
+world-writable binary used to pass), AND (lr-c69197 fifth fold-in) a SHA-256
+content hash of the staged artifact, computed before the install rename and
+compared against a hash of `install_path` after it. Size+mode alone would
+pass a same-size WRONG artifact; the content hash is what makes "verified"
+mean the actual bytes match, not just the size class. A missing or
+mismatched file is a hard error, never a silent pass. After restart, it
+compares the unit's
 `ActiveEnterTimestamp`, `ActiveEnterTimestampMonotonic`, and `MainPID` (via
 `systemctl show`) before and after the restart call; a restart that reports
 success but left all three unchanged (the unit did not actually cycle) is
@@ -292,6 +295,49 @@ automatically" below for why), so the already-running process is
 unaffected either way — this only concerns what is on disk at
 `install_path` for the next successful update or manual restart to pick up.
 
+**The restore rename itself is verified after it runs, not merely assumed
+to have worked (lr-c69197 eighth fold-in, BOBBIE bobbie.uncat.1).** Earlier
+fold-ins verified the FORWARD install path (`installBinary` ->
+`verifyInstalledBinary`) with size, exact mode, and a content hash, but the
+ROLLBACK path (`restoreBackupOrReport`'s `os.Rename(backupPath,
+installPath)`) had no readback at all — a `.bak` of unknown provenance
+could be renamed into `install_path` and become the executable the service
+runs, unverified. `restoreBackupOrReport` now calls `verifyRestoredBinary`
+after every restore rename, and the depth of that check depends on whether
+a genuine pre-image hash is available:
+
+- **Normal rollback** (`install_path` existed and this run backed it up
+  itself — `backupInstalledBinary` hashes the file immediately BEFORE
+  renaming it to `.bak`, the same before-the-rename-not-after discipline
+  `verifyInstalledBinary` already uses on the forward path): the restore is
+  verified fully — exact mode (`install_path`'s permission bits must equal
+  `installedBinaryMode`, 0o755, exactly the same requirement the forward
+  path now enforces — see the exact-mode note above) AND a SHA-256 content
+  hash against that genuine pre-image. A mismatch here means the restore
+  rename did not bring back the binary that was actually backed up.
+- **Crash-window-adopted `.bak`** (the state documented below where
+  `install_path` was absent and a pre-existing `.bak` was adopted as this
+  run's rollback source): `update` never observed this file's content
+  being written, so there is no honest pre-image hash to compare against —
+  fabricating one would be worse than not checking at all. What IS checked:
+  exact mode and non-emptiness. The content gap is not silently skipped —
+  a verification "failure" for this path is reported as the restored
+  binary's **content could not be verified against a known-good hash**,
+  naming the crash-window-adoption explicitly, so an operator has a clear
+  signal to compare the restored binary against a known-good build by hand
+  rather than trusting it blindly.
+
+**A post-restore verification failure never deletes or further renames
+`install_path`.** Both `restoreBackupOrReport` and `verifyRestoredBinary`
+are already on a failure path when this check runs (there is always an
+`originalErr` from the install/verify step that triggered the rollback in
+the first place) — turning a recoverable "the restored binary looks wrong,
+inspect it by hand" into an unrecoverable "and then `update` deleted the
+only remaining binary on the box trying to fix it" would be strictly worse.
+`install_path` is left exactly as the restore rename produced it, and the
+verification failure is reported ALONGSIDE the original error, so an
+operator always has something on disk to inspect.
+
 **`backupInstalledBinary` disambiguates three states on entry, not two
 (lr-c69197 fourth fold-in, PEACHES comment 5373781420) — whether
 `install_path` exists and whether `install_path.bak` exists are checked
@@ -318,10 +364,14 @@ behavior:**
    unambiguously the only candidate good binary on the box in this state
    (there is no existing `install_path` to protect from being clobbered,
    unlike case 2), so `update` treats it as the backup for this run: a
-   subsequent `installBinary` failure restores from it (the operator sees
-   "previous binary restored", not "no previous binary existed to roll back
-   to" — the false claim a prior version of this logic made), and a
-   subsequent successful install/verify consumes it via the same cleanup as
+   subsequent `installBinary` failure restores from it (the operator sees a
+   restore confirmation naming this `.bak`, not "no previous binary existed
+   to roll back to" — the false claim a prior version of this logic made;
+   see "The restore rename itself is verified..." above for why this
+   specific restore is reported as content-UNVERIFIED rather than an
+   unqualified "restored" — there is no pre-image hash for an adopted
+   `.bak`), and a subsequent successful install/verify consumes it via the
+   same cleanup as
    any other run, so it does not survive to wedge the *next* update against
    case 2's refusal. No operator action is required to recover from this
    state — the next `update` run does it automatically. This adoption is
@@ -573,10 +623,12 @@ backend, before tagging a release, and after deploying a new binary.
 | `update` reports `install: post-install verification failed: ... size mismatch ... (previous binary restored from ...)` | Something other than the artifact `update` just built ended up at `install_path` (leftover from another process, or an unrelated file at that path). `update` rolled the previous binary back onto `install_path` before returning | Verify `deploy.install_path` points at the path your service actually execs; remove/replace the stray file |
 | `update` reports `install: post-install verification failed: ... DIFFERENT content hash ... (previous binary restored from ...)` | The installed file at `install_path` matched the freshly built artifact's size and mode but not its content (lr-c69197 fifth fold-in content-hash check) — a same-size wrong artifact, or a concurrent process wrote something else to `install_path` between rename and readback. `update` rolled the previous binary back onto `install_path` before returning | Verify `deploy.install_path` points at the path your service actually execs; check for another process writing to that path concurrently; re-run `update` |
 | `update` reports `install: post-install verification failed: ...; additionally, restoring the previous binary from ... FAILED` | Both the new build failed verification AND the rollback itself could not rename the backup back into place (e.g. `install_path.bak` was itself removed or made unwritable between backup and restore) — `install_path` is left in an unknown state, not guaranteed to hold either binary | Manually inspect `install_path` and `install_path.bak` (if it still exists) and restore by hand; this is the one failure path `update`'s rollback cannot self-heal |
+| `update` reports `... POST-RESTORE VERIFICATION FAILED: restored binary at ... has mode ..., want exactly ...` | The restore rename (`install_path.bak` → `install_path`) completed, but the resulting file's permission bits are not exactly `0o755` (lr-c69197 eighth fold-in restore-mode check) — either a tampered/corrupted `.bak`, or (for a crash-window-adopted `.bak`) a backup that never had the mode `installBinary` normally sets | `install_path` is left exactly as the restore rename produced it — inspect it and `install_path.bak`'s history by hand; if the content is otherwise trustworthy, `chmod 0755 install_path` and re-run `update` to re-verify |
+| `update` reports `... POST-RESTORE VERIFICATION FAILED: restored binary at ... its CONTENT COULD NOT BE VERIFIED against a known-good hash ... this was a crash-window-adopted backup` | This is the honest, expected report for a restore that used a crash-window-adopted `.bak` (see case 3 below) — `update` never observed that `.bak`'s content being written, so it has no pre-image hash to compare the restored file against; mode and non-emptiness were still checked and passed | Not necessarily a failure — inspect `install_path` by hand against a known-good build of the router before trusting it; if it looks right, no further action is needed |
 | `update` reports `restart: ... was not actually restarted` | `systemctl restart` exited 0, but the unit's `ActiveEnterTimestamp`/`ActiveEnterTimestampMonotonic`/`MainPID` did not change — the unit did not actually cycle (e.g. `ExecStart` no-op, or the wrong unit was targeted) | Confirm `deploy.service_name`/`deploy.service_manager` name the unit that's actually running; check `systemctl [--user] status <unit>` by hand |
 | `update` reports `install: back up previous binary before replacing it: refusing to back up ... a stale backup already exists at install_path.bak` | A previous `update` run was interrupted (killed, host rebooted, OOM) between backing up the old binary and consuming that backup — `install_path.bak` from that run is still there. `update` refuses to touch either file rather than guessing which one is good | Inspect `install_path` and `install_path.bak` by hand. If `install_path.bak` is safe to discard (the current `install_path` is known good), remove it and re-run `update`. If `install_path.bak` looks like the good binary and `install_path` does not, restore it manually (`mv install_path.bak install_path`) |
-| `update` reports `update: RECOVERY: install_path ... was absent but a pre-existing backup was found at ...` | This is not a failure — it is the loud crash-window adoption notice (lr-c69197 fifth fold-in): a prior `update` run was interrupted after backing up `install_path` but before completing the replace, and this run is adopting the pre-existing `.bak` as its rollback source. Look for a following `update: RECOVERY COMPLETE: ...` line confirming the recovery finished | No action needed if `RECOVERY COMPLETE` follows; if the run then fails, follow the failure's own error text (the recovered `.bak` is still available as a rollback source) |
-| `install_path` is missing entirely and only `install_path.bak` exists (no `update` error was necessarily reported for this run — it may show up as `binary not found` / the service failing to start) | The backup rename (`install_path` → `install_path.bak`) completed but a prior `update` was killed before the replacing rename (`install_path.new` → `install_path`) landed a new binary — these are two separate syscalls, not one atomic operation (known, accepted gap, see "Redeploying" above). `backupInstalledBinary` recognizes this exact state and treats the existing `.bak` as this run's backup (lr-c69197 fourth fold-in) | **No manual action needed** — just re-run `update`. It self-recovers: on success the pending `.bak` is consumed/removed automatically; on a subsequent install failure, it restores from that `.bak` and reports "previous binary restored", not "no previous binary existed to roll back to". Only intervene by hand (`mv install_path.bak install_path`) if you need the service running again *before* the next `update` run completes |
+| `update` reports `update: RECOVERY: install_path ... was absent but a pre-existing backup was found at ...` | This is not a failure — it is the loud crash-window adoption notice (lr-c69197 fifth fold-in): a prior `update` run was interrupted after backing up `install_path` but before completing the replace, and this run is adopting the pre-existing `.bak` as its rollback source. Look for a following `update: RECOVERY COMPLETE: ...` line confirming the recovery finished | No action needed if `RECOVERY COMPLETE` follows; if the run then fails, follow the failure's own error text (the recovered `.bak` is still available as a rollback source, and any subsequent restore from it will be reported as content-unverified — see the row above) |
+| `install_path` is missing entirely and only `install_path.bak` exists (no `update` error was necessarily reported for this run — it may show up as `binary not found` / the service failing to start) | The backup rename (`install_path` → `install_path.bak`) completed but a prior `update` was killed before the replacing rename (`install_path.new` → `install_path`) landed a new binary — these are two separate syscalls, not one atomic operation (known, accepted gap, see "Redeploying" above). `backupInstalledBinary` recognizes this exact state and treats the existing `.bak` as this run's backup (lr-c69197 fourth fold-in) | **No manual action needed** — just re-run `update`. It self-recovers: on success the pending `.bak` is consumed/removed automatically; on a subsequent install failure, it restores from that `.bak` (reported as content-unverified — see the CONTENT COULD NOT BE VERIFIED row above), not "no previous binary existed to roll back to". Only intervene by hand (`mv install_path.bak install_path`) if you need the service running again *before* the next `update` run completes |
 
 ### Client token resolution (lr-92ee18 B3)
 
