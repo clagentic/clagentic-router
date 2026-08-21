@@ -87,8 +87,50 @@ var errorPatterns = []errorPattern{
 	}},
 }
 
-// ClassifyError returns the ErrorType for the given stderr text and exit code.
-// exitCode 127 = binary not found; 124 = killed by timeout command.
+// exitCodePatternNotFound / exitCodePatternTimeout are the matched_pattern_id
+// values ClassifyErrorWithPattern reports for the exitCode 127/124
+// fast-path returns below, which classify on exit code alone and never
+// consult errorPatterns at all — a bare "" would be indistinguishable from
+// the ErrTypeUnknown/no-match case in a journal line, so these name the
+// actual (non-table) signal that drove classification.
+const (
+	exitCodePatternNotFound = "exit_code=127"
+	exitCodePatternTimeout  = "exit_code=124"
+
+	// billingPatternID / apiKeyPatternID / credentialPatternID are the
+	// matched_pattern_id values for the three word-boundary regex patterns,
+	// which match a regex rather than one literal string out of a
+	// errorPattern.matches list, so they are named by matcher identity
+	// instead of by matched substring.
+	billingPatternID    = "billing"
+	apiKeyPatternID     = "api_key"
+	credentialPatternID = "credential"
+)
+
+// ClassifyError returns the ErrorType for the given stderr text and exit
+// code. It is a thin wrapper around ClassifyErrorWithPattern for callers
+// that don't need the matched pattern id.
+func ClassifyError(stderr string, exitCode int) ErrorType {
+	typ, _ := ClassifyErrorWithPattern(stderr, exitCode)
+	return typ
+}
+
+// ClassifyErrorWithPattern returns the ErrorType for the given stderr text
+// and exit code, alongside the id of the errorPatterns entry that drove the
+// classification (lr-151fa7). exitCode 127 = binary not found; 124 = killed
+// by timeout command — both classify on exit code alone, never touching
+// errorPatterns, and report a synthetic id naming that fact (see
+// exitCodePatternNotFound/exitCodePatternTimeout) rather than "". The
+// returned patternID is "" when the result is ErrTypeUnknown, i.e. nothing
+// matched.
+//
+// patternID is the pattern ITSELF (the matched substring, e.g. "rate
+// limit", "529 overloaded"), or one of the three word-boundary regex names
+// ("billing"/"api_key"/"credential") — never a copy of the surrounding
+// classified text. This is the trust-boundary distinction DRUMMER's
+// decision draws: matched_pattern_id names WHICH matcher fired and is safe
+// to log at Info; the classified text itself may carry model prose, session
+// ids, or secrets and is gated separately (see ClassifiedTextExcerpt).
 //
 // Word-boundary patterns (billing, api key, credential) are checked inline,
 // interleaved with the plain-substring errorPatterns table, so slice/table
@@ -98,19 +140,19 @@ var errorPatterns = []errorPattern{
 // "billing" or "credential" substring must not outrank a real match earlier
 // in that priority order, nor a later one for a pattern this input doesn't
 // actually contain.
-func ClassifyError(stderr string, exitCode int) ErrorType {
+func ClassifyErrorWithPattern(stderr string, exitCode int) (ErrorType, string) {
 	if exitCode == 127 {
-		return ErrTypeNotFound
+		return ErrTypeNotFound, exitCodePatternNotFound
 	}
 	if exitCode == 124 {
-		return ErrTypeTimeout
+		return ErrTypeTimeout, exitCodePatternTimeout
 	}
 
 	lower := strings.ToLower(stderr)
 	for _, p := range errorPatterns {
 		for _, m := range p.matches {
 			if strings.Contains(lower, m) {
-				return p.typ
+				return p.typ, m
 			}
 		}
 		// Word-boundary patterns belonging to this same ErrorType, checked
@@ -119,15 +161,18 @@ func ClassifyError(stderr string, exitCode int) ErrorType {
 		switch p.typ {
 		case ErrTypeQuota:
 			if billingWordRe.MatchString(stderr) {
-				return ErrTypeQuota
+				return ErrTypeQuota, billingPatternID
 			}
 		case ErrTypeAuth:
-			if apiKeyWordRe.MatchString(stderr) || credentialWordRe.MatchString(stderr) {
-				return ErrTypeAuth
+			if apiKeyWordRe.MatchString(stderr) {
+				return ErrTypeAuth, apiKeyPatternID
+			}
+			if credentialWordRe.MatchString(stderr) {
+				return ErrTypeAuth, credentialPatternID
 			}
 		}
 	}
-	return ErrTypeUnknown
+	return ErrTypeUnknown, ""
 }
 
 // resetPatterns are regexes that extract a reset time from error output.

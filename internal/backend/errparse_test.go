@@ -134,3 +134,112 @@ func TestClassifyError_QuotaOutranksRateLimit(t *testing.T) {
 		t.Errorf("ClassifyError(quota+rate_limit text) = %q, want %q (quota must win by slice order)", got, ErrTypeQuota)
 	}
 }
+
+// ---- ClassifyErrorWithPattern (lr-151fa7: matched_pattern_id field) ----
+
+// TestClassifyErrorWithPattern_MatchedPatternID covers the plain-substring
+// table case: patternID is the literal matched substring.
+func TestClassifyErrorWithPattern_MatchedPatternID(t *testing.T) {
+	typ, patternID := ClassifyErrorWithPattern("please slow down and try again", 1)
+	if typ != ErrTypeRateLimit {
+		t.Fatalf("typ = %q, want %q", typ, ErrTypeRateLimit)
+	}
+	if patternID != "please slow down" {
+		t.Errorf("patternID = %q, want %q", patternID, "please slow down")
+	}
+}
+
+// TestClassifyErrorWithPattern_WordBoundaryPatterns covers the three regex
+// patterns, which report a fixed id rather than the literal matched text
+// (there is no single "matched substring" for a regex).
+func TestClassifyErrorWithPattern_WordBoundaryPatterns(t *testing.T) {
+	cases := []struct {
+		name    string
+		text    string
+		wantTyp ErrorType
+		wantID  string
+	}{
+		{"billing", "your billing account is past due", ErrTypeQuota, billingPatternID},
+		// "api key" alone (not "invalid api key"/"invalid_api_key", which
+		// are plain-substring Auth patterns that would win first) isolates
+		// the word-boundary regex path specifically.
+		{"api key", "please rotate your api key before it expires", ErrTypeAuth, apiKeyPatternID},
+		{"credential", "authentication failed: credential expired", ErrTypeAuth, credentialPatternID},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			typ, patternID := ClassifyErrorWithPattern(tc.text, 1)
+			if typ != tc.wantTyp {
+				t.Errorf("typ = %q, want %q", typ, tc.wantTyp)
+			}
+			if patternID != tc.wantID {
+				t.Errorf("patternID = %q, want %q", patternID, tc.wantID)
+			}
+		})
+	}
+}
+
+// TestClassifyErrorWithPattern_Unknown_EmptyPatternID covers DRUMMER's
+// acceptance criterion directly: ErrTypeUnknown must report an empty
+// patternID, not a placeholder or the input text.
+func TestClassifyErrorWithPattern_Unknown_EmptyPatternID(t *testing.T) {
+	typ, patternID := ClassifyErrorWithPattern("nothing here matches any pattern", 1)
+	if typ != ErrTypeUnknown {
+		t.Fatalf("typ = %q, want %q", typ, ErrTypeUnknown)
+	}
+	if patternID != "" {
+		t.Errorf("patternID = %q, want empty string for ErrTypeUnknown", patternID)
+	}
+}
+
+// TestClassifyErrorWithPattern_ExitCodeFastPaths covers the 127/124
+// synthetic ids — these classify on exit code alone and never touch
+// errorPatterns, so patternID must name that (not be empty, which would be
+// indistinguishable from "nothing matched").
+func TestClassifyErrorWithPattern_ExitCodeFastPaths(t *testing.T) {
+	if typ, id := ClassifyErrorWithPattern("anything", 127); typ != ErrTypeNotFound || id != exitCodePatternNotFound {
+		t.Errorf("exit 127: got (%q, %q), want (%q, %q)", typ, id, ErrTypeNotFound, exitCodePatternNotFound)
+	}
+	if typ, id := ClassifyErrorWithPattern("anything", 124); typ != ErrTypeTimeout || id != exitCodePatternTimeout {
+		t.Errorf("exit 124: got (%q, %q), want (%q, %q)", typ, id, ErrTypeTimeout, exitCodePatternTimeout)
+	}
+}
+
+// TestClassifyErrorWithPattern_FirstMatchWinsPriority guards the same
+// slice-order invariant TestClassifyError_QuotaOutranksRateLimit covers for
+// ClassifyError, but also asserts the reported patternID is the WINNING
+// (quota) pattern, not the rate_limit one that also occurs in the text —
+// a regression here would silently misattribute which matcher actually
+// drove the classification.
+func TestClassifyErrorWithPattern_FirstMatchWinsPriority(t *testing.T) {
+	typ, patternID := ClassifyErrorWithPattern("quota exceeded and rate limit hit", 1)
+	if typ != ErrTypeQuota {
+		t.Fatalf("typ = %q, want %q", typ, ErrTypeQuota)
+	}
+	if patternID != "quota exceeded" {
+		t.Errorf("patternID = %q, want %q (the quota pattern that actually won, not the co-occurring rate_limit pattern)", patternID, "quota exceeded")
+	}
+}
+
+// TestClassifyErrorWithPattern_ConsistentWithClassifyError asserts
+// ClassifyError and ClassifyErrorWithPattern never disagree on ErrorType —
+// ClassifyError is documented as a thin wrapper, and any divergence would
+// mean the two classify differently for the same input.
+func TestClassifyErrorWithPattern_ConsistentWithClassifyError(t *testing.T) {
+	cases := []string{
+		"rate limit exceeded, try again later",
+		"your billing account is past due",
+		"invalid api key provided",
+		"connection refused",
+		"context deadline exceeded",
+		"totally unmatched text",
+		"",
+	}
+	for _, text := range cases {
+		want := ClassifyError(text, 1)
+		got, _ := ClassifyErrorWithPattern(text, 1)
+		if got != want {
+			t.Errorf("ClassifyError(%q,1)=%q but ClassifyErrorWithPattern(%q,1)=%q", text, want, text, got)
+		}
+	}
+}
