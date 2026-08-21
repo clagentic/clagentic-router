@@ -1304,6 +1304,19 @@ func (r *Router) offlineRecoveryProbe() {
 			continue
 		}
 
+		// Skip backends offline due to a locally misconfigured model
+		// identifier (lr-2f35bd, B5): sticky by design — no probe interval
+		// makes an invalid model name valid, so this is not "pending a
+		// reset" (HasPendingReset above is quota/rate-limit-specific and
+		// would not catch this) but the same "do not re-probe" contract
+		// applies. An operator must fix router.yaml and call
+		// POST /backends/{id}/reset (ForceReset) to clear this; only that
+		// clears LastErrorType, so this skip does not need its own recovery
+		// path here.
+		if snap.LastErrorType == state.ErrTypeModelConfig {
+			continue
+		}
+
 		// Gate: only probe once per interval.
 		if !bs.RecoveryProbeDue(intervalSeconds) {
 			continue

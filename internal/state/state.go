@@ -41,6 +41,12 @@ const (
 	// before a final text result). See backend.ErrTypeMaxTurns's doc for
 	// the full rationale (lr-39ed6b).
 	ErrTypeMaxTurns ErrorType = "max_turns"
+	// ErrTypeModelConfig mirrors backend.ErrTypeModelConfig — a locally
+	// misconfigured model identifier the provider/endpoint rejects. See
+	// backend.ErrTypeModelConfig's doc for the full rationale (lr-2f35bd,
+	// folded-in defect B5) and RecordFailure's ErrTypeModelConfig case for
+	// why this is a sticky, never-auto-recovered transition.
+	ErrTypeModelConfig ErrorType = "model_config"
 )
 
 // latencyEMAlpha is the EMA smoothing factor for call latency.
@@ -304,8 +310,15 @@ func (s *BackendState) RecordFailure(errType ErrorType, errRaw string, resetAt t
 			s.QuotaResetAt = resetAt
 		}
 		s.Status = StatusOffline
-	case ErrTypeAuth, ErrTypeNotFound:
-		// Permanent until operator intervenes
+	case ErrTypeAuth, ErrTypeNotFound, ErrTypeModelConfig:
+		// Permanent until operator intervenes. ErrTypeModelConfig joins the
+		// same hard-offline bucket as Auth/NotFound (lr-2f35bd, B5): no
+		// probe interval or retry makes a misconfigured model identifier
+		// valid, so this must not be reachable via TryRecover's quota/
+		// rate-limit reset-time paths (neither QuotaExhausted nor
+		// RateLimitResetAt is set here, so TryRecover's two conditions never
+		// fire for this cause) and must not be read by any caller as
+		// transient capacity exhaustion.
 		s.Status = StatusOffline
 	case ErrTypeRateLimit:
 		if !resetAt.IsZero() {
