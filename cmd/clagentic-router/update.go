@@ -135,14 +135,20 @@ func runUpdate(deploy config.DeployConfig, out *os.File) error {
 	switch serviceManager {
 	case "systemd":
 		serviceName := deploy.ResolvedServiceName()
-		fmt.Fprintf(out, "update: restarting systemd unit %s.service\n", serviceName)
-		if err := restartSystemdService(serviceName); err != nil {
+		fmt.Fprintf(out, "update: restarting systemd unit %s.service (system scope)\n", serviceName)
+		if err := restartSystemdService(serviceName, systemdScopeSystem); err != nil {
+			return fmt.Errorf("restart: %w", err)
+		}
+	case "systemd-user":
+		serviceName := deploy.ResolvedServiceName()
+		fmt.Fprintf(out, "update: restarting systemd unit %s.service (user scope)\n", serviceName)
+		if err := restartSystemdService(serviceName, systemdScopeUser); err != nil {
 			return fmt.Errorf("restart: %w", err)
 		}
 	case "none":
 		fmt.Fprintln(out, "update: service_manager=none, skipping restart")
 	default:
-		return fmt.Errorf("deploy.service_manager: unknown value %q (want \"systemd\" or \"none\")", serviceManager)
+		return fmt.Errorf("deploy.service_manager: unknown value %q (want \"systemd\", \"systemd-user\", or \"none\")", serviceManager)
 	}
 
 	fmt.Fprintln(out, "update: done")
@@ -420,13 +426,46 @@ func installBinary(stagedPath, installPath string) error {
 	return nil
 }
 
+// systemdScope selects whether restartSystemdService targets the system
+// systemd manager (PID 1, root-run units under /etc/systemd/system) or the
+// per-user systemd manager (`systemctl --user`, units under
+// ~/.config/systemd/user — see deploy/clagentic-router.user.service). This
+// is deploy.service_manager's "systemd" vs. "systemd-user" distinction,
+// carried as a typed value rather than re-branching on the raw config
+// string past runUpdate, so systemctlRestartArgs stays a pure, easily
+// tested function of (serviceName, scope).
+type systemdScope int
+
+const (
+	systemdScopeSystem systemdScope = iota
+	systemdScopeUser
+)
+
+// systemctlRestartArgs builds the argv for restarting serviceName at the
+// given scope, without the leading "systemctl" — split out from
+// restartSystemdService so the argument shape (in particular, that
+// "--user" precedes "restart", and the unit name is always
+// serviceName+".service") is unit-testable without invoking systemctl or
+// requiring a systemd session in the test environment.
+func systemctlRestartArgs(serviceName string, scope systemdScope) []string {
+	unit := serviceName + ".service"
+	if scope == systemdScopeUser {
+		return []string{"--user", "restart", unit}
+	}
+	return []string{"restart", unit}
+}
+
 // restartSystemdService restarts the named systemd unit (without the
-// .service suffix, which is appended here).
-func restartSystemdService(serviceName string) error {
-	cmd := exec.Command("systemctl", "restart", serviceName+".service")
+// .service suffix, which is appended here) at the given scope. systemd and
+// none behavior is unchanged by the addition of the user-scope path: the
+// system-scope branch below issues the exact same "systemctl restart
+// <unit>.service" invocation as before "systemd-user" was added.
+func restartSystemdService(serviceName string, scope systemdScope) error {
+	args := systemctlRestartArgs(serviceName, scope)
+	cmd := exec.Command("systemctl", args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("systemctl restart %s.service failed: %w\n%s", serviceName, err, output)
+		return fmt.Errorf("systemctl %s failed: %w\n%s", strings.Join(args, " "), err, output)
 	}
 	return nil
 }

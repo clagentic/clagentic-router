@@ -357,12 +357,20 @@ anthropic:
 # manage yourself instead — e.g. "." to build from update's own working
 # directory, matching pre-lr-720e91 behavior exactly. update never touches
 # the git state of an explicitly-configured source_dir.
+# For a single-operator workstation running the router as a `systemd --user`
+# unit instead of a system service (see deploy/clagentic-router.user.service
+# and docs/OPERATOR-GUIDE.md's "Systemd, user scope" section), set
+# install_path to your own $HOME/.local/bin/clagentic-router and
+# service_manager to "systemd-user" — update then restarts via
+# `systemctl --user restart` instead of the system-scope `systemctl
+# restart` the default "systemd" value uses. "systemd" and "none" behavior
+# is unchanged by the addition of "systemd-user".
 # deploy:
 #   source_dir: ""                                   # default: managed checkout (see above); set to an explicit path (e.g. ".") to opt out of the managed-checkout behavior
 #   repo_url: ""                                      # git remote to clone into the DEFAULT managed source_dir if it does not exist yet. Required only when source_dir is left at its default AND the managed checkout has not been created another way (e.g. a prior manual `git clone`). No default — cloning to an unaudited location from a guessed URL is worse than failing loudly.
 #   install_path: /usr/local/bin/clagentic-router    # path the running service execs
 #   service_name: clagentic-router                   # systemd unit (without .service)
-#   service_manager: systemd                         # systemd | none (install only, no restart)
+#   service_manager: systemd                         # systemd | systemd-user | none (install only, no restart)
 
 # --- Cache token metrics (GET <cache_metrics.path>) ---
 # Opt-in per-model prompt-cache token capture at the adapter Invoke boundary

@@ -95,6 +95,28 @@ func TestDeployConfig_Overrides(t *testing.T) {
 	}
 }
 
+// TestDeployConfig_ServiceManager_SystemdUser verifies "systemd-user"
+// round-trips as-is through ResolvedServiceManager, and that "systemd" and
+// "none" remain byte-identical to their pre-lr-574334 values — the
+// compatibility guarantee A1 requires.
+func TestDeployConfig_ServiceManager_SystemdUser(t *testing.T) {
+	cases := []struct {
+		configured string
+		want       string
+	}{
+		{"", "systemd"},        // default, unchanged
+		{"systemd", "systemd"}, // unchanged
+		{"none", "none"},       // unchanged
+		{"systemd-user", "systemd-user"},
+	}
+	for _, tc := range cases {
+		d := DeployConfig{ServiceManager: tc.configured}
+		if got := d.ResolvedServiceManager(); got != tc.want {
+			t.Errorf("ResolvedServiceManager() with ServiceManager=%q = %q, want %q", tc.configured, got, tc.want)
+		}
+	}
+}
+
 // TestLoad_DeployBlock_Unmarshal verifies the deploy block round-trips
 // through the same config.Load path "serve" uses — no second config surface.
 func TestLoad_DeployBlock_Unmarshal(t *testing.T) {
@@ -126,6 +148,34 @@ deploy:
 		t.Errorf("Deploy.ResolvedServiceName() = %q, want %q", got, want)
 	}
 	if got, want := cfg.Deploy.ResolvedServiceManager(), "none"; got != want {
+		t.Errorf("Deploy.ResolvedServiceManager() = %q, want %q", got, want)
+	}
+}
+
+// TestLoad_DeployBlock_Unmarshal_SystemdUser verifies "systemd-user" round-trips
+// through config.Load the same way "systemd" and "none" already do (lr-574334 A1).
+func TestLoad_DeployBlock_Unmarshal_SystemdUser(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/router.yaml"
+	raw := `
+backends:
+  local:
+    adapter: ollama_http
+    url: http://localhost:8080
+    model: phi4-mini
+
+deploy:
+  install_path: /home/operator/.local/bin/clagentic-router
+  service_manager: systemd-user
+`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatalf("write test config: %v", err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got, want := cfg.Deploy.ResolvedServiceManager(), "systemd-user"; got != want {
 		t.Errorf("Deploy.ResolvedServiceManager() = %q, want %q", got, want)
 	}
 }

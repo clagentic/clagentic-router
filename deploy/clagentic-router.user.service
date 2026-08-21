@@ -1,0 +1,109 @@
+# deploy/clagentic-router.user.service — sample systemd USER unit for
+# clagentic-router (lr-574334), for a single-operator workstation deployment
+# where the daemon runs as the invoking human's own user rather than a
+# dedicated system service account. Uses systemd specifiers (%h = the unit's
+# owning user's home directory, %S = that user's state directory root, i.e.
+# $HOME/.local/state) so this file is copyable to any machine unmodified —
+# never edit in a username, host path, or account id (see docs/OPERATOR-GUIDE.md).
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/clagentic-router.user.service ~/.config/systemd/user/clagentic-router.service
+#   cp router.example.yaml ~/.config/clagentic/router/router.yaml   # then edit it
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now clagentic-router
+#   loginctl enable-linger "$USER"   # keeps the unit running after you log out
+#
+# In deploy.service_manager (router.yaml), set "systemd-user" so
+# `clagentic-router update` restarts THIS unit via `systemctl --user restart`
+# instead of the system-scope `systemctl restart` the sibling
+# clagentic-router.service template uses.
+#
+# WHY NO HOME WARNING (contrast with clagentic-router.service): the system
+# template above carries a REQUIRED-HOME warning because a system-scope
+# systemd unit does not set HOME by default, and the claude_cli adapter
+# needs $HOME/.claude/.credentials.json. A systemd --user unit does not have
+# this problem — the user systemd manager instance sets HOME from the
+# invoking user's own passwd entry, so no Environment=HOME=... line is
+# needed or included here.
+#
+# WHY StateDirectory= ALONE IS NOT ENOUGH (this is the non-obvious part):
+# systemd's StateDirectory= directive creates the directory and exports its
+# path to the unit as $STATE_DIRECTORY, but clagentic-router never reads
+# that variable — it only reads CLAGENTIC_ROUTER_STATE_DIR (see
+# internal/backend/claude_cli.go's computeClaudeSubprocessHome) and
+# Storage.DBPath / $XDG_STATE_HOME (see resolveDBPath in
+# cmd/clagentic-router/main.go). At user scope, StateDirectory=clagentic-router
+# expands under %S (i.e. $HOME/.local/state/clagentic-router), which happens
+# to match XDG_STATE_HOME's own default — so DBPath resolution alone would
+# already land in the right place. But the compiled fallback default for the
+# claude_cli subprocess-home state root is /var/lib/clagentic-router
+# (internal/backend/claude_cli.go's defaultSubprocessHomeStateDir, root-only
+# branch) which is both semantically wrong for a user-scope install and
+# unwritable by a non-root user. CLAGENTIC_ROUTER_STATE_DIR is therefore set
+# explicitly below rather than relied upon implicitly, so this template is
+# correct regardless of whether HOME/XDG_STATE_HOME end up visible to the
+# unit's environment the way an interactive shell's would be.
+
+[Unit]
+Description=Clagentic: Router LLM routing daemon (user scope)
+Documentation=https://github.com/clagentic/clagentic-router
+After=network.target
+
+[Service]
+Type=simple
+
+# Config file — created from router.example.yaml, see the install steps above.
+ExecStart=%h/.local/bin/clagentic-router serve --config %h/.config/clagentic/router/router.yaml
+
+# PATH: a systemd --user unit inherits a minimal PATH (typically
+# /usr/bin:/bin) that does NOT include %h/.local/bin, where `claude`
+# (and other user-installed CLIs, e.g. via npm/pipx --user installs)
+# commonly live. Verified live (pre-lr-92ee18 B2 fix): without this, the
+# daemon logged 3x "binary not found at startup name=claude" at WARN on
+# startup, the service stayed "active (running)", GET /health reported
+# "ok", and every claude_cli-backed chain silently fell through to
+# whatever backend came next (here, codex in /usr/bin) — nothing about
+# the service's own status surfaced the missing binary. As of lr-92ee18
+# (internal/backend/binpath.go, internal/server/handlers.go) that log
+# line is ERROR-level and GET /health reports a non-"ok" status with the
+# backend listed in unresolved_binaries — but the chain still silently
+# falls through to the next configured backend either way, so the PATH
+# fix below remains necessary regardless of log level or /health status.
+# Prepending %h/.local/bin closes the underlying gap.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+# State directory — see the "WHY StateDirectory= ALONE IS NOT ENOUGH" note
+# above for why both of these lines are needed together, not either alone.
+StateDirectory=clagentic-router
+Environment=CLAGENTIC_ROUTER_STATE_DIR=%S/clagentic-router
+
+# Load secrets (CLAGENTIC_ROUTER_TOKEN, API keys, etc.) from a separate
+# environment file that is not committed to source control.
+# [CONFIGURE] Create this file with mode 0600.
+EnvironmentFile=%h/.config/clagentic/router/env
+
+Restart=on-failure
+RestartSec=5s
+
+# Basic hardening — see the sibling clagentic-router.service for the
+# system-scope equivalent (NoNewPrivileges=true, ProtectSystem=strict,
+# ReadWritePaths=). Only NoNewPrivileges=true is included here:
+# it is a plain prctl() on the process itself and has identical semantics
+# at user scope. ProtectSystem=strict and ReadWritePaths= are deliberately
+# OMITTED — both rely on systemd building a private mount namespace for the
+# unit, which under a --user manager requires unprivileged user namespaces
+# to be permitted on the host kernel (kernel.unprivileged_userns_clone,
+# further gated on some distros by
+# kernel.apparmor_restrict_unprivileged_userns). That is not guaranteed
+# across every machine this file is copied to, and this repo's build/test
+# environment has no systemctl --user manager available to empirically
+# verify a mount-namespaced unit actually starts here. A unit that fails
+# to start is worse than one missing a hardening line (see
+# docs/OPERATOR-GUIDE.md), so these two are left for an operator to add
+# and verify locally with `systemd-analyze verify` and a real
+# `systemctl --user start` on their own host, not shipped unverified here.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
