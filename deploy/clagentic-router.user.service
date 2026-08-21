@@ -81,5 +81,24 @@ EnvironmentFile=%h/.config/clagentic/router/env
 Restart=on-failure
 RestartSec=5s
 
+# Basic hardening — see the sibling clagentic-router.service for the
+# system-scope equivalent (NoNewPrivileges=true, ProtectSystem=strict,
+# ReadWritePaths=). Only NoNewPrivileges=true is included here:
+# it is a plain prctl() on the process itself and has identical semantics
+# at user scope. ProtectSystem=strict and ReadWritePaths= are deliberately
+# OMITTED — both rely on systemd building a private mount namespace for the
+# unit, which under a --user manager requires unprivileged user namespaces
+# to be permitted on the host kernel (kernel.unprivileged_userns_clone,
+# further gated on some distros by
+# kernel.apparmor_restrict_unprivileged_userns). That is not guaranteed
+# across every machine this file is copied to, and this repo's build/test
+# environment has no systemctl --user manager available to empirically
+# verify a mount-namespaced unit actually starts here. A unit that fails
+# to start is worse than one missing a hardening line (see
+# docs/OPERATOR-GUIDE.md), so these two are left for an operator to add
+# and verify locally with `systemd-analyze verify` and a real
+# `systemctl --user start` on their own host, not shipped unverified here.
+NoNewPrivileges=true
+
 [Install]
 WantedBy=default.target
