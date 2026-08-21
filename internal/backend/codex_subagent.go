@@ -201,9 +201,13 @@ func (a *CodexSubagentAdapter) Invoke(ctx context.Context, req *Request) (*Respo
 		// rationale (this adapter shares codex_cli's exec-and-scan shape).
 		// truncate() is still used for the Raw display field only.
 		combined := stderr.String() + stdout.String()
-		errType := ClassifyError(combined, exitCode)
-		slog.Debug("codex_subagent invoke failed",
-			"backend", a.id, "exit_code", exitCode, "error_type", errType)
+		errType, patternID := ClassifyErrorWithPattern(combined, exitCode)
+		slog.Info("codex_subagent invoke failed",
+			"backend", a.id, "exit_code", exitCode, "error_type", errType,
+			"stderr_len", stderr.Len(), "stdout_len", stdout.Len(), "matched_pattern_id", patternID)
+		slog.Debug("codex_subagent invoke failed: classified text excerpt",
+			"backend", a.id,
+			"classified_text_excerpt", ClassifiedTextExcerpt(combined, patternID))
 		raw := stderrStr
 		if raw == "" {
 			raw = truncate(stdout.String(), 500)

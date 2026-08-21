@@ -234,15 +234,19 @@ func (a *GeminiCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 		// window can silently drop tail-positioned error text. truncate() is
 		// still used for the Raw display field only.
 		full := stderr.String() + stdout.String()
-		errType := ClassifyError(full, exitCode)
+		errType, patternID := ClassifyErrorWithPattern(full, exitCode)
 		resetAt := ParseResetTime(full)
 		raw := stderrStr
 		if raw == "" {
 			raw = truncate(stdout.String(), 500)
 		}
-		slog.Debug("gemini_cli invoke failed",
+		slog.Info("gemini_cli invoke failed",
 			"backend", a.id, "exit_code", exitCode, "error_type", errType, "reset_at", resetAt,
-			"request_id", RequestIDFromCtx(ctx))
+			"request_id", RequestIDFromCtx(ctx),
+			"stderr_len", stderr.Len(), "stdout_len", stdout.Len(), "matched_pattern_id", patternID)
+		slog.Debug("gemini_cli invoke failed: classified text excerpt",
+			"backend", a.id, "request_id", RequestIDFromCtx(ctx),
+			"classified_text_excerpt", ClassifiedTextExcerpt(full, patternID))
 		return nil, &InvokeError{Type: errType, Raw: raw}
 	}
 

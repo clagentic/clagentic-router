@@ -788,11 +788,15 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 		// error text was never guaranteed to be the text that produced
 		// error_type — see extractClassificationText's doc for the fix.
 		text := extractClassificationText(stdout.Bytes(), stderr.String())
-		errType := ClassifyError(text, exitCode)
+		errType, patternID := ClassifyErrorWithPattern(text, exitCode)
 		resetAt := ParseResetTime(text)
-		slog.Debug("claude_cli invoke failed",
+		slog.Info("claude_cli invoke failed",
 			"backend", a.id, "exit_code", exitCode, "error_type", errType, "reset_at", resetAt,
-			"request_id", RequestIDFromCtx(ctx))
+			"request_id", RequestIDFromCtx(ctx),
+			"stderr_len", stderr.Len(), "stdout_len", stdout.Len(), "matched_pattern_id", patternID)
+		slog.Debug("claude_cli invoke failed: classified text excerpt",
+			"backend", a.id, "request_id", RequestIDFromCtx(ctx),
+			"classified_text_excerpt", ClassifiedTextExcerpt(text, patternID))
 		ie := &InvokeError{Type: errType, Raw: truncate(text, 500)}
 		return nil, ie
 	}
