@@ -927,16 +927,23 @@ func TestInstallAndVerifyWithRollback_CrashWindowState_SuccessConsumesStaleBak(t
 // TestVerifyRestartAdvanced_UnchangedSnapshot_IsError is the regression test
 // named explicitly in the lr-c69197 dispatch: "a restart that did NOT
 // restart must be an error, not a silent pass." A restart call that exits 0
-// but whose before/after ActiveEnterTimestamp+MainPID are identical (e.g.
-// systemd accepted the restart request against an already-running unit that
-// for some reason didn't actually cycle, or the unit silently no-op'd) must
-// be reported as a failed restart.
+// but whose before/after snapshot is identical (e.g. systemd accepted the
+// restart request against an already-running unit that for some reason
+// didn't actually cycle, or the unit silently no-op'd) must be reported as a
+// failed restart. ActiveState is included and "active" (lr-c69197 seventh
+// fold-in: MainPID is D-Bus type='u' and reports 0, never empty, for a unit
+// with no running process — see systemctlShowValue's doc — so a real
+// snapshot always has a numeric MainPID, not an empty one).
 func TestVerifyRestartAdvanced_UnchangedSnapshot_IsError(t *testing.T) {
-	snap := systemdUnitSnapshot{activeEnterTimestamp: "Thu 2026-08-20 19:15:06 EDT", mainPID: "2577441"}
+	snap := systemdUnitSnapshot{
+		activeEnterTimestamp: "Thu 2026-08-20 19:15:06 EDT",
+		mainPID:              "2577441",
+		activeState:          "active",
+	}
 
 	err := verifyRestartAdvanced("clagentic-router", snap, nil, snap)
 	if err == nil {
-		t.Fatal("expected error for unchanged ActiveEnterTimestamp/MainPID across a restart, got nil")
+		t.Fatal("expected error for unchanged snapshot across a restart, got nil")
 	}
 	if !strings.Contains(err.Error(), "not actually restarted") {
 		t.Errorf("error = %q, want it to name that the service was not actually restarted", err.Error())
@@ -959,6 +966,7 @@ func TestVerifyRestartAdvanced_FastRestartSameWallClockSecond_NotMisreportedAsFa
 		activeEnterTimestamp:          "Thu 2026-08-20 19:15:06 EDT",
 		activeEnterTimestampMonotonic: "1234567890",
 		mainPID:                       "2577441",
+		activeState:                   "active",
 	}
 	after := systemdUnitSnapshot{
 		// Same wall-clock second AND the kernel happened to reuse the PID —
@@ -966,6 +974,7 @@ func TestVerifyRestartAdvanced_FastRestartSameWallClockSecond_NotMisreportedAsFa
 		activeEnterTimestamp:          "Thu 2026-08-20 19:15:06 EDT",
 		activeEnterTimestampMonotonic: "1234567913", // advanced by 23us — genuinely restarted
 		mainPID:                       "2577441",
+		activeState:                   "active",
 	}
 
 	if err := verifyRestartAdvanced("clagentic-router", before, nil, after); err != nil {
@@ -978,8 +987,8 @@ func TestVerifyRestartAdvanced_FastRestartSameWallClockSecond_NotMisreportedAsFa
 // case: ActiveEnterTimestamp changing (the unit actually cycled) is accepted
 // even if MainPID is unavailable/unchanged for some reason.
 func TestVerifyRestartAdvanced_TimestampAdvanced_Passes(t *testing.T) {
-	before := systemdUnitSnapshot{activeEnterTimestamp: "Thu 2026-08-20 09:00:00 EDT", mainPID: "111"}
-	after := systemdUnitSnapshot{activeEnterTimestamp: "Thu 2026-08-20 19:15:06 EDT", mainPID: "222"}
+	before := systemdUnitSnapshot{activeEnterTimestamp: "Thu 2026-08-20 09:00:00 EDT", mainPID: "111", activeState: "active"}
+	after := systemdUnitSnapshot{activeEnterTimestamp: "Thu 2026-08-20 19:15:06 EDT", mainPID: "222", activeState: "active"}
 
 	if err := verifyRestartAdvanced("clagentic-router", before, nil, after); err != nil {
 		t.Errorf("verifyRestartAdvanced: unexpected error for an advanced snapshot: %v", err)
@@ -992,7 +1001,7 @@ func TestVerifyRestartAdvanced_TimestampAdvanced_Passes(t *testing.T) {
 // nothing to compare against, so this must not fail merely because the
 // after-snapshot happens to look the same as the (unset) zero value.
 func TestVerifyRestartAdvanced_NoBeforeSnapshot_Passes(t *testing.T) {
-	after := systemdUnitSnapshot{activeEnterTimestamp: "Thu 2026-08-20 19:15:06 EDT", mainPID: "2577441"}
+	after := systemdUnitSnapshot{activeEnterTimestamp: "Thu 2026-08-20 19:15:06 EDT", mainPID: "2577441", activeState: "active"}
 	beforeErr := fmt.Errorf("unit not found")
 
 	if err := verifyRestartAdvanced("clagentic-router", systemdUnitSnapshot{}, beforeErr, after); err != nil {
@@ -1000,89 +1009,77 @@ func TestVerifyRestartAdvanced_NoBeforeSnapshot_Passes(t *testing.T) {
 	}
 }
 
-// TestValidateSystemdUnitSnapshot_PartiallyPopulated_IsError is the
-// regression test for the lr-c69197 sixth fold-in defect (MILLER diagnosis):
-// `systemctl show --property=<unknown> --value` exits 0 with empty stdout
-// for a property systemd does not recognize, so a misspelled property name
-// is indistinguishable at the single-field level from the legitimate
-// "unit never started" case (both are ("", nil) from systemctlShowValue).
-// The whole-suite risk this closes: every other test in this file
-// hand-constructs systemdUnitSnapshot literals directly, so a wrong
-// property name in readSystemdUnitSnapshot's systemctlShowValue calls would
-// pass this entire suite green — it never actually exercises the "read a
-// property that doesn't exist" path. This test exercises
-// validateSystemdUnitSnapshot directly against a snapshot shaped exactly
-// like what a wrong property name would produce: some fields populated
-// (proving the unit HAS started and systemctl IS reachable), one field
-// empty (the fingerprint of a bad property name), which must be a hard,
-// named error rather than silently accepted as "never started".
-func TestValidateSystemdUnitSnapshot_PartiallyPopulated_IsError(t *testing.T) {
-	cases := []struct {
-		name     string
-		snapshot systemdUnitSnapshot
-		wantName string // property name the error must call out
-	}{
-		{
-			name: "ActiveEnterTimestamp empty, others populated",
-			snapshot: systemdUnitSnapshot{
-				activeEnterTimestampMonotonic: "1234567890",
-				mainPID:                       "2577441",
-			},
-			wantName: "ActiveEnterTimestamp",
-		},
-		{
-			name: "ActiveEnterTimestampMonotonic empty, others populated (the misspelling this task fixes)",
-			snapshot: systemdUnitSnapshot{
-				activeEnterTimestamp: "Thu 2026-08-20 19:15:06 EDT",
-				mainPID:              "2577441",
-			},
-			wantName: "ActiveEnterTimestampMonotonic",
-		},
-		{
-			name: "MainPID empty, others populated",
-			snapshot: systemdUnitSnapshot{
-				activeEnterTimestamp:          "Thu 2026-08-20 19:15:06 EDT",
-				activeEnterTimestampMonotonic: "1234567890",
-			},
-			wantName: "MainPID",
-		},
+// TestVerifyRestartAdvanced_AdvancedButNotActive_IsError is the regression
+// test for the lr-c69197 seventh fold-in defect (PEACHES finding, MILLER-
+// confirmed): a restart can advance ActiveEnterTimestampMonotonic and
+// MainPID and then have the unit die immediately afterward — demonstrated
+// on-host via claude-relay.service, whose snapshot advanced at a restart
+// attempt and whose unit was `failed` three seconds later. A snapshot-delta
+// check alone reports that as a successful restart; this must be caught as
+// a failure because the unit did not end up running.
+func TestVerifyRestartAdvanced_AdvancedButNotActive_IsError(t *testing.T) {
+	before := systemdUnitSnapshot{
+		activeEnterTimestamp:          "Sat 2026-07-25 02:10:00 EDT",
+		activeEnterTimestampMonotonic: "1000000",
+		mainPID:                       "170",
+		activeState:                   "active",
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			err := validateSystemdUnitSnapshot(tc.snapshot)
-			if err == nil {
-				t.Fatalf("validateSystemdUnitSnapshot(%+v): expected error for a partially populated snapshot, got nil",
-					tc.snapshot)
-			}
-			if !strings.Contains(err.Error(), tc.wantName) {
-				t.Errorf("validateSystemdUnitSnapshot(%+v) error = %q, want it to name the empty property %q",
-					tc.snapshot, err.Error(), tc.wantName)
-			}
-		})
+	after := systemdUnitSnapshot{
+		// Snapshot genuinely advanced — the restart attempt did cycle the
+		// unit — but it died 3s later and is now failed, not active.
+		activeEnterTimestamp:          "Sat 2026-07-25 02:10:30 EDT",
+		activeEnterTimestampMonotonic: "1030000",
+		mainPID:                       "179",
+		activeState:                   "failed",
+	}
+
+	err := verifyRestartAdvanced("clagentic-router", before, nil, after)
+	if err == nil {
+		t.Fatal("expected error for a snapshot that advanced but left ActiveState != active, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed") {
+		t.Errorf("error = %q, want it to name the observed ActiveState %q", err.Error(), after.activeState)
+	}
+	if !strings.Contains(err.Error(), "did not end up running") {
+		t.Errorf("error = %q, want it to say the unit did not end up running", err.Error())
 	}
 }
 
-// TestValidateSystemdUnitSnapshot_AllEmpty_Passes verifies the legitimate
-// never-started/nonexistent-unit case is unaffected by the sixth fold-in's
-// partial-population guard: when systemd genuinely has no runtime state for
-// the unit at all, every property comes back empty together, and that must
-// still pass validation exactly as before.
-func TestValidateSystemdUnitSnapshot_AllEmpty_Passes(t *testing.T) {
-	if err := validateSystemdUnitSnapshot(systemdUnitSnapshot{}); err != nil {
-		t.Errorf("validateSystemdUnitSnapshot(zero value): unexpected error for the never-started case: %v", err)
+// TestSystemctlShowValue_EmptyOutput_IsError is the regression test for the
+// lr-c69197 seventh fold-in fix (MILLER adjudication, replacing the sixth
+// fold-in's cross-field validateSystemdUnitSnapshot): a never-started unit
+// does NOT leave these properties empty — MainPID and the two timestamp
+// properties are D-Bus numeric types (type='u'/'t') with no empty
+// representation, so a never-started unit reports 0, not "". Empty stdout
+// from a successful (exit 0) `systemctl show --value` is therefore
+// unconditionally a wrong-property-name signal, on a per-field basis with
+// no dependency on sibling fields. This exercises that check directly by
+// invoking systemctlShowValue against a stub "systemctl" that always exits
+// 0 with empty stdout, mirroring how a genuinely unrecognized property name
+// behaves.
+func TestSystemctlShowValue_EmptyOutput_IsError(t *testing.T) {
+	dir := t.TempDir()
+	stubPath := filepath.Join(dir, "systemctl")
+	// #!/bin/sh stub: always succeeds, always prints nothing — reproduces
+	// `systemctl show --property=<unknown> --value`'s documented behavior.
+	if err := os.WriteFile(stubPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write stub systemctl: %v", err)
 	}
-}
+	oldPath := os.Getenv("PATH")
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+oldPath)
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		t.Fatalf("stub systemctl not found on PATH: %v", err)
+	}
 
-// TestValidateSystemdUnitSnapshot_FullyPopulated_Passes verifies the normal
-// successful-read case is unaffected.
-func TestValidateSystemdUnitSnapshot_FullyPopulated_Passes(t *testing.T) {
-	snapshot := systemdUnitSnapshot{
-		activeEnterTimestamp:          "Thu 2026-08-20 19:15:06 EDT",
-		activeEnterTimestampMonotonic: "1234567890",
-		mainPID:                       "2577441",
+	_, err := systemctlShowValue("clagentic-router", systemdScopeSystem, "NotARealProperty")
+	if err == nil {
+		t.Fatal("systemctlShowValue: expected error for empty stdout from a successful call, got nil")
 	}
-	if err := validateSystemdUnitSnapshot(snapshot); err != nil {
-		t.Errorf("validateSystemdUnitSnapshot(%+v): unexpected error for a fully populated snapshot: %v", snapshot, err)
+	if !strings.Contains(err.Error(), "empty value") {
+		t.Errorf("error = %q, want it to name the empty value", err.Error())
+	}
+	if !strings.Contains(err.Error(), "NotARealProperty") {
+		t.Errorf("error = %q, want it to name the property that came back empty", err.Error())
 	}
 }
 

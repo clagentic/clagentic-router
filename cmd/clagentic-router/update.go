@@ -920,11 +920,12 @@ type systemdUnitSnapshot struct {
 	activeEnterTimestamp          string
 	activeEnterTimestampMonotonic string
 	mainPID                       string
+	activeState                   string
 }
 
 // readSystemdUnitSnapshot reads ActiveEnterTimestamp,
-// ActiveEnterTimestampMonotonic, and MainPID for the named unit at the given
-// scope.
+// ActiveEnterTimestampMonotonic, MainPID, and ActiveState for the named unit
+// at the given scope.
 //
 // CORRECTED (lr-c69197 fifth fold-in, PEACHES nit): this comment previously
 // claimed `systemctl show` fails/errors against a unit that has never been
@@ -947,13 +948,29 @@ type systemdUnitSnapshot struct {
 // systemctl-itself-unreachable case, not just the never-started case this
 // comment used to (incorrectly) claim it covered.
 //
-// SECOND ERROR PATH (lr-c69197 sixth fold-in): a PARTIALLY populated
-// snapshot — some fields empty, others not — is a third, distinct outcome
-// from either "never started" (all empty) or "read successfully" (all
-// populated). validateSystemdUnitSnapshot below treats it as a hard error
-// naming the empty property, because it is the fingerprint of a wrong
-// property name silently returning ("", nil) rather than of a legitimate
-// unit lifecycle state.
+// WHAT "NEVER STARTED" ACTUALLY LOOKS LIKE (lr-c69197 seventh fold-in,
+// MILLER adjudication — correcting the sixth fold-in's premise): the sixth
+// fold-in's comment here previously claimed a never-started unit leaves ALL
+// of ActiveEnterTimestamp/ActiveEnterTimestampMonotonic/MainPID empty
+// together, and treated any OTHER combination (some populated, some not) as
+// proof of a misspelled property name. That premise is false. MainPID is a
+// D-Bus type='u' (uint32, org.freedesktop.systemd1.Service.xml:455) and
+// ActiveEnterTimestamp/...Monotonic are both type='t' (uint64, Unit.xml:174,
+// 176) — D-Bus numeric types have no empty representation. A unit with no
+// running main process reports MainPID=0, a POPULATED value, not an empty
+// one; `systemctl show --value` prints the formatted number, it does not
+// omit the line. This holds for every observed unit lifecycle state
+// (oneshot after its process exits, failed, socket-activated, previously-
+// active-now-inactive — verified directly on-host against
+// systemd-remount-fs.service, claude-relay.service, and
+// systemd-random-seed.service, none of which ever produced an empty numeric
+// field). Line omission — and therefore an empty string from
+// systemctlShowValue's --value output — happens ONLY when `systemctl show`
+// is asked for a property name it does not recognize. There is no
+// legitimate unit state that produces a partially- or fully-empty snapshot
+// for these fields; empty is unconditionally a wrong-property-name signal.
+// See systemctlShowValue below for the resulting per-field check, which
+// replaced the sixth fold-in's cross-field validateSystemdUnitSnapshot.
 func readSystemdUnitSnapshot(serviceName string, scope systemdScope) (systemdUnitSnapshot, error) {
 	activeEnter, err := systemctlShowValue(serviceName, scope, "ActiveEnterTimestamp")
 	if err != nil {
@@ -967,66 +984,37 @@ func readSystemdUnitSnapshot(serviceName string, scope systemdScope) (systemdUni
 	if err != nil {
 		return systemdUnitSnapshot{}, err
 	}
-	snapshot := systemdUnitSnapshot{
+	activeState, err := systemctlShowValue(serviceName, scope, "ActiveState")
+	if err != nil {
+		return systemdUnitSnapshot{}, err
+	}
+	return systemdUnitSnapshot{
 		activeEnterTimestamp:          activeEnter,
 		activeEnterTimestampMonotonic: activeEnterMonotonic,
 		mainPID:                       mainPID,
-	}
-	if err := validateSystemdUnitSnapshot(snapshot); err != nil {
-		return systemdUnitSnapshot{}, err
-	}
-	return snapshot, nil
-}
-
-// validateSystemdUnitSnapshot is the MILLER-diagnosed fix (lr-c69197 sixth
-// fold-in): `systemctl show --property=<unknown-name> --value` exits 0 and
-// prints nothing for a property systemd does not recognize — it does not
-// error. systemctlShowValue therefore returns ("", nil) for BOTH a
-// misspelled/wrong property name and the legitimate "unit never started"
-// case (see readSystemdUnitSnapshot's caller doc), making the two
-// indistinguishable at the single-field level. A silently wrong property
-// name would make its field permanently empty in every snapshot, so
-// verifyRestartAdvanced's before==after comparison would never see it
-// change — exactly the false "restart did not happen" negative the
-// monotonic field exists to remove, just moved one property over.
-//
-// The discriminator: on a genuinely never-started unit, systemd has no
-// runtime state for ANY of these properties, so ALL THREE fields come back
-// empty together. A snapshot with some fields populated and others empty is
-// therefore not "never started" — it is evidence that one of the empty
-// fields' property names is wrong. Treat that as a hard, named error
-// instead of a silently degraded field, so a bad property name fails loudly
-// the first time it is read rather than only showing up later as an
-// unexplained missed-restart report.
-func validateSystemdUnitSnapshot(snapshot systemdUnitSnapshot) error {
-	populated := snapshot.activeEnterTimestamp != "" || snapshot.mainPID != ""
-	if !populated {
-		// Nothing populated at all: the legitimate never-started/nonexistent
-		// case. Nothing to validate against.
-		return nil
-	}
-	if snapshot.activeEnterTimestamp == "" {
-		return fmt.Errorf("systemd unit snapshot is partially populated (MainPID=%q) but ActiveEnterTimestamp "+
-			"came back empty — this property name is likely wrong, not a never-started unit (a never-started "+
-			"unit leaves ALL properties empty together)", snapshot.mainPID)
-	}
-	if snapshot.activeEnterTimestampMonotonic == "" {
-		return fmt.Errorf("systemd unit snapshot is partially populated (ActiveEnterTimestamp=%q, MainPID=%q) "+
-			"but ActiveEnterTimestampMonotonic came back empty — this property name is likely wrong, not a "+
-			"never-started unit (a never-started unit leaves ALL properties empty together)",
-			snapshot.activeEnterTimestamp, snapshot.mainPID)
-	}
-	if snapshot.mainPID == "" {
-		return fmt.Errorf("systemd unit snapshot is partially populated (ActiveEnterTimestamp=%q, "+
-			"ActiveEnterTimestampMonotonic=%q) but MainPID came back empty — this property name is likely "+
-			"wrong, not a never-started unit (a never-started unit leaves ALL properties empty together)",
-			snapshot.activeEnterTimestamp, snapshot.activeEnterTimestampMonotonic)
-	}
-	return nil
+		activeState:                   activeState,
+	}, nil
 }
 
 // systemctlShowValue runs `systemctl [--user] show --property=<property>
 // --value <unit>.service` and returns its trimmed stdout.
+//
+// PER-FIELD EMPTY CHECK (lr-c69197 seventh fold-in, MILLER adjudication,
+// replacing the sixth fold-in's validateSystemdUnitSnapshot): `systemctl
+// show --property=<unknown-name> --value` exits 0 with empty stdout for a
+// property systemd does not recognize — a misspelled property name is
+// otherwise silently indistinguishable from a real read. Unlike the
+// deleted cross-field guard, this needs no assumption about sibling
+// fields: every property this function is used for (ActiveEnterTimestamp,
+// ActiveEnterTimestampMonotonic, MainPID — all numeric D-Bus types with no
+// empty representation) is populated in every legitimate unit lifecycle
+// state, including "never started" (see readSystemdUnitSnapshot's doc
+// above), so empty stdout on a successful (exit 0) call is unconditionally
+// a wrong-property-name signal for those fields. ActiveState is the one
+// exception: it is a string enum (type='s', Unit.xml:145) that IS legitimately
+// non-empty for every state systemd tracks a unit in at all, so the same
+// "empty means wrong name" reasoning still applies to it too — there is no
+// unit systemd knows about with an empty ActiveState.
 func systemctlShowValue(serviceName string, scope systemdScope, property string) (string, error) {
 	args := systemctlShowArgs(serviceName, scope, property)
 	cmd := exec.Command("systemctl", args...)
@@ -1034,7 +1022,14 @@ func systemctlShowValue(serviceName string, scope systemdScope, property string)
 	if err != nil {
 		return "", fmt.Errorf("systemctl %s failed: %w\n%s", strings.Join(args, " "), err, output)
 	}
-	return strings.TrimSpace(string(output)), nil
+	value := strings.TrimSpace(string(output))
+	if value == "" {
+		return "", fmt.Errorf("systemctl %s succeeded but returned an empty value for property %q — "+
+			"this property has no legitimate empty state (numeric D-Bus types report 0, not empty; "+
+			"ActiveState is never unset for a unit systemd knows about), so an empty result means the "+
+			"property name is wrong, not that the unit has never started", strings.Join(args, " "), property)
+	}
+	return value, nil
 }
 
 // restartAndVerifySystemdService is restartSystemdService plus the readback
@@ -1075,8 +1070,8 @@ func restartAndVerifySystemdService(serviceName string, scope systemdScope, out 
 		return err
 	}
 
-	fmt.Fprintf(out, "update: verified restart of %s.service (ActiveEnterTimestamp=%s, MainPID=%s)\n",
-		serviceName, after.activeEnterTimestamp, after.mainPID)
+	fmt.Fprintf(out, "update: verified restart of %s.service (ActiveEnterTimestamp=%s, MainPID=%s, ActiveState=%s)\n",
+		serviceName, after.activeEnterTimestamp, after.mainPID, after.activeState)
 	return nil
 }
 
@@ -1102,12 +1097,32 @@ func restartAndVerifySystemdService(serviceName string, scope systemdScope, out 
 // activeEnterTimestampMonotonic carries microsecond precision and has no
 // such same-second collision floor, so it still differs even when the
 // wall-clock field and PID do not.
+//
+// ACTIVESTATE REQUIREMENT (lr-c69197 seventh fold-in, PEACHES finding,
+// MILLER-confirmed): a snapshot delta alone is not sufficient. A restart can
+// advance ActiveEnterTimestampMonotonic AND MainPID and then have the unit
+// die immediately afterward — demonstrated on-host via claude-relay.service,
+// whose timestamps/PID advanced at a restart attempt and whose unit was
+// `failed` three seconds later. That sequence passes the delta check above
+// (before != after) while reporting a restart that did NOT end with the
+// service running, which is the same false-PASS class as the defect this
+// whole readback exists to close. ActiveState is a D-Bus type='s' string
+// enum (Unit.xml:145) — unlike the numeric fields above, an empty value
+// here (already rejected by systemctlShowValue) is the wrong-name signal,
+// and "failed"/"inactive"/etc. are legitimate-but-unwanted values to reject
+// on their own terms, not by absence.
 func verifyRestartAdvanced(serviceName string, before systemdUnitSnapshot, beforeErr error, after systemdUnitSnapshot) error {
 	if beforeErr == nil && before == after {
 		return fmt.Errorf("restart of %s.service reported success but the unit's ActiveEnterTimestamp (%s), "+
-			"ActiveEnterTimestampMonotonic (%s), and MainPID (%s) are all unchanged from before the restart — "+
-			"the service was not actually restarted",
-			serviceName, after.activeEnterTimestamp, after.activeEnterTimestampMonotonic, after.mainPID)
+			"ActiveEnterTimestampMonotonic (%s), MainPID (%s), and ActiveState (%s) are all unchanged from "+
+			"before the restart — the service was not actually restarted",
+			serviceName, after.activeEnterTimestamp, after.activeEnterTimestampMonotonic, after.mainPID, after.activeState)
+	}
+	if after.activeState != "active" {
+		return fmt.Errorf("restart of %s.service advanced the unit's snapshot (ActiveEnterTimestamp=%s, "+
+			"ActiveEnterTimestampMonotonic=%s, MainPID=%s) but its post-restart ActiveState is %q, not "+
+			"\"active\" — the unit cycled but did not end up running", serviceName,
+			after.activeEnterTimestamp, after.activeEnterTimestampMonotonic, after.mainPID, after.activeState)
 	}
 	return nil
 }
