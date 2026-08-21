@@ -14,10 +14,11 @@
 # surface than reusing the update mechanism that already exists and having
 # the target host poll for it on its own schedule.
 #
-# WHY THIS DOES NOT REBUILD EVERY INTERVAL: "clagentic-router update" itself
-# already only rebuilds+installs+restarts when it runs — there is no
-# separate lightweight "is a new build available" check invoked first. This
-# is a deliberate simplification, not an oversight: the router's discovery
+# WHY THIS REBUILDS EVERY INTERVAL: "clagentic-router update" itself does
+# not distinguish "nothing changed" from "something changed" before
+# rebuilding — every timer activation runs the full build+install+restart
+# path, even when the managed checkout was already up to date. This is a
+# deliberate simplification, not an oversight: the router's discovery
 # doctrine (see this repo's CLAUDE.md, "Discover, don't hardcode — but only
 # what you can actually verify by calling it") forbids inventing a remote
 # "latest revision" discovery endpoint that no code path here has ever
@@ -40,13 +41,16 @@
 # rejected, build failure, install/restart readback failure — see
 # update.go's runUpdate) must not retry in a tight loop and must not leave
 # a half-updated deployment. `update`'s own contract already guarantees the
-# second half (a failed build/readback never reaches the install-replace or
-# restart step — see clagentic-router-update.user.service's comment); the
-# first half (no thrashing) is why this is a plain oneshot with no
-# Restart=on-failure of its own — a failure here simply waits for the
-# timer's NEXT scheduled activation rather than retrying immediately.
-# systemd --user's own default journal captures the failure for later
-# inspection (`journalctl --user -u clagentic-router-update`).
+# second half: a failed build never reaches the install-replace step at all,
+# and a failed post-install verification rolls the previously-installed
+# binary back into place before returning (see
+# clagentic-router-update.user.service's comment for exactly what "rolls
+# back" does and does not cover, per failure path); the first half (no
+# thrashing) is why this is a plain oneshot with no Restart=on-failure of
+# its own — a failure here simply waits for the timer's NEXT scheduled
+# activation rather than retrying immediately. systemd --user's own default
+# journal captures the failure for later inspection (`journalctl --user -u
+# clagentic-router-update`).
 #
 # DEFAULTS, AND WHY: OnUnitActiveSec=1h with RandomizedDelaySec=10m. An
 # hourly cadence is a reasonable balance for a single-operator workstation —

@@ -29,13 +29,33 @@ Type=oneshot
 # uses manually or via post-merge automation — no parallel updater, no
 # separate config surface. Reads deploy.* from the operator's own
 # router.yaml (source_dir, repo_url, install_path, service_name,
-# service_manager) exactly like a manual invocation would. On failure,
-# `update` itself already fails loudly and leaves the previously-installed
-# binary and running service untouched (see cmd/clagentic-router/update.go:
-# the staged build only replaces install_path via atomic rename AFTER a
-# successful build, and the restart step is only reached after a successful
-# install) — this unit adds no additional retry/rollback logic on top of
-# that, and Restart= is deliberately NOT set below (see the timer's own doc
+# service_manager) exactly like a manual invocation would. `update` itself
+# fails loudly on any error, and what "the previous state" means differs by
+# WHICH step failed (lr-c69197 fold-in — the pre-rollback wording here
+# claimed a blanket "leaves the previously-installed binary ... untouched",
+# which was false for one of these three paths):
+#
+#   - Build failure (git pull rejected, `go build` failure): install_path is
+#     never touched at all — the staged build only replaces it via atomic
+#     rename AFTER a successful build.
+#   - Post-install verification failure: install_path WAS already replaced
+#     by installBinary's rename by the time verification runs, but
+#     cmd/clagentic-router/update.go's installAndVerifyWithRollback backs up
+#     the previous binary before that rename and restores it from that
+#     backup when verification fails — install_path ends up back at its
+#     pre-update contents (a genuine rollback, not merely undisturbed
+#     because nothing happened). The service itself is deliberately NOT
+#     restarted in this case (see below), so the already-running process
+#     keeps executing whatever binary its own inode pointed at when it last
+#     started, independent of what is now on disk at install_path.
+#   - Restart failure (systemctl/readback failure, AFTER a successful
+#     install+verify): install_path holds the NEW binary — verification
+#     already passed — but the running process has not necessarily picked
+#     it up; the service continues running whatever it was running before
+#     the failed restart attempt until a later successful restart.
+#
+# This unit adds no additional retry logic on top of `update`'s own
+# rollback; Restart= is deliberately NOT set below (see the timer's own doc
 # for why an on-failure restart loop here would be actively harmful).
 ExecStart=%h/.local/bin/clagentic-router update --config %h/.config/clagentic/router/router.yaml
 

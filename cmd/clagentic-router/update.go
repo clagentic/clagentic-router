@@ -158,23 +158,9 @@ func runUpdate(deploy config.DeployConfig, out *os.File) error {
 		return fmt.Errorf("install: stat freshly built binary %s: %w", stagedPath, err)
 	}
 
-	fmt.Fprintf(out, "update: installing %s -> %s (atomic rename)\n", stagedPath, installPath)
-	if err := installBinary(stagedPath, installPath); err != nil {
-		return fmt.Errorf("install: %w", err)
+	if err := installAndVerifyWithRollback(stagedPath, installPath, stagedInfo, hostname, out); err != nil {
+		return err
 	}
-
-	// READBACK (lr-c69197 MILLER item 2): installBinary's os.Rename returning
-	// nil means "the syscall succeeded", not "the binary that is now running
-	// is the one just staged". verifyInstalledBinary re-stats installPath —
-	// the exact path a running service execs — and compares it against what
-	// was staged, so a PASS here is falsifiable: if installPath does not
-	// exist, or its size/mode don't match the staged artifact, this is a
-	// hard error, not a silently-swallowed mismatch.
-	if err := verifyInstalledBinary(installPath, stagedInfo); err != nil {
-		return fmt.Errorf("install: post-install verification failed: %w", err)
-	}
-	fmt.Fprintf(out, "update: verified %s on %s (size=%d bytes, mode=%s)\n",
-		installPath, hostname, stagedInfo.Size(), stagedInfo.Mode().Perm())
 
 	switch serviceManager {
 	case "systemd":
@@ -485,6 +471,34 @@ func installBinary(stagedPath, installPath string) error {
 	return nil
 }
 
+// backupInstalledBinary preserves the current contents of installPath at
+// installPath+".bak" (same directory, so the later restore is a same-
+// filesystem rename — atomic, no partial-write window) before it is
+// replaced. This is the rollback fold-in (lr-c69197, PEACHES comment
+// 5373517397 / BOBBIE comment 5373549900): both the update.user.service unit
+// comment and OPERATOR-GUIDE.md previously claimed a failed update leaves
+// the previous binary "untouched", which was false — verifyInstalledBinary
+// runs AFTER installBinary's os.Rename has already replaced installPath.
+// This closes that gap for real rather than only correcting the claim.
+//
+// Returns ("", nil) when installPath does not exist yet (first-ever
+// install) — there is nothing to back up, and that is not an error; a
+// caller checks for the empty return to know rollback-on-failure has
+// nothing to restore.
+func backupInstalledBinary(installPath string) (string, error) {
+	if _, err := os.Stat(installPath); err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("stat existing binary at %s: %w", installPath, err)
+	}
+	backupPath := installPath + ".bak"
+	if err := os.Rename(installPath, backupPath); err != nil {
+		return "", fmt.Errorf("rename %s -> %s: %w (backup and target must be on the same filesystem)", installPath, backupPath, err)
+	}
+	return backupPath, nil
+}
+
 // verifyInstalledBinary is the readback half of the install step (lr-c69197
 // MILLER item 2: "installBinary returns nil on exit 0 and that is the whole
 // contract — nothing re-reads the result"). It re-stats installPath — the
@@ -517,6 +531,79 @@ func verifyInstalledBinary(installPath string, stagedInfo os.FileInfo) error {
 	}
 	if installedInfo.Mode().Perm()&0o111 == 0 {
 		return fmt.Errorf("installed binary at %s is not executable (mode %s)", installPath, installedInfo.Mode().Perm())
+	}
+	return nil
+}
+
+// installAndVerifyWithRollback is runUpdate's install step: back up any
+// existing binary, atomically replace it with the freshly built one, verify
+// the replacement, and — on a verification failure — restore the backup so
+// installPath ends up in a real, falsifiable state rather than holding
+// whatever installBinary's rename just put there. Split out from runUpdate
+// so it is independently unit-testable with synthetic staged/installed
+// files, no real `go build` required (lr-c69197 fold-in regression test:
+// "a failed verification restores the prior binary").
+//
+// hostname is used only for the success log line, matching runUpdate's own
+// pre-fold-in wording.
+func installAndVerifyWithRollback(stagedPath, installPath string, stagedInfo os.FileInfo, hostname string, out *os.File) error {
+	// ROLLBACK (lr-c69197 fold-in, PEACHES comment 5373517397 / BOBBIE comment
+	// 5373549900): the previously-installed binary is preserved BEFORE the
+	// replace, at installPath+".bak", specifically so a verification failure
+	// below has something real to restore — see backupInstalledBinary's own
+	// doc for why a missing pre-existing binary (first-ever install) is not
+	// an error here.
+	backupPath, backupErr := backupInstalledBinary(installPath)
+	if backupErr != nil {
+		return fmt.Errorf("install: back up previous binary before replacing it: %w", backupErr)
+	}
+
+	fmt.Fprintf(out, "update: installing %s -> %s (atomic rename)\n", stagedPath, installPath)
+	if err := installBinary(stagedPath, installPath); err != nil {
+		return fmt.Errorf("install: %w", err)
+	}
+
+	// READBACK (lr-c69197 MILLER item 2): installBinary's os.Rename returning
+	// nil means "the syscall succeeded", not "the binary that is now running
+	// is the one just staged". verifyInstalledBinary re-stats installPath —
+	// the exact path a running service execs — and compares it against what
+	// was staged, so a PASS here is falsifiable: if installPath does not
+	// exist, or its size/mode don't match the staged artifact, this is a
+	// hard error, not a silently-swallowed mismatch.
+	//
+	// ROLLBACK ON FAILURE (lr-c69197 fold-in): a verification failure here
+	// used to leave installPath holding whatever installBinary's rename just
+	// put there — the bad artifact, not the previously-working one, despite
+	// documentation elsewhere claiming the old binary was "untouched". It is
+	// restored from backupPath (best-effort: if the restore itself fails,
+	// that failure is reported ALONGSIDE the verification failure, never in
+	// place of it — an operator needs to know both that verification failed
+	// AND whether the restore actually worked).
+	if err := verifyInstalledBinary(installPath, stagedInfo); err != nil {
+		if backupPath == "" {
+			return fmt.Errorf("install: post-install verification failed: %w (no previous binary existed "+
+				"to roll back to — this was a first-ever install at %s)", err, installPath)
+		}
+		if restoreErr := os.Rename(backupPath, installPath); restoreErr != nil {
+			return fmt.Errorf("install: post-install verification failed: %w; additionally, restoring the "+
+				"previous binary from %s FAILED: %v — %s may now be missing or in an inconsistent state, "+
+				"check it by hand", err, backupPath, restoreErr, installPath)
+		}
+		return fmt.Errorf("install: post-install verification failed: %w (previous binary restored from "+
+			"%s — the running service's on-disk binary is back to its pre-update state)", err, backupPath)
+	}
+	fmt.Fprintf(out, "update: verified %s on %s (size=%d bytes, mode=%s)\n",
+		installPath, hostname, stagedInfo.Size(), stagedInfo.Mode().Perm())
+
+	// The backup has served its purpose once verification passes — remove it
+	// rather than leaving a stale ".bak" artifact sitting next to installPath
+	// forever. Best-effort: a removal failure here is a real problem (disk
+	// full, permissions) but must not turn an otherwise-successful update
+	// into a reported failure — it is logged, not returned.
+	if backupPath != "" {
+		if err := os.Remove(backupPath); err != nil {
+			fmt.Fprintf(out, "update: warning: verified install succeeded, but removing the backup at %s failed: %v (harmless leftover file, safe to delete by hand)\n", backupPath, err)
+		}
 	}
 	return nil
 }

@@ -98,6 +98,55 @@ func TestInstallBinary_MissingStagedFile(t *testing.T) {
 	}
 }
 
+// TestBackupInstalledBinary_ExistingBinary_RenamesToBak verifies the
+// rollback fold-in's backup step: an existing binary at installPath is
+// preserved at installPath+".bak" via rename (not copy), and installPath
+// itself is empty afterward (the caller's subsequent installBinary rename
+// is what repopulates it).
+func TestBackupInstalledBinary_ExistingBinary_RenamesToBak(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "clagentic-router")
+	if err := os.WriteFile(target, []byte("old binary contents"), 0o755); err != nil {
+		t.Fatalf("write target file: %v", err)
+	}
+
+	backupPath, err := backupInstalledBinary(target)
+	if err != nil {
+		t.Fatalf("backupInstalledBinary: %v", err)
+	}
+	if backupPath != target+".bak" {
+		t.Errorf("backupPath = %q, want %q", backupPath, target+".bak")
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Errorf("target %s should not exist after backup rename, stat err = %v", target, err)
+	}
+	content, err := os.ReadFile(backupPath)
+	if err != nil {
+		t.Fatalf("read backup: %v", err)
+	}
+	if string(content) != "old binary contents" {
+		t.Errorf("backup content = %q, want the original binary's contents", string(content))
+	}
+}
+
+// TestBackupInstalledBinary_NoExistingBinary_ReturnsEmptyNoError verifies
+// the first-ever-install case: nothing exists yet at installPath, so there
+// is nothing to back up — this must not be an error, and the returned path
+// must be empty so callers can distinguish "nothing to roll back to" from a
+// real backup path.
+func TestBackupInstalledBinary_NoExistingBinary_ReturnsEmptyNoError(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "clagentic-router")
+
+	backupPath, err := backupInstalledBinary(target)
+	if err != nil {
+		t.Fatalf("backupInstalledBinary: unexpected error for first-ever install: %v", err)
+	}
+	if backupPath != "" {
+		t.Errorf("backupPath = %q, want empty string (nothing existed to back up)", backupPath)
+	}
+}
+
 // TestBuildBinary_EmitsFreshArtifact verifies buildBinary(-o outputPath)
 // always produces a binary at exactly outputPath, guarding against the
 // clagentic-directory outage root cause: an -o-less `go build ./...` never
@@ -358,6 +407,107 @@ func TestVerifyInstalledBinary_SizeMismatch(t *testing.T) {
 
 	if err := verifyInstalledBinary(target, stagedInfo); err == nil {
 		t.Fatal("expected error for size mismatch between installed and staged artifacts, got nil")
+	}
+}
+
+// TestInstallAndVerifyWithRollback_VerificationFailure_RestoresPreviousBinary
+// is the regression test the lr-c69197 fold-in dispatch requires: a failed
+// post-install verification must restore the previously-installed binary,
+// not leave the bad artifact installBinary's os.Rename already put at
+// installPath. stagedInfo is deliberately built from a decoy file of a
+// different length than the real staged file, so verifyInstalledBinary's
+// size check fails deterministically without depending on a corrupted `go
+// build` output.
+func TestInstallAndVerifyWithRollback_VerificationFailure_RestoresPreviousBinary(t *testing.T) {
+	dir := t.TempDir()
+	installPath := filepath.Join(dir, "clagentic-router")
+	stagedPath := installPath + ".new"
+
+	previousContents := []byte("previous, working binary contents")
+	if err := os.WriteFile(installPath, previousContents, 0o755); err != nil {
+		t.Fatalf("write pre-existing installed binary: %v", err)
+	}
+	if err := os.WriteFile(stagedPath, []byte("freshly built"), 0o644); err != nil {
+		t.Fatalf("write staged file: %v", err)
+	}
+
+	// A stagedInfo whose size does not match the real staged file forces
+	// verifyInstalledBinary's mismatch branch below.
+	mismatchDir := t.TempDir()
+	decoy := filepath.Join(mismatchDir, "decoy")
+	if err := os.WriteFile(decoy, []byte("a file with a deliberately different length"), 0o644); err != nil {
+		t.Fatalf("write decoy file: %v", err)
+	}
+	mismatchedStagedInfo, err := os.Stat(decoy)
+	if err != nil {
+		t.Fatalf("stat decoy file: %v", err)
+	}
+
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open devnull: %v", err)
+	}
+	defer devNull.Close()
+
+	err = installAndVerifyWithRollback(stagedPath, installPath, mismatchedStagedInfo, "test-host", devNull)
+	if err == nil {
+		t.Fatal("expected an error for the forced verification mismatch, got nil")
+	}
+	if !strings.Contains(err.Error(), "previous binary restored") {
+		t.Errorf("error = %q, want it to confirm the previous binary was restored", err.Error())
+	}
+
+	restored, err := os.ReadFile(installPath)
+	if err != nil {
+		t.Fatalf("read installPath after rollback: %v", err)
+	}
+	if string(restored) != string(previousContents) {
+		t.Errorf("installPath contents after rollback = %q, want the previous binary's contents %q",
+			string(restored), string(previousContents))
+	}
+	if _, err := os.Stat(installPath + ".bak"); !os.IsNotExist(err) {
+		t.Errorf("backup path %s.bak should no longer exist after being renamed back, stat err = %v", installPath, err)
+	}
+}
+
+// TestInstallAndVerifyWithRollback_Success_RemovesBackup verifies the
+// non-failure path: a successful install+verify removes the backup file
+// rather than leaving a stale ".bak" artifact behind permanently.
+func TestInstallAndVerifyWithRollback_Success_RemovesBackup(t *testing.T) {
+	dir := t.TempDir()
+	installPath := filepath.Join(dir, "clagentic-router")
+	stagedPath := installPath + ".new"
+
+	if err := os.WriteFile(installPath, []byte("previous binary"), 0o755); err != nil {
+		t.Fatalf("write pre-existing installed binary: %v", err)
+	}
+	if err := os.WriteFile(stagedPath, []byte("fresh binary contents"), 0o644); err != nil {
+		t.Fatalf("write staged file: %v", err)
+	}
+	stagedInfo, err := os.Stat(stagedPath)
+	if err != nil {
+		t.Fatalf("stat staged file: %v", err)
+	}
+
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open devnull: %v", err)
+	}
+	defer devNull.Close()
+
+	if err := installAndVerifyWithRollback(stagedPath, installPath, stagedInfo, "test-host", devNull); err != nil {
+		t.Fatalf("installAndVerifyWithRollback: unexpected error: %v", err)
+	}
+
+	content, err := os.ReadFile(installPath)
+	if err != nil {
+		t.Fatalf("read installPath: %v", err)
+	}
+	if string(content) != "fresh binary contents" {
+		t.Errorf("installPath contents = %q, want the freshly staged contents", string(content))
+	}
+	if _, err := os.Stat(installPath + ".bak"); !os.IsNotExist(err) {
+		t.Errorf("backup path %s.bak should have been removed after a successful verify, stat err = %v", installPath, err)
 	}
 }
 

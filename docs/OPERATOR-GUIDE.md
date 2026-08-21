@@ -258,6 +258,24 @@ The final report line names the hostname, the resolved `install_path`, and
 the resolved unit+scope actually acted on, so a PASS is falsifiable against
 those facts rather than an echo of pre-action intent.
 
+**Post-install verification failure rolls back the binary, it does not
+merely fail loudly (lr-c69197 fold-in).** `installBinary`'s atomic rename
+already replaces `install_path` with the newly built artifact BEFORE
+verification runs, so a verification failure at that point does not find
+`install_path` "untouched" — it finds the new (bad) binary sitting there.
+`update` backs up the previous binary to `install_path.bak` immediately
+before the replacing rename, and restores it from that backup if
+verification fails, so `install_path` ends up back at its pre-update
+contents rather than left holding the artifact that just failed
+verification. This is a real restore, not a no-op — see
+`cmd/clagentic-router/update.go`'s `installAndVerifyWithRollback` for the
+implementation and its failure-path error text (which also names whether
+the restore itself succeeded). The service is deliberately **not**
+restarted after a rollback (see "Keeping a user-scope host current
+automatically" below for why), so the already-running process is
+unaffected either way — this only concerns what is on disk at
+`install_path` for the next successful update or manual restart to pick up.
+
 ```yaml
 deploy:
   source_dir: ""                                   # default: a managed checkout (see below); set explicitly to opt out
@@ -397,13 +415,19 @@ journalctl --user -u clagentic-router-update    # after it has fired at least on
   implemented here.
 - **What happens on failure:** the paired `.service` unit is a plain
   `oneshot` with no `Restart=` of its own — a failed run (pull rejected,
-  build failure, or a failed post-install/restart readback, see "Redeploying"
-  above) waits for the timer's next scheduled activation rather than
-  retrying in a tight loop. `update`'s own contract already prevents a
-  half-updated deployment: the atomic install-replace step and the restart
-  step are only reached after the preceding step succeeds (see
-  `cmd/clagentic-router/update.go`'s `runUpdate`), so a failure here leaves
-  the previously-installed, previously-running binary untouched. Check
+  build failure, a failed post-install verification, or a failed
+  restart readback, see "Redeploying" above) waits for the timer's next
+  scheduled activation rather than retrying in a tight loop. What ends up
+  on disk at `install_path` differs by which step failed: a build failure
+  never touches it at all; a post-install verification failure rolls the
+  previous binary back onto it (a real restore — see "Redeploying" above's
+  "Post-install verification failure rolls back the binary" paragraph, not
+  merely "was never touched"); a restart failure leaves the newly-installed,
+  already-verified binary in place but the running process may not yet be
+  executing it. In every case the **running process itself** is left alone
+  by a failed run — `update` never kills or restarts the service except in
+  its own final, only-reached-after-verification restart step — so a failed
+  update never hands control to a half-built or unverified binary. Check
   `journalctl --user -u clagentic-router-update` after a failure.
 - **Interval and jitter:** `OnUnitActiveSec=1h` with `RandomizedDelaySec=10m`
   — frequent enough that a merged fix does not sit unpropagated for an
@@ -463,8 +487,9 @@ backend, before tagging a release, and after deploying a new binary.
 | `systemd --user` deployment: service is `active (running)`, but a `claude_cli` backend never responds, `GET /health` reports `status` other than `"ok"` with that backend in `unresolved_binaries`, and the startup log has an ERROR-level `binary not found at startup name=claude` line | A `systemd --user` unit inherits a minimal `PATH` lacking `~/.local/bin`, where `claude` installs | "Systemd, user scope" above — the shipped user template sets `PATH` including `%h/.local/bin`; if you wrote your own unit instead of copying the template, add that |
 | `update` reports `restart: systemctl restart ... failed` (note: NO `--user` in the command text) on a host that is actually running the unit at user scope | `deploy.service_manager` is still `systemd` (system scope) even though the unit was installed under `~/.config/systemd/user/` — `update` is issuing a system-scope `systemctl restart`, which cannot see a user-scope unit at all | Set `deploy.service_manager: systemd-user` in `router.yaml` |
 | `update` reports `restart: systemctl --user restart ... failed` (command text DOES include `--user`) | `deploy.service_manager` is correctly `systemd-user`, but the per-user systemd manager instance isn't reachable (e.g. no active login session and `loginctl enable-linger` not set) | Run `loginctl enable-linger "$USER"`; confirm with `systemctl --user status` |
-| `update` reports `install: post-install verification failed: ... stat failed` | The binary was staged and renamed, but nothing now exists at `install_path` — a mount, permissions change, or a concurrent process removed it between rename and readback | Check `install_path` exists and is writable by the user `update` runs as; re-run `update` |
-| `update` reports `install: post-install verification failed: ... size mismatch` | Something other than the artifact `update` just built is sitting at `install_path` (leftover from another process, or an unrelated file at that path) | Verify `deploy.install_path` points at the path your service actually execs; remove/replace the stray file |
+| `update` reports `install: post-install verification failed: ... stat failed ... (previous binary restored from ...)` | The binary was staged and renamed, but nothing now exists at `install_path` — a mount, permissions change, or a concurrent process removed it between rename and readback. `update` rolled the previous binary back onto `install_path` before returning (see "Redeploying" above's rollback paragraph), so `install_path` should hold the pre-update binary, not be empty | Check `install_path` exists and is writable by the user `update` runs as; re-run `update` |
+| `update` reports `install: post-install verification failed: ... size mismatch ... (previous binary restored from ...)` | Something other than the artifact `update` just built ended up at `install_path` (leftover from another process, or an unrelated file at that path). `update` rolled the previous binary back onto `install_path` before returning | Verify `deploy.install_path` points at the path your service actually execs; remove/replace the stray file |
+| `update` reports `install: post-install verification failed: ...; additionally, restoring the previous binary from ... FAILED` | Both the new build failed verification AND the rollback itself could not rename the backup back into place (e.g. `install_path.bak` was itself removed or made unwritable between backup and restore) — `install_path` is left in an unknown state, not guaranteed to hold either binary | Manually inspect `install_path` and `install_path.bak` (if it still exists) and restore by hand; this is the one failure path `update`'s rollback cannot self-heal |
 | `update` reports `restart: ... was not actually restarted` | `systemctl restart` exited 0, but the unit's `ActiveEnterTimestamp`/`MainPID` did not change — the unit did not actually cycle (e.g. `ExecStart` no-op, or the wrong unit was targeted) | Confirm `deploy.service_name`/`deploy.service_manager` name the unit that's actually running; check `systemctl [--user] status <unit>` by hand |
 
 ### Client token resolution (lr-92ee18 B3)
