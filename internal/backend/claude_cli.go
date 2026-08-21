@@ -846,6 +846,21 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 	cmd.Stderr = &stderr
 
 	err := cmd.Run()
+
+	// Context-deadline kill check FIRST, before any exit-code normalization
+	// or output-text classification (lr-2f35bd): a SIGKILL from
+	// exec.CommandContext's own deadline watcher normalizes to a bare
+	// nonzero exit code below, and the "context deadline exceeded" string
+	// lives only in the Go err value — it is never present in the
+	// subprocess's stdout/stderr for this adapter to classify against. See
+	// IsContextDeadlineKill's doc for why ctx.Err(), not errors.Is on err
+	// directly.
+	if IsContextDeadlineKill(ctx, err) {
+		slog.Info("claude_cli invoke failed: context deadline exceeded",
+			"backend", a.id, "request_id", RequestIDFromCtx(ctx))
+		return nil, &InvokeError{Type: ErrTypeTimeout, Raw: "context deadline exceeded"}
+	}
+
 	exitCode := 0
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
@@ -929,16 +944,48 @@ func extractClassificationText(stdout []byte, stderrStr string) string {
 	return string(stdout)
 }
 
+// isInitFrame reports whether sl is the claude CLI's type=="system",
+// subtype=="init" stream-json line — the harmless, well-formed session-start
+// event (session_id/cwd/tools/model/permissionMode) that is ALWAYS the
+// first line of a stream-json invocation, success or failure alike. It
+// carries no error information by construction and must never be treated as
+// a candidate error-bearing line (lr-2f35bd, B5): a config-rejected model
+// (claude CLI's 400 "provided model identifier is invalid") still emits
+// this init frame before the CLI aborts, and naively taking "the first
+// well-formed JSON object" as the error text reports this harmless frame
+// instead of the real terminal diagnostic that follows it.
+func isInitFrame(sl *claudeOutput) bool {
+	return sl.Type == "system" && sl.Subtype == "init"
+}
+
 // errorTextFromStreamJSON scans stdout as newline-delimited stream-json
 // looking for an error-bearing field: a type=="error" event's error/message,
 // or a "result" line's Error/Message/Errors (the same fields parseStreamJSON
 // itself checks on the success path — see its "error" case and the
-// resultLine.IsError branch below). Returns ("", false) when stdout does
-// not decode as stream-json at all, or decodes but no line carries an
-// error-bearing field — the caller falls back to stderr in that case.
+// resultLine.IsError branch below). The init frame (isInitFrame) is skipped
+// as a candidate entirely — see its doc.
+//
+// A line that fails to decode as claudeOutput JSON at all is captured as a
+// CANDIDATE terminal diagnostic (lastNonJSONLine) rather than silently
+// discarded, so long as at least one earlier line WAS well-formed
+// stream-json (i.e. the CLI's output stream started normally, then emitted
+// a plain-text diagnostic instead of a further JSON event on abort) — this
+// closes the exact B5 gap: a config-rejected model still emits a
+// well-formed init frame first, then aborts with a diagnostic that is not
+// itself JSON, and the pre-fix scanner discarded that diagnostic outright
+// once sawValidLine was already true from the init line. The LAST such line
+// wins (not the first) because the CLI writes progress/banner output before
+// its terminal diagnostic, matching codex_cli.go's tail-preference rationale
+// (package doc) for the same reason.
+//
+// Returns ("", false) only when stdout never decoded as stream-json AT ALL
+// (not even an init frame) and carried no non-JSON line either (empty
+// stdout) — the caller falls back to stderr in that case, unchanged from
+// before this fix.
 func errorTextFromStreamJSON(stdout []byte) (string, bool) {
 	scanner := bufio.NewScanner(bytes.NewReader(stdout))
 	var sawValidLine bool
+	var lastNonJSONLine string
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -946,9 +993,14 @@ func errorTextFromStreamJSON(stdout []byte) (string, bool) {
 		}
 		var sl claudeOutput
 		if err := json.Unmarshal(line, &sl); err != nil {
+			lastNonJSONLine = string(line)
 			continue
 		}
 		sawValidLine = true
+
+		if isInitFrame(&sl) {
+			continue
+		}
 
 		if sl.Type == "error" {
 			if sl.Error != "" {
@@ -970,6 +1022,13 @@ func errorTextFromStreamJSON(stdout []byte) (string, bool) {
 			}
 		}
 	}
+	if sawValidLine && lastNonJSONLine != "" {
+		// The stream started as well-formed stream-json (at minimum the init
+		// frame) and then emitted a plain-text terminal diagnostic instead of
+		// a further JSON error event — this is the B5 shape. Report that
+		// diagnostic rather than discarding it.
+		return lastNonJSONLine, true
+	}
 	if !sawValidLine {
 		// stdout never decoded as stream-json (e.g. plain crash output) —
 		// tell the caller to fall back to stderr rather than silently
@@ -977,8 +1036,9 @@ func errorTextFromStreamJSON(stdout []byte) (string, bool) {
 		return "", false
 	}
 	// Valid stream-json throughout, but no line carried an error-bearing
-	// field — the nonzero exit is not explained in-band by the stream
-	// (e.g. an early abort before any output, or a reason the CLI does not
+	// field and no non-JSON diagnostic line followed either — the nonzero
+	// exit is not explained in-band by the stream (e.g. an early abort right
+	// after init with nothing further written, or a reason the CLI does not
 	// report as a structured event). Fall back to stderr.
 	return "", false
 }
@@ -987,8 +1047,10 @@ func errorTextFromStreamJSON(stdout []byte) (string, bool) {
 // rate_limit_event, and returns a populated Response. Exported for testing.
 func parseStreamJSON(data []byte, req *Request, backendID string) (*Response, error) {
 	var (
-		resultLine   *claudeOutput
-		rateLimitEvt *RateLimitEvent
+		resultLine      *claudeOutput
+		rateLimitEvt    *RateLimitEvent
+		sawInitFrame    bool
+		lastNonJSONLine string
 	)
 
 	scanner := bufio.NewScanner(bytes.NewReader(data))
@@ -1007,7 +1069,16 @@ func parseStreamJSON(data []byte, req *Request, backendID string) (*Response, er
 		// Decode the line to check its type field.
 		var sl claudeOutput
 		if err := json.Unmarshal(line, &sl); err != nil {
-			// Ignore unparseable lines — forward-compat with new event types.
+			// Not a rate_limit_event and not claudeOutput JSON either. Kept as
+			// a candidate terminal diagnostic (lr-2f35bd, B5) rather than
+			// silently discarded — see errorTextFromStreamJSON's identical
+			// lastNonJSONLine rationale, which this zero-exit path mirrors.
+			lastNonJSONLine = string(line)
+			continue
+		}
+
+		if isInitFrame(&sl) {
+			sawInitFrame = true
 			continue
 		}
 
@@ -1026,7 +1097,22 @@ func parseStreamJSON(data []byte, req *Request, backendID string) (*Response, er
 	}
 
 	if resultLine == nil {
-		// No result line found — fall back to treating stdout as plain text if non-empty.
+		// No result line found. If the stream carried an init frame followed
+		// by a plain-text diagnostic instead of a further JSON event, that
+		// diagnostic — not the raw init-plus-diagnostic blob — is the real
+		// failure text (lr-2f35bd, B5): the CLI aborted before producing a
+		// result, so returning ANY of this stream as successful Content
+		// would fabricate a completion the model never produced, the same
+		// concern isMaxTurnsTermination's doc raises for max_turns.
+		if sawInitFrame && lastNonJSONLine != "" {
+			errType, patternID := ClassifyErrorWithPattern(lastNonJSONLine, 0)
+			slog.Info("claude_cli invoke failed (zero exit, init frame + non-JSON diagnostic)",
+				"backend", backendID, "error_type", errType, "matched_pattern_id", patternID)
+			return nil, &InvokeError{Type: errType, Raw: truncate(lastNonJSONLine, 500)}
+		}
+		// No result line and no diagnostic beyond the init frame (or no
+		// stream-json at all) — fall back to treating stdout as plain text
+		// if non-empty, matching pre-existing behavior.
 		content := strings.TrimSpace(string(data))
 		if content == "" {
 			return nil, &InvokeError{Type: ErrTypeSchema, Raw: "empty output from claude CLI"}

@@ -282,6 +282,17 @@ func (a *CodexCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response, 
 	cmd.Stderr = &stderr
 
 	err := cmd.Run()
+
+	// Context-deadline kill check FIRST, before any exit-code normalization
+	// or output-text classification (lr-2f35bd) — see claude_cli.go's Invoke
+	// for the full rationale (shared IsContextDeadlineKill helper, identical
+	// reasoning applies to every CLI adapter).
+	if IsContextDeadlineKill(ctx, err) {
+		slog.Info("codex_cli invoke failed: context deadline exceeded",
+			"backend", a.id, "request_id", RequestIDFromCtx(ctx))
+		return nil, &InvokeError{Type: ErrTypeTimeout, Raw: "context deadline exceeded"}
+	}
+
 	exitCode := 0
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {

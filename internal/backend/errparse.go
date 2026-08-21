@@ -37,6 +37,20 @@ var apiKeyWordRe = regexp.MustCompile(`(?i)\bapi[ _-]?key\b`)
 var credentialWordRe = regexp.MustCompile(`(?i)\bcredentials?\b`)
 
 var errorPatterns = []errorPattern{
+	// Model-configuration faults — a locally misconfigured model identifier
+	// the provider/endpoint rejects (lr-2f35bd, B5). Checked FIRST, ahead of
+	// every other pattern: this is a permanent local config fault, not a
+	// transient capacity/auth/network condition, and its wording ("model
+	// identifier is invalid") does not plausibly co-occur with a genuine
+	// match for any pattern below in the same error text — there is no
+	// priority-inversion risk analogous to the quota-vs-rate_limit ordering
+	// concern the other entries' comments describe.
+	{ErrTypeModelConfig, []string{
+		"provided model identifier is invalid",
+		"model identifier is invalid",
+		"is not a valid model id",
+		"could not find model",
+	}},
 	// Quota / credit exhaustion — hard limits
 	{ErrTypeQuota, []string{
 		"usage limit reached",
