@@ -905,14 +905,17 @@ func systemctlShowArgs(serviceName string, scope systemdScope, property string) 
 // documented D-Bus/`systemctl show` unit property name for the monotonic
 // counterpart of ActiveEnterTimestamp (paired properties, same prefix
 // convention as e.g. InactiveExitTimestamp/InactiveExitTimestampMonotonic).
-// This was not independently re-verified against a live `systemctl show` in
-// this build environment — no systemctl binary is reachable from AMoS's
-// sandboxed tool allowlist here — so this is asserted from documented
-// systemd property naming, not a captured live-run output the way
-// codex_model_discovery.go's shape was. If a future run on a real systemd
-// host finds this property name wrong, correct it there; the fallback below
-// degrades safely either way (see systemctlShowValue's optional-property
-// handling in readSystemdUnitSnapshot).
+// CONFIRMED (lr-c69197 sixth fold-in, MILLER diagnosis): verified against
+// systemd's own shipped D-Bus interface definition,
+// /usr/share/dbus-1/interfaces/org.freedesktop.systemd1.Unit.xml lines
+// 166-185 (systemd 255) — `<property name="ActiveEnterTimestampMonotonic"
+// type="t" access="read">`, type 't' = uint64, CLOCK_MONOTONIC microseconds
+// since boot — and corroborated against the compiled property vtable in the
+// running manager (libsystemd-core-255.so). `systemctl show`'s property
+// names are these D-Bus property names; nothing here is asserted from
+// naming convention alone any more. See readSystemdUnitSnapshot below for
+// the guard against a *different*, wrong property name reaching this code
+// path undetected in the future.
 type systemdUnitSnapshot struct {
 	activeEnterTimestamp          string
 	activeEnterTimestampMonotonic string
@@ -930,10 +933,10 @@ type systemdUnitSnapshot struct {
 // empty property values for a valid-but-never-started (or nonexistent) unit
 // name — show reads whatever the manager currently knows about that unit
 // name, which for "never started" is simply empty fields, not a query
-// failure. The error path below is real (systemctlShowValue can still fail
-// if systemctl itself is missing from PATH, the manager is unreachable, or
-// the scope's session doesn't exist), but "the unit was never started" does
-// not reach it — that case instead returns a zero-value snapshot with empty
+// failure. The systemctlShowValue error path is real (it can still fail if
+// systemctl itself is missing from PATH, the manager is unreachable, or the
+// scope's session doesn't exist), but "the unit was never started" does not
+// reach it — that case instead returns a zero-value snapshot with empty
 // string fields, which verifyRestartAdvanced's beforeErr==nil-but-empty
 // comparison already treats correctly (an empty before-snapshot differs from
 // any real after-snapshot, so the "unchanged" false-failure this fifth
@@ -943,6 +946,14 @@ type systemdUnitSnapshot struct {
 // restart over it — that degrade-on-error behavior is meaningful for the
 // systemctl-itself-unreachable case, not just the never-started case this
 // comment used to (incorrectly) claim it covered.
+//
+// SECOND ERROR PATH (lr-c69197 sixth fold-in): a PARTIALLY populated
+// snapshot — some fields empty, others not — is a third, distinct outcome
+// from either "never started" (all empty) or "read successfully" (all
+// populated). validateSystemdUnitSnapshot below treats it as a hard error
+// naming the empty property, because it is the fingerprint of a wrong
+// property name silently returning ("", nil) rather than of a legitimate
+// unit lifecycle state.
 func readSystemdUnitSnapshot(serviceName string, scope systemdScope) (systemdUnitSnapshot, error) {
 	activeEnter, err := systemctlShowValue(serviceName, scope, "ActiveEnterTimestamp")
 	if err != nil {
@@ -956,11 +967,62 @@ func readSystemdUnitSnapshot(serviceName string, scope systemdScope) (systemdUni
 	if err != nil {
 		return systemdUnitSnapshot{}, err
 	}
-	return systemdUnitSnapshot{
+	snapshot := systemdUnitSnapshot{
 		activeEnterTimestamp:          activeEnter,
 		activeEnterTimestampMonotonic: activeEnterMonotonic,
 		mainPID:                       mainPID,
-	}, nil
+	}
+	if err := validateSystemdUnitSnapshot(snapshot); err != nil {
+		return systemdUnitSnapshot{}, err
+	}
+	return snapshot, nil
+}
+
+// validateSystemdUnitSnapshot is the MILLER-diagnosed fix (lr-c69197 sixth
+// fold-in): `systemctl show --property=<unknown-name> --value` exits 0 and
+// prints nothing for a property systemd does not recognize — it does not
+// error. systemctlShowValue therefore returns ("", nil) for BOTH a
+// misspelled/wrong property name and the legitimate "unit never started"
+// case (see readSystemdUnitSnapshot's caller doc), making the two
+// indistinguishable at the single-field level. A silently wrong property
+// name would make its field permanently empty in every snapshot, so
+// verifyRestartAdvanced's before==after comparison would never see it
+// change — exactly the false "restart did not happen" negative the
+// monotonic field exists to remove, just moved one property over.
+//
+// The discriminator: on a genuinely never-started unit, systemd has no
+// runtime state for ANY of these properties, so ALL THREE fields come back
+// empty together. A snapshot with some fields populated and others empty is
+// therefore not "never started" — it is evidence that one of the empty
+// fields' property names is wrong. Treat that as a hard, named error
+// instead of a silently degraded field, so a bad property name fails loudly
+// the first time it is read rather than only showing up later as an
+// unexplained missed-restart report.
+func validateSystemdUnitSnapshot(snapshot systemdUnitSnapshot) error {
+	populated := snapshot.activeEnterTimestamp != "" || snapshot.mainPID != ""
+	if !populated {
+		// Nothing populated at all: the legitimate never-started/nonexistent
+		// case. Nothing to validate against.
+		return nil
+	}
+	if snapshot.activeEnterTimestamp == "" {
+		return fmt.Errorf("systemd unit snapshot is partially populated (MainPID=%q) but ActiveEnterTimestamp "+
+			"came back empty — this property name is likely wrong, not a never-started unit (a never-started "+
+			"unit leaves ALL properties empty together)", snapshot.mainPID)
+	}
+	if snapshot.activeEnterTimestampMonotonic == "" {
+		return fmt.Errorf("systemd unit snapshot is partially populated (ActiveEnterTimestamp=%q, MainPID=%q) "+
+			"but ActiveEnterTimestampMonotonic came back empty — this property name is likely wrong, not a "+
+			"never-started unit (a never-started unit leaves ALL properties empty together)",
+			snapshot.activeEnterTimestamp, snapshot.mainPID)
+	}
+	if snapshot.mainPID == "" {
+		return fmt.Errorf("systemd unit snapshot is partially populated (ActiveEnterTimestamp=%q, "+
+			"ActiveEnterTimestampMonotonic=%q) but MainPID came back empty — this property name is likely "+
+			"wrong, not a never-started unit (a never-started unit leaves ALL properties empty together)",
+			snapshot.activeEnterTimestamp, snapshot.activeEnterTimestampMonotonic)
+	}
+	return nil
 }
 
 // systemctlShowValue runs `systemctl [--user] show --property=<property>

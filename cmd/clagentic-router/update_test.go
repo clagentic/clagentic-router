@@ -1000,6 +1000,92 @@ func TestVerifyRestartAdvanced_NoBeforeSnapshot_Passes(t *testing.T) {
 	}
 }
 
+// TestValidateSystemdUnitSnapshot_PartiallyPopulated_IsError is the
+// regression test for the lr-c69197 sixth fold-in defect (MILLER diagnosis):
+// `systemctl show --property=<unknown> --value` exits 0 with empty stdout
+// for a property systemd does not recognize, so a misspelled property name
+// is indistinguishable at the single-field level from the legitimate
+// "unit never started" case (both are ("", nil) from systemctlShowValue).
+// The whole-suite risk this closes: every other test in this file
+// hand-constructs systemdUnitSnapshot literals directly, so a wrong
+// property name in readSystemdUnitSnapshot's systemctlShowValue calls would
+// pass this entire suite green — it never actually exercises the "read a
+// property that doesn't exist" path. This test exercises
+// validateSystemdUnitSnapshot directly against a snapshot shaped exactly
+// like what a wrong property name would produce: some fields populated
+// (proving the unit HAS started and systemctl IS reachable), one field
+// empty (the fingerprint of a bad property name), which must be a hard,
+// named error rather than silently accepted as "never started".
+func TestValidateSystemdUnitSnapshot_PartiallyPopulated_IsError(t *testing.T) {
+	cases := []struct {
+		name     string
+		snapshot systemdUnitSnapshot
+		wantName string // property name the error must call out
+	}{
+		{
+			name: "ActiveEnterTimestamp empty, others populated",
+			snapshot: systemdUnitSnapshot{
+				activeEnterTimestampMonotonic: "1234567890",
+				mainPID:                       "2577441",
+			},
+			wantName: "ActiveEnterTimestamp",
+		},
+		{
+			name: "ActiveEnterTimestampMonotonic empty, others populated (the misspelling this task fixes)",
+			snapshot: systemdUnitSnapshot{
+				activeEnterTimestamp: "Thu 2026-08-20 19:15:06 EDT",
+				mainPID:              "2577441",
+			},
+			wantName: "ActiveEnterTimestampMonotonic",
+		},
+		{
+			name: "MainPID empty, others populated",
+			snapshot: systemdUnitSnapshot{
+				activeEnterTimestamp:          "Thu 2026-08-20 19:15:06 EDT",
+				activeEnterTimestampMonotonic: "1234567890",
+			},
+			wantName: "MainPID",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateSystemdUnitSnapshot(tc.snapshot)
+			if err == nil {
+				t.Fatalf("validateSystemdUnitSnapshot(%+v): expected error for a partially populated snapshot, got nil",
+					tc.snapshot)
+			}
+			if !strings.Contains(err.Error(), tc.wantName) {
+				t.Errorf("validateSystemdUnitSnapshot(%+v) error = %q, want it to name the empty property %q",
+					tc.snapshot, err.Error(), tc.wantName)
+			}
+		})
+	}
+}
+
+// TestValidateSystemdUnitSnapshot_AllEmpty_Passes verifies the legitimate
+// never-started/nonexistent-unit case is unaffected by the sixth fold-in's
+// partial-population guard: when systemd genuinely has no runtime state for
+// the unit at all, every property comes back empty together, and that must
+// still pass validation exactly as before.
+func TestValidateSystemdUnitSnapshot_AllEmpty_Passes(t *testing.T) {
+	if err := validateSystemdUnitSnapshot(systemdUnitSnapshot{}); err != nil {
+		t.Errorf("validateSystemdUnitSnapshot(zero value): unexpected error for the never-started case: %v", err)
+	}
+}
+
+// TestValidateSystemdUnitSnapshot_FullyPopulated_Passes verifies the normal
+// successful-read case is unaffected.
+func TestValidateSystemdUnitSnapshot_FullyPopulated_Passes(t *testing.T) {
+	snapshot := systemdUnitSnapshot{
+		activeEnterTimestamp:          "Thu 2026-08-20 19:15:06 EDT",
+		activeEnterTimestampMonotonic: "1234567890",
+		mainPID:                       "2577441",
+	}
+	if err := validateSystemdUnitSnapshot(snapshot); err != nil {
+		t.Errorf("validateSystemdUnitSnapshot(%+v): unexpected error for a fully populated snapshot: %v", snapshot, err)
+	}
+}
+
 // TestSystemctlShowArgs verifies the argv shape for both scopes, mirroring
 // TestSystemctlRestartArgs's coverage for the sibling restart-args builder.
 func TestSystemctlShowArgs(t *testing.T) {
