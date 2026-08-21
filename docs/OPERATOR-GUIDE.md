@@ -246,6 +246,18 @@ restarts the service. It reuses the same config file `serve` uses (no
 second config surface); every setting is optional and defaults to a stock
 systemd install:
 
+**Every mutating step is verified after it runs, not just assumed to have
+succeeded on exit code 0 (lr-c69197).** After install, `update` re-stats
+`install_path` — the exact path the running service execs from — and
+compares it against the artifact it just built; a missing or mismatched
+file is a hard error, never a silent pass. After restart, it compares the
+unit's `ActiveEnterTimestamp` and `MainPID` (via `systemctl show`) before
+and after the restart call; a restart that reports success but left both
+values unchanged (the unit did not actually cycle) is also a hard error.
+The final report line names the hostname, the resolved `install_path`, and
+the resolved unit+scope actually acted on, so a PASS is falsifiable against
+those facts rather than an echo of pre-action intent.
+
 ```yaml
 deploy:
   source_dir: ""                                   # default: a managed checkout (see below); set explicitly to opt out
@@ -323,6 +335,95 @@ so all *other* host-specific detail (install path, unit name, checkout
 location for the deployed-host case) lives in `router.yaml`'s `deploy:`
 block, not in the committed post-merge step.
 
+### Keeping a user-scope host current automatically (lr-c69197)
+
+`clagentic-router update` (above) makes a redeploy a single command, but
+something still has to run that command after each merge. For the crew's
+own host this happens automatically as a post-merge step; for an
+operator-owned `systemd --user` workstation (see "Systemd, user scope"
+above) it does not — the crew's post-merge automation runs entirely on the
+crew's own host with no transport, credential, or agent reaching any
+operator machine, so a merge landing on `main` has no path to that host at
+all. This is a known, permanent architectural boundary, not a bug to be
+closed by adding a remote-exec transport (see `deploy/clagentic-router-update.user.timer`'s
+own comment for the full "why pull, not push" rationale).
+
+**Opt-in, pull-based self-update:** two systemd `--user` unit templates —
+[`deploy/clagentic-router-update.user.service`](../deploy/clagentic-router-update.user.service)
+(a oneshot that runs `clagentic-router update` against your own
+`router.yaml`) and
+[`deploy/clagentic-router-update.user.timer`](../deploy/clagentic-router-update.user.timer)
+(activates it on a schedule) — let a `systemd --user` host keep itself
+current without any push mechanism. Neither is installed or enabled by
+anything in this repo automatically; you opt in explicitly:
+
+```bash
+# Assumes you already completed "Systemd, user scope" above (the long-running
+# clagentic-router.service is installed and your router.yaml has a [deploy]
+# block with service_manager: systemd-user).
+
+# 1. Install both units
+cp deploy/clagentic-router-update.user.service ~/.config/systemd/user/clagentic-router-update.service
+cp deploy/clagentic-router-update.user.timer ~/.config/systemd/user/clagentic-router-update.timer
+systemctl --user daemon-reload
+
+# 2. Set deploy.repo_url in router.yaml if it is not already set — the
+#    managed-checkout clone path (see "Where does the source come from?"
+#    above) requires it on a host with no pre-existing source checkout.
+
+# 3. Enable the TIMER (not the service — the service has no [Install]
+#    section and is only ever activated by the timer)
+systemctl --user enable --now clagentic-router-update.timer
+
+# 4. Check it
+systemctl --user list-timers clagentic-router-update.timer
+journalctl --user -u clagentic-router-update    # after it has fired at least once
+```
+
+**Design decisions, stated explicitly:**
+
+- **How staleness is detected without a full rebuild every interval:** it
+  isn't, today — every timer activation runs the real `update` path, which
+  itself fetches/pulls the managed checkout first (cheap, network-bound —
+  git reports "already up to date" when there is nothing new) and then
+  rebuilds. This repo's discovery doctrine (see the top-level CLAUDE.md,
+  "Discover, don't hardcode — but only what you can actually verify by
+  calling it") rules out inventing a lightweight remote "is there a new
+  build" check against an endpoint nothing here has ever called. A real
+  optimization — compare the checkout's post-pull HEAD against the
+  *installed* binary's own reported revision (`GET /version` or
+  `clagentic-router version`, both linkable since lr-92ee18) before
+  deciding whether to build at all — is a concrete, scoped follow-up, not
+  implemented here.
+- **What happens on failure:** the paired `.service` unit is a plain
+  `oneshot` with no `Restart=` of its own — a failed run (pull rejected,
+  build failure, or a failed post-install/restart readback, see "Redeploying"
+  above) waits for the timer's next scheduled activation rather than
+  retrying in a tight loop. `update`'s own contract already prevents a
+  half-updated deployment: the atomic install-replace step and the restart
+  step are only reached after the preceding step succeeds (see
+  `cmd/clagentic-router/update.go`'s `runUpdate`), so a failure here leaves
+  the previously-installed, previously-running binary untouched. Check
+  `journalctl --user -u clagentic-router-update` after a failure.
+- **Interval and jitter:** `OnUnitActiveSec=1h` with `RandomizedDelaySec=10m`
+  — frequent enough that a merged fix does not sit unpropagated for an
+  extended period with no signal (the incident this mechanism exists to
+  close), infrequent enough that a failed run's next attempt is not itself
+  a thrashing loop. Both are plain systemd timer directives — edit your
+  installed copy if a different cadence fits your host.
+- **Opt-in, not default:** neither unit's install step above happens as a
+  side effect of anything else in this repo — an operator who has not run
+  the install sequence above gets no self-update behavior at all, exactly
+  as before this change.
+
+**Known remaining gap (explicitly out of scope for this mechanism):**
+`clagentic-loadout`'s `post_merge.py` PASS log line names only `cwd`, never
+the hostname it actually ran on — a separate repo's fix, tracked
+independently, not addressed by the pull-based mechanism above (which
+solves a different problem: reaching a host post_merge_steps has no path
+to at all, not improving what post_merge_steps itself reports about the
+host it does reach).
+
 ### Docker (API-only mode)
 
 ```bash
@@ -362,6 +463,9 @@ backend, before tagging a release, and after deploying a new binary.
 | `systemd --user` deployment: service is `active (running)`, but a `claude_cli` backend never responds, `GET /health` reports `status` other than `"ok"` with that backend in `unresolved_binaries`, and the startup log has an ERROR-level `binary not found at startup name=claude` line | A `systemd --user` unit inherits a minimal `PATH` lacking `~/.local/bin`, where `claude` installs | "Systemd, user scope" above — the shipped user template sets `PATH` including `%h/.local/bin`; if you wrote your own unit instead of copying the template, add that |
 | `update` reports `restart: systemctl restart ... failed` (note: NO `--user` in the command text) on a host that is actually running the unit at user scope | `deploy.service_manager` is still `systemd` (system scope) even though the unit was installed under `~/.config/systemd/user/` — `update` is issuing a system-scope `systemctl restart`, which cannot see a user-scope unit at all | Set `deploy.service_manager: systemd-user` in `router.yaml` |
 | `update` reports `restart: systemctl --user restart ... failed` (command text DOES include `--user`) | `deploy.service_manager` is correctly `systemd-user`, but the per-user systemd manager instance isn't reachable (e.g. no active login session and `loginctl enable-linger` not set) | Run `loginctl enable-linger "$USER"`; confirm with `systemctl --user status` |
+| `update` reports `install: post-install verification failed: ... stat failed` | The binary was staged and renamed, but nothing now exists at `install_path` — a mount, permissions change, or a concurrent process removed it between rename and readback | Check `install_path` exists and is writable by the user `update` runs as; re-run `update` |
+| `update` reports `install: post-install verification failed: ... size mismatch` | Something other than the artifact `update` just built is sitting at `install_path` (leftover from another process, or an unrelated file at that path) | Verify `deploy.install_path` points at the path your service actually execs; remove/replace the stray file |
+| `update` reports `restart: ... was not actually restarted` | `systemctl restart` exited 0, but the unit's `ActiveEnterTimestamp`/`MainPID` did not change — the unit did not actually cycle (e.g. `ExecStart` no-op, or the wrong unit was targeted) | Confirm `deploy.service_name`/`deploy.service_manager` name the unit that's actually running; check `systemctl [--user] status <unit>` by hand |
 
 ### Client token resolution (lr-92ee18 B3)
 

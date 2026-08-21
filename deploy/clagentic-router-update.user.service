@@ -1,0 +1,60 @@
+# deploy/clagentic-router-update.user.service — OPT-IN systemd USER oneshot
+# unit that runs `clagentic-router update` against this host's own config
+# (lr-c69197). Paired with clagentic-router-update.user.timer, which
+# activates it periodically — see that file for the schedule and
+# docs/OPERATOR-GUIDE.md's "Keeping a user-scope host current automatically"
+# section for the full install sequence and the design rationale (why
+# pull, not push; what happens on failure; how staleness is detected without
+# rebuilding every interval).
+#
+# NOT enabled by anything in this repo automatically. An operator who wants
+# their systemd --user deployment (see clagentic-router.user.service) to
+# keep itself current opts in explicitly by installing and enabling BOTH
+# this unit and the sibling .timer — installing the .service alone does
+# nothing (oneshot units with no [Install] WantedBy are never
+# auto-started; this one is activated only by the timer).
+#
+# Uses systemd specifiers (%h, %S) exclusively — copyable to any machine
+# unmodified, same convention as clagentic-router.user.service. Never edit
+# in a username, host path, or account id.
+
+[Unit]
+Description=Clagentic: Router self-update check (user scope)
+Documentation=https://github.com/clagentic/clagentic-router
+
+[Service]
+Type=oneshot
+
+# Runs the SAME update path "clagentic-router update" (the CLI subcommand)
+# uses manually or via post-merge automation — no parallel updater, no
+# separate config surface. Reads deploy.* from the operator's own
+# router.yaml (source_dir, repo_url, install_path, service_name,
+# service_manager) exactly like a manual invocation would. On failure,
+# `update` itself already fails loudly and leaves the previously-installed
+# binary and running service untouched (see cmd/clagentic-router/update.go:
+# the staged build only replaces install_path via atomic rename AFTER a
+# successful build, and the restart step is only reached after a successful
+# install) — this unit adds no additional retry/rollback logic on top of
+# that, and Restart= is deliberately NOT set below (see the timer's own doc
+# for why an on-failure restart loop here would be actively harmful).
+ExecStart=%h/.local/bin/clagentic-router update --config %h/.config/clagentic/router/router.yaml
+
+# Same PATH gap as the long-running serve unit (see
+# clagentic-router.user.service's comment) — `go` (checkGoToolchain) and
+# `git` both need to be reachable, and %h/.local/bin needs to be on PATH for
+# the client to resolve the router binary itself.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+# Same state-directory rationale as clagentic-router.user.service — this
+# unit does not open the SQLite store itself, but the underlying `update`
+# invocation resolves the same config, and setting this consistently avoids
+# a second, divergent environment definition for the same binary.
+Environment=CLAGENTIC_ROUTER_STATE_DIR=%S/clagentic-router
+
+# Load secrets the same way the long-running unit does — `update` does not
+# need CLAGENTIC_ROUTER_TOKEN itself (it never calls the HTTP API), but the
+# EnvironmentFile is harmless to load here and keeps this unit's
+# environment a strict subset of the serve unit's rather than a bespoke one.
+EnvironmentFile=%h/.config/clagentic/router/env
+
+NoNewPrivileges=true

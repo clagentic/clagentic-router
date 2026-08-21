@@ -1,0 +1,73 @@
+# deploy/clagentic-router-update.user.timer — OPT-IN systemd USER timer that
+# periodically activates clagentic-router-update.user.service, giving a
+# systemd --user deployment a pull-based self-update mechanism (lr-c69197).
+# See docs/OPERATOR-GUIDE.md's "Keeping a user-scope host current
+# automatically" section for the install sequence and full design
+# rationale.
+#
+# WHY PULL, NOT PUSH (lr-c69197): the crew's post-merge automation
+# (clagentic-loadout's post_merge_steps) runs entirely on the crew's own
+# host via subprocess.run(shell=False, cwd=root) — no transport, no host
+# inventory, no agent on any operator workstation. Standing up a push path
+# would mean inventing a remote-exec transport plus long-lived credentials
+# into an operator's machine — more moving parts and a larger attack
+# surface than reusing the update mechanism that already exists and having
+# the target host poll for it on its own schedule.
+#
+# WHY THIS DOES NOT REBUILD EVERY INTERVAL: "clagentic-router update" itself
+# already only rebuilds+installs+restarts when it runs — there is no
+# separate lightweight "is a new build available" check invoked first. This
+# is a deliberate simplification, not an oversight: the router's discovery
+# doctrine (see this repo's CLAUDE.md, "Discover, don't hardcode — but only
+# what you can actually verify by calling it") forbids inventing a remote
+# "latest revision" discovery endpoint that no code path here has ever
+# called — origin/main's HEAD is not queryable through anything this update
+# path talks to today, only through `git fetch`+`git log` against
+# deploy.source_dir's own origin, which `ensureSourceCheckout` already does
+# as its FIRST step on every run. The actual cost of a no-op interval is
+# therefore: one `git fetch`+ff-only-pull (cheap, network-bound) that
+# reports "already up to date" via git's own exit code, at which point
+# `update` proceeds to rebuild from a source tree unchanged from last time.
+# A real "skip the build if unchanged" optimization would compare the
+# checkout's post-pull HEAD against the INSTALLED binary's own reported
+# revision (GET /version or `clagentic-router version`, both linkable via
+# lr-92ee18) before deciding to build — that comparison is NOT implemented
+# here; it is a real, scoped follow-up (see OPERATOR-GUIDE.md), not silently
+# assumed. Today, an idle interval costs one Go compile (seconds, not
+# meaningful load for the default interval below) rather than zero.
+#
+# WHY NO Restart= ON THE PAIRED .service: a failed `update` run (git pull
+# rejected, build failure, install/restart readback failure — see
+# update.go's runUpdate) must not retry in a tight loop and must not leave
+# a half-updated deployment. `update`'s own contract already guarantees the
+# second half (a failed build/readback never reaches the install-replace or
+# restart step — see clagentic-router-update.user.service's comment); the
+# first half (no thrashing) is why this is a plain oneshot with no
+# Restart=on-failure of its own — a failure here simply waits for the
+# timer's NEXT scheduled activation rather than retrying immediately.
+# systemd --user's own default journal captures the failure for later
+# inspection (`journalctl --user -u clagentic-router-update`).
+#
+# DEFAULTS, AND WHY: OnUnitActiveSec=1h with RandomizedDelaySec=10m. An
+# hourly cadence is a reasonable balance for a single-operator workstation —
+# frequent enough that "the box sat on a stale, previously-widened error
+# classification window for 10+ hours with no signal" (the lr-c69197
+# incident this exists to close) cannot recur at that scale, infrequent
+# enough that a failed run's next attempt isn't itself a thrashing loop.
+# RandomizedDelaySec=10m spreads activation instead of firing at exactly
+# :00 every hour — immaterial for a single host, but the honest default for
+# a template that may be copied to more than one. Both are operator-tunable
+# in the installed copy; nothing here is hardcoded beyond this default.
+
+[Unit]
+Description=Clagentic: Router self-update timer (user scope)
+Documentation=https://github.com/clagentic/clagentic-router
+
+[Timer]
+OnStartupSec=15m
+OnUnitActiveSec=1h
+RandomizedDelaySec=10m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
