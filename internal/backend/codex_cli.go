@@ -302,10 +302,14 @@ func (a *CodexCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response, 
 		// classifying against a head-truncated window would silently drop
 		// the tail text the auth/quota/rate-limit patterns need to match.
 		text := codexClassificationText(stdout.Bytes(), stderr.String())
-		errType := ClassifyError(text, exitCode)
-		slog.Debug("codex_cli invoke failed",
+		errType, patternID := ClassifyErrorWithPattern(text, exitCode)
+		slog.Info("codex_cli invoke failed",
 			"backend", a.id, "exit_code", exitCode, "error_type", errType,
-			"request_id", RequestIDFromCtx(ctx))
+			"request_id", RequestIDFromCtx(ctx),
+			"stderr_len", stderr.Len(), "stdout_len", stdout.Len(), "matched_pattern_id", patternID)
+		slog.Debug("codex_cli invoke failed: classified text excerpt",
+			"backend", a.id, "request_id", RequestIDFromCtx(ctx),
+			"classified_text_excerpt", ClassifiedTextExcerpt(text, patternID))
 		return nil, &InvokeError{Type: errType, Raw: truncate(text, 500)}
 	}
 
@@ -316,7 +320,7 @@ func (a *CodexCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response, 
 	// (the exact defect this task fixes; see package doc for verified
 	// event shapes and why this check runs on BOTH the nonzero and zero
 	// exit paths rather than assuming exit code alone is authoritative).
-	return parseCodexJSONL(ctx, stdout.Bytes(), req, a.id)
+	return parseCodexJSONL(ctx, stdout.Bytes(), stderr.Len(), req, a.id)
 }
 
 // codexEvent is one line of `codex exec --json` JSONL output. Field
@@ -485,17 +489,28 @@ func codexClassificationText(stdout []byte, stderrStr string) string {
 // terminal event and returns either a failure (in-band error/turn.failed —
 // see package doc for why this is checked unconditionally, not only on the
 // nonzero-exit path) or a successful Response carrying the agent_message
-// text and cache/token usage from turn.completed (lr-718af0).
-func parseCodexJSONL(ctx context.Context, stdout []byte, req *Request, backendID string) (*Response, error) {
+// text and cache/token usage from turn.completed (lr-718af0). stderrLen is
+// the byte length of the subprocess's stderr buffer at the call site —
+// passed through rather than re-derived here so the zero-exit in-band
+// failure log line below reports the same stderr_len field the nonzero-exit
+// path does (lr-151fa7), even though stderr itself plays no role in this
+// path's classification (codex's zero-exit in-band error text lives on
+// stdout only — see codexErrorTextFromJSONL).
+func parseCodexJSONL(ctx context.Context, stdout []byte, stderrLen int, req *Request, backendID string) (*Response, error) {
 	// A zero-exit in-band error is classified identically to a nonzero-exit
-	// one — same text extraction, same ClassifyError call, same
-	// Raw-equals-classified invariant. exitCode 0 is passed to ClassifyError
-	// (it carries no special-case meaning beyond 127/124, per its own doc).
+	// one — same text extraction, same ClassifyErrorWithPattern call, same
+	// Raw-equals-classified invariant. exitCode 0 is passed to
+	// ClassifyErrorWithPattern (it carries no special-case meaning beyond
+	// 127/124, per its own doc).
 	if text, ok := codexErrorTextFromJSONL(stdout); ok {
-		errType := ClassifyError(text, 0)
-		slog.Debug("codex_cli invoke failed (zero exit, in-band error)",
+		errType, patternID := ClassifyErrorWithPattern(text, 0)
+		slog.Info("codex_cli invoke failed (zero exit, in-band error)",
 			"backend", backendID, "error_type", errType,
-			"request_id", RequestIDFromCtx(ctx))
+			"request_id", RequestIDFromCtx(ctx),
+			"stderr_len", stderrLen, "stdout_len", len(stdout), "matched_pattern_id", patternID)
+		slog.Debug("codex_cli invoke failed (zero exit, in-band error): classified text excerpt",
+			"backend", backendID, "request_id", RequestIDFromCtx(ctx),
+			"classified_text_excerpt", ClassifiedTextExcerpt(text, patternID))
 		return nil, &InvokeError{Type: errType, Raw: truncate(text, 500)}
 	}
 
