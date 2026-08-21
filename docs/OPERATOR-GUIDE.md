@@ -165,6 +165,77 @@ If you use only API-based adapters (`anthropic_api`, `openai_api`,
 `bedrock_api`) and do not configure any `claude_cli`/`codex_subagent`
 backends, this requirement does not apply.
 
+### Systemd, user scope
+
+A single-operator workstation — where the OAuth session `claude_cli` needs
+(`$HOME/.claude/.credentials.json`) and, for Bedrock, `~/.aws/sso/cache`
+both belong to the one human running the router — is a natural fit for a
+`systemd --user` unit instead of a system-scope service. A fully annotated
+sample is in
+[`deploy/clagentic-router.user.service`](../deploy/clagentic-router.user.service).
+It uses `%h`/`%S` systemd specifiers throughout (your home directory / your
+state directory root) — copy it unmodified, nothing in it needs editing for
+your username or host.
+
+```bash
+# 1. Build and install the binary for your own user
+make build
+mkdir -p ~/.local/bin
+cp bin/clagentic-router ~/.local/bin/clagentic-router
+
+# 2. Configure
+mkdir -p ~/.config/clagentic/router
+cp router.example.yaml ~/.config/clagentic/router/router.yaml
+$EDITOR ~/.config/clagentic/router/router.yaml
+# Set deploy.service_manager: systemd-user (see "Redeploying" below)
+
+# 3. Secrets file referenced by the unit's EnvironmentFile=
+mkdir -p ~/.config/clagentic/router
+printf 'CLAGENTIC_ROUTER_TOKEN=mysecret\n' > ~/.config/clagentic/router/env
+chmod 0600 ~/.config/clagentic/router/env
+
+# 4. Install the unit
+mkdir -p ~/.config/systemd/user
+cp deploy/clagentic-router.user.service ~/.config/systemd/user/clagentic-router.service
+systemctl --user daemon-reload
+systemctl --user enable --now clagentic-router
+
+# 5. Keep it running after you log out (optional but usually wanted)
+loginctl enable-linger "$USER"
+
+# 6. Call it
+export CLAGENTIC_ROUTER_TOKEN=mysecret
+clagentic-router call --model claude-haiku --message "What is 2+2?"
+```
+
+Every path in this sequence is either a fixed relative layout under `~`
+(`~/.local/bin`, `~/.config/clagentic/router/`,
+`~/.config/systemd/user/`) or a value you already set in step 2/3 — nothing
+here is invented by the operator that this guide does not name.
+
+Two adaptations from the system-scope unit, both explained in comments in
+the shipped user template itself:
+
+- **No `Environment=HOME=...` line is needed.** The system-scope unit above
+  requires it because a system-scope systemd unit does not set `HOME` by
+  default; a `systemd --user` unit is started by the per-user systemd
+  manager instance, which does set `HOME` from your own passwd entry.
+- **`CLAGENTIC_ROUTER_STATE_DIR` is set explicitly**, even though the unit
+  also declares `StateDirectory=clagentic-router`. `StateDirectory=` only
+  creates the directory and exports `$STATE_DIRECTORY` to the unit — the
+  router never reads that variable (it reads `CLAGENTIC_ROUTER_STATE_DIR`
+  and `$XDG_STATE_HOME`/`storage.db_path` instead). The compiled fallback
+  default for part of that state (the `claude_cli` subprocess-home root) is
+  `/var/lib/clagentic-router`, which is wrong and unwritable at user scope,
+  so the template sets `CLAGENTIC_ROUTER_STATE_DIR=%S/clagentic-router`
+  explicitly rather than relying on it being inferred.
+- **`PATH` includes `%h/.local/bin`.** A `systemd --user` unit inherits a
+  minimal `PATH` (typically `/usr/bin:/bin`) that does not include
+  `~/.local/bin`, where the `claude` CLI (and other user-installed tools)
+  commonly live. Without this, the daemon starts and reports `active
+  (running)` and `GET /health` `ok` while every `claude_cli`-backed chain is
+  silently unusable — see "Diagnosing a failure" below.
+
 ### Redeploying: `clagentic-router update`
 
 The router is a long-running daemon — landing a change in git does not make
@@ -181,8 +252,17 @@ deploy:
   repo_url: ""                                      # git remote to clone the managed checkout from, if it doesn't already exist
   install_path: /usr/local/bin/clagentic-router    # path the running service execs
   service_name: clagentic-router                   # systemd unit name, without .service
-  service_manager: systemd                         # systemd | none (install only, no restart)
+  service_manager: systemd                         # systemd | systemd-user | none (install only, no restart)
 ```
+
+For the user-scope deployment above, set `install_path` to
+`%h/.local/bin/clagentic-router` expanded for your own home (e.g.
+`/home/you/.local/bin/clagentic-router` — `deploy.install_path` is plain
+Go/YAML config, not a systemd unit file, so it does not expand `%h`
+itself) and `service_manager: systemd-user`; `update` then restarts via
+`systemctl --user restart` instead of the system-scope `systemctl restart`
+the default `systemd` value uses. `systemd` and `none` behavior is
+unchanged by the addition of `systemd-user`.
 
 ```bash
 clagentic-router update                             # uses the resolved config (see "Configuration")
@@ -279,6 +359,8 @@ backend, before tagging a release, and after deploying a new binary.
 | `clagentic-router doctor`/`health`/`quota`/etc. (run from an operator's own shell) returns `401` | The daemon's token lives only in its systemd `EnvironmentFile` (not sourced into an interactive shell) and none of `--token`/`--token-file`/`CLAGENTIC_ROUTER_TOKEN` resolved a value either | The 401 error itself names every source checked, including the exact env-file path; see "Client token resolution" below |
 | Backend `openai_api` quota shows only soft/header-based limits, never account-level usage | No admin-scoped `openai_api_key` configured, or your key is a standard `sk-proj-...` project key | See "OpenAI usage API" below |
 | Webhook not firing | Event not registered for that endpoint, or delivery exhausted retries | `GET /webhooks` to check registration; delivery logs |
+| `systemd --user` deployment: service is `active (running)`, `GET /health` is `ok`, but a `claude_cli` backend never responds and logs `binary not found at startup name=claude` at `WARN` | A `systemd --user` unit inherits a minimal `PATH` lacking `~/.local/bin`, where `claude` installs | "Systemd, user scope" above — the shipped user template sets `PATH` including `%h/.local/bin`; if you wrote your own unit instead of copying the template, add that |
+| `systemd --user` deployment: `update` reports `restart: systemctl --user restart ... failed` | `deploy.service_manager` is still `systemd` (system scope) on a host with no system-scope unit, or `systemd-user` on a host where the user manager instance isn't reachable (e.g. no active session and `loginctl enable-linger` not set) | Set `deploy.service_manager: systemd-user`; run `loginctl enable-linger "$USER"` |
 
 ### Client token resolution (lr-92ee18 B3)
 
