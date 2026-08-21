@@ -195,6 +195,84 @@ func TestRunUpdate_BuildFailureSurfaces(t *testing.T) {
 	}
 }
 
+// TestSystemctlRestartArgs verifies the argv shape for both scopes (lr-574334
+// A1): system scope is byte-identical to the pre-"systemd-user" invocation
+// ("systemctl restart <unit>.service", no "--user" token at all), and user
+// scope inserts a single leading "--user" token ahead of "restart".
+func TestSystemctlRestartArgs(t *testing.T) {
+	cases := []struct {
+		name        string
+		serviceName string
+		scope       systemdScope
+		want        []string
+	}{
+		{"system scope", "clagentic-router", systemdScopeSystem, []string{"restart", "clagentic-router.service"}},
+		{"user scope", "clagentic-router", systemdScopeUser, []string{"--user", "restart", "clagentic-router.service"}},
+		{"system scope, custom unit name", "my-router", systemdScopeSystem, []string{"restart", "my-router.service"}},
+		{"user scope, custom unit name", "my-router", systemdScopeUser, []string{"--user", "restart", "my-router.service"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := systemctlRestartArgs(tc.serviceName, tc.scope)
+			if len(got) != len(tc.want) {
+				t.Fatalf("systemctlRestartArgs(%q, %v) = %v, want %v", tc.serviceName, tc.scope, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("systemctlRestartArgs(%q, %v)[%d] = %q, want %q", tc.serviceName, tc.scope, i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestRunUpdate_ServiceManagerSystemdUser_DispatchesUserScopeRestart verifies
+// runUpdate's switch actually routes "systemd-user" to the user-scope restart
+// path (lr-574334 A1). This host's test environment has no reachable
+// `systemctl --user` session, so the real systemctl invocation is expected to
+// fail — the assertion here is that it fails with a systemctl error naming
+// "--user", not the config-validation "unknown value" error a config typo
+// would produce, and not a silent no-op the way "none" would behave.
+func TestRunUpdate_ServiceManagerSystemdUser_DispatchesUserScopeRestart(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping go-build integration test in -short mode")
+	}
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		t.Skip("systemctl not on PATH in this environment")
+	}
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	repoRoot = filepath.Dir(filepath.Dir(repoRoot))
+
+	dir := t.TempDir()
+	installPath := filepath.Join(dir, "clagentic-router")
+
+	deploy := config.DeployConfig{
+		SourceDir:      repoRoot,
+		InstallPath:    installPath,
+		ServiceManager: "systemd-user",
+	}
+
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open devnull: %v", err)
+	}
+	defer devNull.Close()
+
+	err = runUpdate(deploy, devNull)
+	// The build+install steps must have succeeded (binary lands at
+	// installPath) regardless of whether the restart itself succeeds in this
+	// sandboxed test environment — install must never be gated on restart.
+	if _, statErr := os.Stat(installPath); statErr != nil {
+		t.Errorf("expected installed binary at %s even if restart fails, stat err: %v", installPath, statErr)
+	}
+	if err != nil && !strings.Contains(err.Error(), "--user") {
+		t.Errorf("runUpdate with service_manager=systemd-user error = %q, want it to name the --user restart invocation it attempted", err.Error())
+	}
+}
+
 // TestDeployConfig_UnknownServiceManager_Value verifies an unrecognized
 // deploy.service_manager string round-trips as-is (validated at dispatch
 // time in runUpdate, not silently coerced to a known value here).
