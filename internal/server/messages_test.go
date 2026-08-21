@@ -46,7 +46,7 @@ func newMessagesTestServer(t *testing.T, upstreamURL string) (*httptest.Server, 
 	}
 	r := router.New(cfg, adapters, nil, nil)
 
-	srv := New(":0", "secret", "secret", false, r, nil, upstreamURL, "", "", "", false, "")
+	srv := New(":0", "secret", "secret", false, r, nil, upstreamURL, "", "", "", false, "", "test")
 	ts := httptest.NewServer(srv.httpServer.Handler)
 	return ts, func() { ts.Close() }
 }
@@ -375,7 +375,7 @@ func TestMessages_Passthrough_UpstreamAPIKeyOverride(t *testing.T) {
 		"test-backend": &stubAdapter{id: "test-backend"},
 	}
 	r := router.New(cfg, adapters, nil, nil)
-	srv := New(":0", "secret", "secret", false, r, nil, upstream.URL, "router-owned-key", "", "", false, "")
+	srv := New(":0", "secret", "secret", false, r, nil, upstream.URL, "router-owned-key", "", "", false, "", "test")
 	ts := httptest.NewServer(srv.httpServer.Handler)
 	defer ts.Close()
 
@@ -513,7 +513,7 @@ func TestMessages_Routed_ToolsWithCapableBackend_Succeeds(t *testing.T) {
 		"tool-backend": &stubAdapter{id: "tool-backend", supportsTools: true},
 	}
 	r := router.New(cfg, adapters, nil, nil)
-	srv := New(":0", "secret", "secret", false, r, nil, "http://unused.invalid", "", "", "", false, "")
+	srv := New(":0", "secret", "secret", false, r, nil, "http://unused.invalid", "", "", "", false, "", "test")
 	ts := httptest.NewServer(srv.httpServer.Handler)
 	defer ts.Close()
 

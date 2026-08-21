@@ -23,6 +23,15 @@ import (
 // Returns the resolved absolute path, or an empty string when the binary is not
 // found. An empty return does NOT block construction — adapters fall back to bare
 // name resolution at invoke time, which produces a clear ErrTypeNotFound error.
+//
+// An unresolvable binary is logged at ERROR, not WARN (lr-92ee18 B2): this is
+// a configured backend that cannot possibly serve a request until the
+// operator fixes it, not a transient or cosmetic condition — WARN-level
+// logging let this defect hide in a startup log an operator was not
+// necessarily watching, and the backend still reported /health status:ok
+// until the first real request failed. The adapter's BinaryChecker
+// implementation (see adapter.go) surfaces the same fact on /health and
+// /doctor so it is visible without grepping the startup log at all.
 func ResolveBinPath(name, configured, envVar string) string {
 	var resolved string
 	if configured != "" {
@@ -32,7 +41,8 @@ func ResolveBinPath(name, configured, envVar string) string {
 	}
 
 	if resolved == "" {
-		slog.Warn("binary not found at startup", "name", name)
+		slog.Error("binary not found at startup — this backend cannot serve requests until fixed",
+			"name", name)
 		return ""
 	}
 

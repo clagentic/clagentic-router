@@ -199,6 +199,13 @@ func (a *CodexCLIAdapter) refreshBin() string {
 	return a.binPath
 }
 
+// BinaryResolved implements BinaryChecker (lr-92ee18 B2).
+func (a *CodexCLIAdapter) BinaryResolved() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.binPath != ""
+}
+
 // Invoke calls codex exec with the prompt via stdin.
 func (a *CodexCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response, error) {
 	bin := a.resolveBin()

@@ -32,6 +32,16 @@ type Handler struct {
 	token      string // inference token
 	adminToken string // admin token (may equal token if not separately configured)
 
+	// buildVersion is the running binary's revision string (main.version, set
+	// at build time via -ldflags -X — see cmd/clagentic-router/main.go).
+	// Surfaced on /health, /doctor, and /version so a stale deployment is
+	// visible from the same diagnostic surfaces an operator already checks,
+	// without a separate build-vs-running-binary comparison step (lr-92ee18
+	// B1). Named distinctly from the version(...) handler method below —
+	// Go permits a field and method sharing a name on different receivers,
+	// but not within the same struct's own field/method set.
+	buildVersion string
+
 	// allowNoAuth is the explicit, operator-set intent to run without
 	// authentication. Set ONLY by cmdServe when --unsafe-no-auth was
 	// actually passed (see main.go). When false, an empty token/adminToken
@@ -457,8 +467,23 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 }
 
 // health handles GET /health — fast cached status.
+//
+// overall is "ok" only when every configured backend both has a resolved CLI
+// binary (or has no binary concept at all — HTTP adapters) AND is not
+// StatusOffline. A backend whose binary never resolved at startup used to be
+// invisible here — /health reported "ok" indefinitely even with 4 of 5
+// configured backends permanently unable to serve a request, because
+// ResolveBinPath's failure was WARN-only startup-log noise with no runtime
+// surface (lr-92ee18 B2). unresolved_binaries names exactly which backends
+// are in that state so an operator does not have to grep the startup log to
+// find out.
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 	snaps := h.router.AllSnapshots()
+	unresolved := h.router.UnresolvedBinaryBackends()
+	unresolvedSet := make(map[string]struct{}, len(unresolved))
+	for _, id := range unresolved {
+		unresolvedSet[id] = struct{}{}
+	}
 
 	backendStatus := make(map[string]string, len(snaps))
 	overall := "ok"
@@ -467,11 +492,16 @@ func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 		if snap.Status == state.StatusOffline {
 			overall = "degraded"
 		}
+		if _, bad := unresolvedSet[id]; bad {
+			overall = "degraded"
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":   overall,
-		"backends": backendStatus,
+		"status":              overall,
+		"version":             h.buildVersion,
+		"backends":            backendStatus,
+		"unresolved_binaries": unresolved,
 	})
 }
 
@@ -503,6 +533,7 @@ func (h *Handler) doctor(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"probed_at": time.Now().UTC().Format(time.RFC3339),
+		"version":   h.buildVersion,
 		"results":   results,
 	})
 }
@@ -825,7 +856,7 @@ func (h *Handler) webhookList(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) version(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{
 		"product": "clagentic-router",
-		"version": "0.1.0",
+		"version": h.buildVersion,
 	})
 }
 

@@ -152,6 +152,13 @@ func (a *GeminiCLIAdapter) refreshBin() string {
 	return a.binPath
 }
 
+// BinaryResolved implements BinaryChecker (lr-92ee18 B2).
+func (a *GeminiCLIAdapter) BinaryResolved() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.binPath != ""
+}
+
 // Invoke calls the gemini CLI with the given request.
 func (a *GeminiCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response, error) {
 	bin := a.resolveBin()

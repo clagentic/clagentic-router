@@ -60,19 +60,50 @@ import (
 	"sync"
 )
 
-// claudeSubprocessHome is the HOME directory injected into every claude CLI subprocess.
-// It must contain a ~/.claude directory with credentials but NO settings.json hooks —
-// this prevents the operator's SessionStart/UserPromptSubmit hooks from firing inside
-// router-spawned sessions, which would pollute stdout with hook telemetry and cause
-// parseStreamJSON to fail with auth misclassification.
+// claudeSubprocessHomeOnce guards lazy, first-use resolution of the
+// subprocess HOME directory (see resolveClaudeSubprocessHome below). Shared
+// by claude_cli.go and codex_subagent.go, which both invoke the same claude
+// binary through the same isolated HOME.
+var claudeSubprocessHomeOnce sync.Once
+
+// claudeSubprocessHomeCached is the resolved path, populated exactly once by
+// claudeSubprocessHomeOnce. Read only through resolveClaudeSubprocessHome().
+var claudeSubprocessHomeCached string
+
+// resolveClaudeSubprocessHome returns the HOME directory injected into every
+// claude CLI subprocess, resolving and preparing it lazily on first call
+// rather than at package init (lr-92ee18 B4). It must contain a ~/.claude
+// directory with credentials but NO settings.json hooks — this prevents the
+// operator's SessionStart/UserPromptSubmit hooks from firing inside
+// router-spawned sessions, which would pollute stdout with hook telemetry
+// and cause parseStreamJSON to fail with auth misclassification.
 //
 // Resolution order:
 //  1. CLAGENTIC_ROUTER_SUBPROCESS_HOME env var (operator override)
-//  2. {state_dir}/claude-home — created at package init if absent
+//  2. {state_dir}/claude-home — created on first call if absent
 //
 // The credentials must be present at {home}/.claude/.credentials.json.
-// At init time the subprocess home directory and a stub settings.json are created.
-// Credential freshness is maintained by syncSubprocessCreds, called on each Invoke.
+// On first call the subprocess home directory and a stub settings.json are
+// created. Credential freshness is maintained by syncSubprocessCreds, called
+// on each Invoke.
+//
+// WHY LAZY, NOT PACKAGE INIT (lr-92ee18 B4): this used to run
+// unconditionally at package init via a `var x = func() string {...}()`
+// initializer, which fires for every process that imports this package —
+// including "version", "doctor", "health", and "update", none of which ever
+// invoke a claude_cli or codex_subagent backend. On any host where the
+// default state dir (/var/lib/clagentic-router, or its
+// CLAGENTIC_ROUTER_STATE_DIR override) is not writable by the invoking user
+// — the common case for a diagnostic CLI subcommand run as an unprivileged
+// operator against a daemon that runs as a service account — os.MkdirAll
+// failed and logged a permissions WARN on every single subcommand
+// invocation, none of which use the path it was warning about. That false
+// "broken install" impression opened every diagnostic session, drowning out
+// signal from the checks the operator actually ran the subcommand to see.
+// Resolving (and creating the directory) only on first real claude_cli/
+// codex_subagent Invoke means a diagnostic-only session touches this code
+// path zero times and creates zero directories — exactly the "genuinely
+// unable" case this function still warns on, just never spuriously.
 //
 // Claude Code's per-project workspace trust dialog is NOT a control this
 // daemon can rely on: "claude --print" (non-interactive, what this adapter
@@ -86,16 +117,31 @@ import (
 // a caller-supplied working_dir's .claude/settings.json / CLAUDE.md
 // exposure entirely, including the permissions.allow gap that --safe-mode
 // alone left open — see the Invoke doc comment for the full history.
-var claudeSubprocessHome = func() string {
+func resolveClaudeSubprocessHome() string {
+	claudeSubprocessHomeOnce.Do(func() {
+		claudeSubprocessHomeCached = computeClaudeSubprocessHome()
+	})
+	return claudeSubprocessHomeCached
+}
+
+// computeClaudeSubprocessHome does the actual resolution + on-disk
+// preparation; split out from resolveClaudeSubprocessHome so the
+// sync.Once-wrapping stays trivial to read. Never called more than once per
+// process (guarded by claudeSubprocessHomeOnce).
+func computeClaudeSubprocessHome() string {
 	// Operator override takes precedence.
 	if v := os.Getenv("CLAGENTIC_ROUTER_SUBPROCESS_HOME"); v != "" {
 		return v
 	}
 
-	// Default: state dir sibling, which persists across restarts.
+	// Default: state dir sibling, which persists across restarts. Prefer
+	// XDG_STATE_HOME / ~/.local/state when not root, matching
+	// resolveDBPath's XDG resolution in cmd/clagentic-router/main.go — a
+	// non-root deployment (no write access to /var/lib) still gets a usable
+	// default without operator configuration (lr-92ee18 B4).
 	stateDir := os.Getenv("CLAGENTIC_ROUTER_STATE_DIR")
 	if stateDir == "" {
-		stateDir = "/var/lib/clagentic-router"
+		stateDir = defaultSubprocessHomeStateDir()
 	}
 	home := filepath.Join(stateDir, "claude-home")
 	claudeDir := filepath.Join(home, ".claude")
@@ -117,7 +163,30 @@ var claudeSubprocessHome = func() string {
 	}
 
 	return home
-}()
+}
+
+// defaultSubprocessHomeStateDir returns the default state directory root
+// for the subprocess HOME when neither CLAGENTIC_ROUTER_SUBPROCESS_HOME nor
+// CLAGENTIC_ROUTER_STATE_DIR is set: /var/lib/clagentic-router for root (the
+// standard systemd-unit StateDirectory location, matching
+// deploy/clagentic-router.service), or $XDG_STATE_HOME/clagentic-router
+// (falling back to ~/.local/state/clagentic-router) for a non-root user —
+// mirrors resolveDBPath's XDG resolution in cmd/clagentic-router/main.go so
+// the two default-state-location decisions in this codebase agree. Returns
+// "/var/lib/clagentic-router" as a last resort when HOME is also unset,
+// preserving the pre-existing default for that edge case.
+func defaultSubprocessHomeStateDir() string {
+	if os.Geteuid() == 0 {
+		return "/var/lib/clagentic-router"
+	}
+	if xdg := os.Getenv("XDG_STATE_HOME"); xdg != "" {
+		return filepath.Join(xdg, "clagentic-router")
+	}
+	if home := os.Getenv("HOME"); home != "" {
+		return filepath.Join(home, ".local", "state", "clagentic-router")
+	}
+	return "/var/lib/clagentic-router"
+}
 
 // resolveDaemonHomeFunc is the resolver used by syncSubprocessCreds to locate the daemon's
 // home directory. It is a package-level variable so tests can inject a replacement
@@ -166,8 +235,9 @@ var credsSyncLastInfo os.FileInfo
 // Mirroring is additive, deliberately: this function has no delete/prune
 // step. If the source credentials file is removed from the daemon's real
 // HOME (e.g. "claude auth logout"), the previously-synced subprocess copy
-// remains in claudeSubprocessHome indefinitely — it is not proactively
-// wiped. This is an intentional, documented property, decided identically
+// remains in the subprocess HOME (resolveClaudeSubprocessHome) indefinitely
+// — it is not proactively wiped. This is an intentional, documented
+// property, decided identically
 // for syncSubprocessAWSSSOCache below (lr-dbbcd3): the residual is a
 // credential written 0600 inside an isolated HOME whose only reader is this
 // daemon's own subprocess, and OAuth tokens expire on a timescale far
@@ -313,10 +383,11 @@ var awsSSOCacheSyncLastState map[string]os.FileInfo
 //
 // This syncs ONLY ~/.aws/sso/cache/ — never ~/.aws/config, ~/.aws/credentials,
 // or any other real-HOME state — to avoid regressing the isolation property
-// claudeSubprocessHome exists to provide. AWS_PROFILE/AWS_REGION (env vars,
-// already allowlisted in env.go) still carry which profile/region to use;
-// this sync supplies only the cached token file that profile resolution
-// needs to turn a profile NAME into credentials.
+// the subprocess HOME (resolveClaudeSubprocessHome) exists to provide.
+// AWS_PROFILE/AWS_REGION (env vars, already allowlisted in env.go) still
+// carry which profile/region to use; this sync supplies only the cached
+// token file that profile resolution needs to turn a profile NAME into
+// credentials.
 //
 // Full-directory sync, not single-file: the SDK resolves the cache filename
 // by hashing the profile's sso_start_url, which this function has no reason
@@ -636,19 +707,31 @@ func (a *ClaudeCLIAdapter) refreshBin() string {
 	return a.binPath
 }
 
+// BinaryResolved implements BinaryChecker (lr-92ee18 B2).
+func (a *ClaudeCLIAdapter) BinaryResolved() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.binPath != ""
+}
+
 // Invoke calls the claude CLI with the given request.
 func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response, error) {
+	// Resolved lazily, on first real Invoke — not at package init — so that
+	// version/doctor/health/update subcommands (which never invoke this
+	// adapter) never create this directory or warn about it (lr-92ee18 B4).
+	subprocessHome := resolveClaudeSubprocessHome()
+
 	// Refresh subprocess credentials before each invocation.  The host OAuth token
 	// rotates over time; if the subprocess copy is stale the CLI returns an auth
 	// error and the backend is marked offline.  syncSubprocessCreds is a no-op when
 	// the source is unchanged (mtime+size fast path).
-	syncSubprocessCreds(claudeSubprocessHome)
+	syncSubprocessCreds(subprocessHome)
 
 	// Mirror the daemon's AWS SSO token cache into the isolated subprocess
 	// HOME (lr-6572d5). No-op on the majority deployment (OAuth hosts and
 	// static-credential Bedrock hosts have no ~/.aws/sso/cache); see
 	// syncSubprocessAWSSSOCache's doc for the full rationale.
-	syncSubprocessAWSSSOCache(claudeSubprocessHome)
+	syncSubprocessAWSSSOCache(subprocessHome)
 
 	bin := a.resolveBin()
 	if bin == "" {
@@ -730,16 +813,16 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 	// buildCLIEnv filters the daemon environment to the allowlist — router tokens
 	// and API keys are not passed to the subprocess. (lr-c7ac)
 	//
-	// The subprocess HOME is overridden to claudeSubprocessHome (see its doc
-	// above), which points at a stub config dir with an empty settings.json —
-	// this is what suppresses hooks, MCP servers, and memory loaded from
-	// ~/.claude, not any CLAUDE_CONFIG_DIR setting. Without it, SessionStart
-	// hooks (e.g. LORE) fire on every router invocation, polluting stdout with
-	// hook telemetry and occasionally triggering auth misclassification in
-	// parseStreamJSON.
+	// The subprocess HOME is overridden to subprocessHome (resolved lazily
+	// above via resolveClaudeSubprocessHome — see its doc), which points at a
+	// stub config dir with an empty settings.json — this is what suppresses
+	// hooks, MCP servers, and memory loaded from ~/.claude, not any
+	// CLAUDE_CONFIG_DIR setting. Without it, SessionStart hooks (e.g. LORE)
+	// fire on every router invocation, polluting stdout with hook telemetry
+	// and occasionally triggering auth misclassification in parseStreamJSON.
 	extra := []string{"CLAGENTIC_DISABLE_RECALL=1"}
-	if claudeSubprocessHome != "" {
-		extra = append(extra, "HOME="+claudeSubprocessHome)
+	if subprocessHome != "" {
+		extra = append(extra, "HOME="+subprocessHome)
 	}
 	env := buildCLIEnv(extra)
 

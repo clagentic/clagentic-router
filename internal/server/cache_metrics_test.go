@@ -45,7 +45,7 @@ func newCacheMetricsTestServer(t *testing.T, enabled bool, path string) (*httpte
 	}
 	r := router.New(cfg, adapters, st, nil)
 
-	srv := New(":0", "secret", "secret", false, r, st, "https://api.anthropic.com", "", "", "", enabled, path)
+	srv := New(":0", "secret", "secret", false, r, st, "https://api.anthropic.com", "", "", "", enabled, path, "test")
 	ts := httptest.NewServer(srv.httpServer.Handler)
 	t.Cleanup(ts.Close)
 	return ts, st

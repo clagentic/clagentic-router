@@ -46,7 +46,11 @@ type Server struct {
 // is true — an unconfigured install (cacheMetricsEnabled == false, the
 // config default) never registers the path at all, not merely returns an
 // empty body from it.
-func New(addr, token, adminToken string, allowNoAuth bool, r *router.Router, st *store.Store, anthropicUpstreamURL, anthropicUpstreamAPIKey, bedrockRegion, bedrockProfile string, cacheMetricsEnabled bool, cacheMetricsPath string) *Server {
+// version is the running binary's revision string (main.version, see
+// cmd/clagentic-router/main.go), surfaced on /version, /health, and /doctor
+// (lr-92ee18 B1). Passed through rather than read from a package-level var
+// here so this package has no dependency on cmd/clagentic-router.
+func New(addr, token, adminToken string, allowNoAuth bool, r *router.Router, st *store.Store, anthropicUpstreamURL, anthropicUpstreamAPIKey, bedrockRegion, bedrockProfile string, cacheMetricsEnabled bool, cacheMetricsPath string, version string) *Server {
 	h := &Handler{
 		router:                  r,
 		store:                   st,
@@ -57,6 +61,7 @@ func New(addr, token, adminToken string, allowNoAuth bool, r *router.Router, st 
 		anthropicUpstreamAPIKey: anthropicUpstreamAPIKey,
 		bedrockRegion:           bedrockRegion,
 		bedrockProfile:          bedrockProfile,
+		buildVersion:            version,
 	}
 	mux := http.NewServeMux()
 
