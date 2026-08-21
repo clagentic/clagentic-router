@@ -185,6 +185,20 @@ func TestCodexCLI_ModelPassthrough(t *testing.T) {
 					t.Errorf("--model %q passed to CLI, want %q", got, tc.model)
 				}
 			}
+
+			// --json is required for the in-band failure surface and
+			// cache/token metrics wiring (lr-a40da5) — must be present on
+			// every invocation, not conditional on any flag.
+			hasJSON := false
+			for _, a := range args {
+				if a == "--json" {
+					hasJSON = true
+					break
+				}
+			}
+			if !hasJSON {
+				t.Error("--json flag missing; required for in-band failure detection and cache metrics (lr-a40da5)")
+			}
 		})
 	}
 }
