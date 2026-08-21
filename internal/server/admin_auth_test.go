@@ -40,7 +40,7 @@ func newSplitTokenServer(t *testing.T) (*httptest.Server, func()) {
 	inferenceToken := "inference-token"
 	adminToken := "admin-token-separate"
 
-	srv := New(":0", inferenceToken, adminToken, false, r, nil, "https://api.anthropic.com", "", "", "", false, "")
+	srv := New(":0", inferenceToken, adminToken, false, r, nil, "https://api.anthropic.com", "", "", "", false, "", "test")
 	ts := httptest.NewServer(srv.httpServer.Handler)
 	return ts, func() { ts.Close() }
 }

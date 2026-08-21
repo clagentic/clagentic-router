@@ -45,7 +45,7 @@ func newToolCarriageTestServer(t *testing.T, resp *backend.Response) (*httptest.
 		"tool-backend": &stubAdapter{id: "tool-backend", supportsTools: true, response: resp},
 	}
 	r := router.New(cfg, adapters, nil, nil)
-	srv := New(":0", "secret", "secret", false, r, nil, "http://unused.invalid", "", "", "", false, "")
+	srv := New(":0", "secret", "secret", false, r, nil, "http://unused.invalid", "", "", "", false, "", "test")
 	ts := httptest.NewServer(srv.httpServer.Handler)
 	return ts, func() { ts.Close() }
 }
@@ -252,7 +252,7 @@ func TestChatCompletions_ToolUseResponse_EmitsToolCallsAndFinishReason(t *testin
 		"tool-backend": &stubAdapter{id: "tool-backend", supportsTools: true, response: toolResp},
 	}
 	r := router.New(cfg, adapters, nil, nil)
-	srv := New(":0", "secret", "secret", false, r, nil, "https://api.anthropic.com", "", "", "", false, "")
+	srv := New(":0", "secret", "secret", false, r, nil, "https://api.anthropic.com", "", "", "", false, "", "test")
 	ts := httptest.NewServer(srv.httpServer.Handler)
 	defer ts.Close()
 
@@ -339,7 +339,7 @@ func TestBedrockRouted_ToolUseResponse_EmitsToolUseBlockAndStopReason(t *testing
 		"tool-backend": &stubAdapter{id: "tool-backend", supportsTools: true, response: toolResp},
 	}
 	r := router.New(cfg, adapters, nil, nil)
-	srv := New(":0", "secret", "secret", false, r, nil, "https://api.anthropic.com", "", "", "", false, "")
+	srv := New(":0", "secret", "secret", false, r, nil, "https://api.anthropic.com", "", "", "", false, "", "test")
 	ts := httptest.NewServer(srv.httpServer.Handler)
 	defer ts.Close()
 

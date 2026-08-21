@@ -531,6 +531,29 @@ func (r *Router) AdapterCapabilities(backendID string) (backend.Capabilities, bo
 	return adp.Capabilities(), true
 }
 
+// UnresolvedBinaryBackends returns the IDs of all configured backends whose
+// adapter implements backend.BinaryChecker and reports BinaryResolved() ==
+// false — i.e. every CLI-subprocess backend (claude_cli, codex_cli,
+// codex_subagent, gemini_cli) whose binary could not be found at
+// construction time (or a later refreshBin call). Backends whose adapter
+// does not implement BinaryChecker at all (the HTTP adapters — see that
+// interface's doc) are never included; "no binary concept" is not the same
+// condition as "binary unresolved" (lr-92ee18 B2).
+//
+// Sorted for deterministic output (used directly in /health's JSON body).
+func (r *Router) UnresolvedBinaryBackends() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var unresolved []string
+	for id, adp := range r.adapters {
+		if bc, ok := adp.(backend.BinaryChecker); ok && !bc.BinaryResolved() {
+			unresolved = append(unresolved, id)
+		}
+	}
+	sort.Strings(unresolved)
+	return unresolved
+}
+
 // FilterChainForTools narrows chain to entries that resolve to at least one
 // tool-capable backend. A tier-alias or role-chain entry whose candidate set
 // contains a mix of capable and incapable backends is kept as-is — Route's

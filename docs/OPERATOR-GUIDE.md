@@ -275,8 +275,39 @@ backend, before tagging a release, and after deploying a new binary.
 | `bedrock_api` backend fails at startup | `region` unset — Bedrock has no SDK default region | [BEDROCK.md](BEDROCK.md)'s `bedrock_api` section |
 | `422 no_tool_capable_backend` | Request carried `tools` and the resolved chain has no tool-capable backend | [AGENT-REFERENCE.md](AGENT-REFERENCE.md)'s adapter capabilities section — every adapter today declares `supports_tools: false` |
 | `GET /doctor` shows a backend `unknown` | No probe or organic traffic yet for that backend | `GET /health` (cached) vs `GET /doctor` (live probe) — see [AGENT-REFERENCE.md](AGENT-REFERENCE.md)'s API table |
+| `GET /health` reports `status` other than `"ok"` and lists a backend in `unresolved_binaries` | That backend's CLI binary (claude/codex/gemini) could not be found on `PATH`/`extraBinDirs` at startup — an ERROR-level `binary not found at startup` log line was emitted when the daemon started | Install the binary, or set the adapter's `bin_path` / the matching `*_BIN` env var; restart the daemon |
+| `clagentic-router doctor`/`health`/`quota`/etc. (run from an operator's own shell) returns `401` | The daemon's token lives only in its systemd `EnvironmentFile` (not sourced into an interactive shell) and none of `--token`/`--token-file`/`CLAGENTIC_ROUTER_TOKEN` resolved a value either | The 401 error itself names every source checked, including the exact env-file path; see "Client token resolution" below |
 | Backend `openai_api` quota shows only soft/header-based limits, never account-level usage | No admin-scoped `openai_api_key` configured, or your key is a standard `sk-proj-...` project key | See "OpenAI usage API" below |
 | Webhook not firing | Event not registered for that endpoint, or delivery exhausted retries | `GET /webhooks` to check registration; delivery logs |
+
+### Client token resolution (lr-92ee18 B3)
+
+`health`, `doctor`, `quota`, `metrics`, `logs`, `call`, and `backend`
+subcommands are thin HTTP clients — they need the same bearer token the
+daemon itself checks incoming requests against. That token normally lives
+**only** in the daemon's `EnvironmentFile` (`/etc/clagentic/router/env` by
+default — see the systemd unit above), which systemd loads into the
+service's environment but which is never sourced into an operator's own
+interactive shell. Before this was fixed, that meant the single best
+diagnostic surface for a broken deployment — `clagentic-router doctor` — was
+effectively unusable from a normal shell: it always 401ed.
+
+Resolution order, first non-empty value wins:
+
+1. `--token TOKEN` / `-t TOKEN`
+2. `--token-file PATH` (file contents, trimmed)
+3. `CLAGENTIC_ROUTER_TOKEN` or `CLAGENTIC_ROUTER_ADMIN_TOKEN` in the
+   caller's own shell environment
+4. The deployment's `EnvironmentFile` — default
+   `/etc/clagentic/router/env`, matching
+   [`deploy/clagentic-router.service`](../deploy/clagentic-router.service);
+   override the path with `CLAGENTIC_ROUTER_ENV_FILE`
+
+Step 4 is what makes a bare `clagentic-router doctor` work out of the box on
+a stock systemd install: it reads the same file the daemon was configured to
+load its own token from. If every step fails, the resulting `401` names
+exactly which sources were checked and which env-file path was tried — never
+a bare `HTTP 401`, and never the token value itself.
 
 ### OpenAI usage API note
 

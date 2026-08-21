@@ -86,14 +86,22 @@ func (a *CodexSubagentAdapter) refreshBin() string {
 	return a.binPath
 }
 
+// BinaryResolved implements BinaryChecker (lr-92ee18 B2).
+func (a *CodexSubagentAdapter) BinaryResolved() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.binPath != ""
+}
+
 // Invoke calls claude -p --agent codex with CLAGENTIC_CODEX_TIER set.
 func (a *CodexSubagentAdapter) Invoke(ctx context.Context, req *Request) (*Response, error) {
 	// Verified, not assumed: this adapter's cmd (below) invokes bin — the
 	// same claude binary resolved the same way as claude_cli.go — via
 	// "-p --agent codex", passed through the identical buildCLIEnv(extra)
-	// call and the identical claudeSubprocessHome HOME override that
-	// claude_cli.go uses. There is no separate codex_subagent-specific auth
-	// path to check: whatever env/HOME claude_cli's subprocess sees, this
+	// call and the identical isolated-HOME override that claude_cli.go uses
+	// (resolveClaudeSubprocessHome, resolved lazily on first Invoke —
+	// lr-92ee18 B4). There is no separate codex_subagent-specific auth path
+	// to check: whatever env/HOME claude_cli's subprocess sees, this
 	// adapter's subprocess sees too, because it is the same binary invoked
 	// through the same env-construction code. So CLAUDE_CODE_USE_BEDROCK
 	// must survive buildCLIEnv's filter (env.go, shared by both adapters),
@@ -101,8 +109,9 @@ func (a *CodexSubagentAdapter) Invoke(ctx context.Context, req *Request) (*Respo
 	// claude_cli.go provides, for the identical reason (lr-6572d5). No
 	// adapter-specific logic needed here beyond calling the shared sync
 	// functions.
-	syncSubprocessCreds(claudeSubprocessHome)
-	syncSubprocessAWSSSOCache(claudeSubprocessHome)
+	subprocessHome := resolveClaudeSubprocessHome()
+	syncSubprocessCreds(subprocessHome)
+	syncSubprocessAWSSSOCache(subprocessHome)
 
 	bin := a.resolveBin()
 	if bin == "" {
@@ -148,8 +157,8 @@ func (a *CodexSubagentAdapter) Invoke(ctx context.Context, req *Request) (*Respo
 	// buildCLIEnv filters the daemon environment to the allowlist — router tokens
 	// and API keys are not passed to the subprocess. (lr-c7ac)
 	extra := []string{"CLAGENTIC_DISABLE_RECALL=1"}
-	if claudeSubprocessHome != "" {
-		extra = append(extra, "HOME="+claudeSubprocessHome)
+	if subprocessHome != "" {
+		extra = append(extra, "HOME="+subprocessHome)
 	}
 	if a.tier != "" {
 		extra = append(extra, fmt.Sprintf("CLAGENTIC_CODEX_TIER=%s", a.tier))

@@ -81,17 +81,20 @@ func argvHasFlagValue(args []string, flag, value string) bool {
 // TestClaudeCLI_NoTrustFileWritten proves the isolated subprocess HOME's
 // .claude.json is never created or modified by an Invoke call — the prior
 // pre-accept-trust write path (removed) is gone, not just dormant.
-// claudeSubprocessHome is resolved once at package init (it is a package
-// var, not re-read per Invoke), so this test targets that real resolved
-// path rather than trying to inject a fresh one via env var — a
-// CLAGENTIC_ROUTER_SUBPROCESS_HOME override at test time would have no
-// effect on the already-initialized package var.
+// resolveClaudeSubprocessHome resolves lazily on first call, guarded by a
+// package-level sync.Once (lr-92ee18 B4) — the FIRST call in this test
+// binary's process (whichever test runs first) wins and every subsequent
+// call, including this one, returns that already-resolved path. Since
+// Invoke() itself calls resolveClaudeSubprocessHome(), calling it directly
+// here to seed subprocessHome does not create the directory a second time
+// or change which path is resolved.
 func TestClaudeCLI_NoTrustFileWritten(t *testing.T) {
-	if claudeSubprocessHome == "" {
-		t.Skip("claudeSubprocessHome resolved empty at package init; nothing to assert")
+	subprocessHome := resolveClaudeSubprocessHome()
+	if subprocessHome == "" {
+		t.Skip("subprocess home resolved empty; nothing to assert")
 	}
 
-	trustFile := filepath.Join(claudeSubprocessHome, ".claude.json")
+	trustFile := filepath.Join(subprocessHome, ".claude.json")
 	var beforeModTime int64
 	if info, err := os.Stat(trustFile); err == nil {
 		beforeModTime = info.ModTime().UnixNano()

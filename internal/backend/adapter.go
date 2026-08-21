@@ -331,6 +331,32 @@ type Adapter interface {
 	Capabilities() Capabilities
 }
 
+// BinaryChecker is an optional interface implemented by every CLI subprocess
+// adapter (claude_cli, codex_cli, codex_subagent, gemini_cli) — each already
+// resolves and caches its binary path at construction time (see
+// ResolveBinPath) and re-resolves lazily on FileNotFoundError. Before this
+// interface existed, that construction-time failure was logged only at WARN
+// ("binary not found at startup" — binpath.go) and nothing downstream ever
+// asked the adapter whether its binary actually resolved: a router
+// configured with an unresolvable CLI binary would report /health status:ok
+// indefinitely, until the first real request hit that backend and failed
+// (lr-92ee18 B2).
+//
+// HTTP adapters (anthropic_api, openai_api, bedrock_api, ollama_http) have no
+// subprocess and no binary to resolve — they deliberately do NOT implement
+// this interface, so a type assertion against it is the correct and only way
+// to ask "does this adapter have a binary-resolution concept at all,"
+// distinct from "did resolution succeed." Callers (e.g. router.AllSnapshots'
+// health rollup) must treat a failed type assertion as "not applicable," not
+// as a resolution failure.
+type BinaryChecker interface {
+	// BinaryResolved reports whether this adapter's CLI binary was found
+	// (construction-time ResolveBinPath, or a later refreshBin call) — a
+	// live check of the cached path, not a fresh filesystem stat. Concurrent-
+	// safe: each adapter guards binPath with its own mutex.
+	BinaryResolved() bool
+}
+
 // FormatMessages converts a messages slice into a prompt string for CLI-based adapters.
 // Returns (prompt, systemPrompt). The prompt is the user-facing input;
 // systemPrompt is the optional system instruction.
