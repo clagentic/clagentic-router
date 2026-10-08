@@ -209,7 +209,8 @@ func (h *Handler) bedrockRouted(w http.ResponseWriter, r *http.Request, modelID 
 	}
 
 	t0 := time.Now()
-	routeCtx, cancelRoute, reqDeadline := beginRoutedRequestAt(w, r, t0, h.router.RequestDeadline(chain))
+	budget, capped := h.router.RequestDeadline(chain)
+	routeCtx, cancelRoute, _ := beginRoutedRequestAt(w, r, t0, budget, capped)
 	defer cancelRoute()
 	resp, meta, err := h.router.Route(routeCtx, routerReq, chain)
 	if err != nil {
@@ -217,12 +218,12 @@ func (h *Handler) bedrockRouted(w http.ResponseWriter, r *http.Request, modelID 
 			writeBedrockError(w, http.StatusServiceUnavailable, "no available backends in chain")
 			return
 		}
-		slog.Error("bedrock invoke: routed backend error", "err", err, "request_id", RequestID(r.Context()))
+		logRouteFailure("bedrock invoke", err, RequestID(r.Context()))
 		writeBedrockError(w, http.StatusBadGateway, "upstream backend failed")
 		return
 	}
 
-	dw := newDeliveryWriter(w, reqDeadline)
+	dw := newDeliveryWriter(w)
 	defer dw.reportDelivery(RequestID(r.Context()), meta.BackendID, t0)
 	w = dw
 
@@ -234,7 +235,8 @@ func (h *Handler) bedrockRouted(w http.ResponseWriter, r *http.Request, modelID 
 
 	if stream {
 		if err := writeBedrockEventStream(w, modelID, resp); err != nil {
-			slog.Error("bedrock invoke: eventstream write failed", "err", err, "request_id", RequestID(r.Context()))
+			slog.Error("bedrock invoke: eventstream write failed",
+				"err", err, "cause", writeFailureCause(err), "request_id", RequestID(r.Context()))
 		}
 		return
 	}
@@ -289,7 +291,8 @@ func (h *Handler) bedrockPassthrough(w http.ResponseWriter, r *http.Request, mod
 	}
 	creds, err := credsFn(ctx)
 	if err != nil {
-		slog.Error("bedrock invoke: credential resolution failed", "err", err, "request_id", RequestID(r.Context()))
+		slog.Error("bedrock invoke: credential resolution failed",
+			"err", err, "cause", pt.Cause(), "request_id", RequestID(r.Context()))
 		writeBedrockError(w, http.StatusBadGateway, "failed to resolve AWS credentials for passthrough")
 		return
 	}
@@ -321,14 +324,16 @@ func (h *Handler) bedrockPassthrough(w http.ResponseWriter, r *http.Request, mod
 	payloadHash := hex.EncodeToString(sum[:])
 	signer := v4.NewSigner()
 	if err := signer.SignHTTP(ctx, creds, upReq, payloadHash, "bedrock", h.bedrockRegion, time.Now()); err != nil {
-		slog.Error("bedrock invoke: SigV4 signing failed", "err", err, "request_id", RequestID(r.Context()))
+		slog.Error("bedrock invoke: SigV4 signing failed",
+			"err", err, "cause", pt.Cause(), "request_id", RequestID(r.Context()))
 		writeBedrockError(w, http.StatusBadGateway, "failed to sign upstream request")
 		return
 	}
 
 	upResp, err := http.DefaultClient.Do(upReq)
 	if err != nil {
-		slog.Error("bedrock invoke: passthrough upstream error", "err", err, "request_id", RequestID(r.Context()))
+		slog.Error("bedrock invoke: passthrough upstream error",
+			"err", err, "cause", pt.Cause(), "request_id", RequestID(r.Context()))
 		writeBedrockError(w, http.StatusBadGateway, "upstream request failed")
 		return
 	}

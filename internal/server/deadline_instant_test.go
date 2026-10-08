@@ -1,6 +1,10 @@
-// internal/server/deadline_instant_test.go — one-instant deadline derivation
-// for routed requests (Route expires a delivery margin before the write
-// deadline) and handler-entry bounds for passthrough requests.
+// Guards the single-instant invariant of the request deadline model: every
+// deadline derives from one start instant and one budget, so the routed and
+// passthrough paths cannot drift apart, nothing re-reads the clock mid-request,
+// and work that must end in a written error response always stops a delivery
+// margin before the connection's write deadline. A regression here shows up as
+// an empty reply (the error had no budget left to be written) rather than a
+// failed assertion in the handler under test.
 package server
 
 import (
@@ -37,7 +41,7 @@ func TestBeginRoutedRequestAt_RouteExpiresMarginBeforeWriteDeadline(t *testing.T
 	t.Run("margin_reserved", func(t *testing.T) {
 		d := 5 * time.Minute
 		w := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
-		ctx, cancel, deadline := beginRoutedRequestAt(w, r, start, d)
+		ctx, cancel, deadline := beginRoutedRequestAt(w, r, start, d, false)
 		defer cancel()
 
 		wantWrite := start.Add(d)
@@ -59,7 +63,7 @@ func TestBeginRoutedRequestAt_RouteExpiresMarginBeforeWriteDeadline(t *testing.T
 	t.Run("clamped_when_bound_not_above_margin", func(t *testing.T) {
 		for _, d := range []time.Duration{router.DeliveryMargin, router.DeliveryMargin / 3, time.Second} {
 			w := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
-			ctx, cancel, _ := beginRoutedRequestAt(w, r, start, d)
+			ctx, cancel, _ := beginRoutedRequestAt(w, r, start, d, false)
 			got, _ := ctx.Deadline()
 			cancel()
 			if !got.After(start) || !got.Before(w.writeDeadline) {
@@ -152,7 +156,7 @@ func TestRequestDeadlines_SingleSourceForRoutedAndPassthrough(t *testing.T) {
 		}
 
 		w := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
-		ctx, cancel, got := beginRoutedRequestAt(w, r, t0, d)
+		ctx, cancel, got := beginRoutedRequestAt(w, r, t0, d, false)
 		routedWork, _ := ctx.Deadline()
 		cancel()
 		if !routedWork.Equal(work) || !got.Equal(write) || !w.writeDeadline.Equal(write) {

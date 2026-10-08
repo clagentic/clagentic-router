@@ -165,7 +165,7 @@ func (a *CodexSubagentAdapter) Invoke(ctx context.Context, req *Request) (*Respo
 	}
 	env := buildCLIEnv(extra)
 
-	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd := newBoundedCommand(ctx, bin, args...)
 	cmd.Stdin = strings.NewReader(fullPrompt.String())
 	cmd.Env = env
 	// Neutral working directory so the subprocess does not inherit the

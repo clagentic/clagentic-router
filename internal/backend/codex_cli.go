@@ -264,7 +264,7 @@ func (a *CodexCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response, 
 	// is fine; HOME curation is a separate, out-of-scope concern.
 	env := buildCLIEnv(nil)
 
-	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd := newBoundedCommand(ctx, bin, args...)
 	cmd.Stdin = strings.NewReader(fullPrompt.String())
 	cmd.Env = env
 	// Neutral working directory so the subprocess does not inherit the

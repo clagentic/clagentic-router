@@ -1,12 +1,18 @@
-// internal/server/deadline_delivery_test.go — delivery-failure capture and the
-// post-Route Warn emitted by deliveryWriter.
+// A response can fail to deliver after Route has already succeeded, and call_log
+// rightly keeps recording the backend's "pass". These tests guard that the
+// failure is still surfaced at Warn, and that its cause is read from the error
+// captured at the moment of failure: a report that runs later (it is deferred)
+// must not relabel an early failure as a deadline expiry.
 package server
 
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -76,26 +82,72 @@ func TestDeliveryWriter_ReportDeliveryWarnsOnFailure(t *testing.T) {
 	}
 }
 
-func TestDeliveryWriter_WarnAttributesRequestDeadline(t *testing.T) {
-	cases := []struct {
-		name     string
-		deadline time.Time
-		want     string
-	}{
-		{"past deadline", time.Now().Add(-time.Second), "cause=request_deadline"},
-		{"deadline not reached", time.Now().Add(time.Hour), "cause=write_failed"},
-		{"unknown deadline", time.Time{}, "cause=write_failed"},
+// The cause is fixed by the error captured at the first failure. A write that
+// fails before the write deadline W must stay write_failed even when the report
+// runs after W (reportDelivery is deferred, so it always runs later than the
+// failure it reports).
+func TestDeliveryWriter_FailureBeforeW_ReportedAfterW_IsWriteFailed(t *testing.T) {
+	buf := captureWarnLog(t)
+	w := time.Now().Add(40 * time.Millisecond)
+	dw := newDeliveryWriter(&failingWriter{})
+
+	_, _ = dw.Write([]byte("x")) // fails now, before W
+	time.Sleep(60 * time.Millisecond)
+	if !time.Now().After(w) {
+		t.Fatal("test setup: report must run after W")
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			buf := captureWarnLog(t)
-			dw := newDeliveryWriter(&failingWriter{}, tc.deadline)
-			_, _ = dw.Write([]byte("x"))
-			dw.reportDelivery("req-1", "b", time.Now())
-			if !strings.Contains(buf.String(), tc.want) {
-				t.Errorf("warn log missing %q:\n%s", tc.want, buf.String())
-			}
-		})
+	dw.reportDelivery("req-1", "b", time.Now())
+
+	if !strings.Contains(buf.String(), "cause=write_failed") {
+		t.Errorf("a pre-W failure reported after W must be write_failed:\n%s", buf.String())
+	}
+	if strings.Contains(buf.String(), "write_deadline") {
+		t.Errorf("report-time clock leaked into attribution:\n%s", buf.String())
+	}
+}
+
+func TestWriteFailureCause_FromErrorIdentity(t *testing.T) {
+	if got := writeFailureCause(os.ErrDeadlineExceeded); got != "write_deadline" {
+		t.Errorf("os.ErrDeadlineExceeded -> %q, want write_deadline", got)
+	}
+	if got := writeFailureCause(fmt.Errorf("write tcp: %w", os.ErrDeadlineExceeded)); got != "write_deadline" {
+		t.Errorf("wrapped os.ErrDeadlineExceeded -> %q, want write_deadline", got)
+	}
+	if got := writeFailureCause(errClientGone); got != "write_failed" {
+		t.Errorf("broken pipe -> %q, want write_failed", got)
+	}
+}
+
+// With a real http.Server, a write that fails because the connection's write
+// deadline W expired must surface as os.ErrDeadlineExceeded (verifying that
+// net/http propagates the net.Conn error unchanged) and be reported as
+// write_deadline.
+func TestDeliveryWriter_RealServer_FailureAtW_IsWriteDeadline(t *testing.T) {
+	buf := captureWarnLog(t)
+	reported := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(reported)
+		t0 := time.Now()
+		setWriteDeadline(w, t0.Add(100*time.Millisecond), "req-w")
+		dw := newDeliveryWriter(w)
+		time.Sleep(250 * time.Millisecond) // work outlives W
+		dw.WriteHeader(http.StatusOK)
+		_, _ = dw.Write([]byte("late"))
+		dw.reportDelivery("req-w", "b", t0)
+		if !errors.Is(dw.err, os.ErrDeadlineExceeded) {
+			t.Errorf("captured err = %v, want one matching os.ErrDeadlineExceeded", dw.err)
+		}
+	}))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL)
+	if err == nil {
+		resp.Body.Close()
+	}
+	<-reported
+
+	if !strings.Contains(buf.String(), "cause=write_deadline") {
+		t.Errorf("write failure at W must be write_deadline:\n%s", buf.String())
 	}
 }
 

@@ -1,7 +1,10 @@
-// internal/server/deadline_inv_test.go — class guards for the request-deadline
-// invariant: every ctx-expiry branch that reports by writing a response must
-// have budget left to write it, and a passthrough body relay may run to the
-// write deadline but no further.
+// Class guards for the deadline invariant that a context expiry reported by
+// writing an error response must leave budget to write it. Each earlier fix
+// patched one handler branch and the next review found a sibling branch with
+// the same defect, so these tests enumerate every branch (routed and
+// passthrough, before and after the response is committed) instead of one:
+// a new handler path that forgets the work/write split fails here as an empty
+// reply, and a relay that outruns the write deadline fails the cut-time check.
 package server
 
 import (

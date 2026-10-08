@@ -359,28 +359,35 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 		// family (CLI subprocess, bedrock_api, HTTP) instead of in each
 		// adapter: a deadline on the Invoke context kills exec.CommandContext
 		// subprocesses and aborts SDK/HTTP calls alike.
-		invokeCtx, cancelInvoke := context.WithTimeout(ctx, r.backendTimeout(bid))
+		invokeCtx, cancelInvoke := context.WithTimeoutCause(ctx, r.backendTimeout(bid), ErrBackendTimeout)
 		resp, err := r.adapters[bid].Invoke(invokeCtx, req)
-		// backendDeadlineHit is true only when OUR deadline fired while the
-		// caller's context was still live; a parent cancel/deadline (client
-		// gone) is a different fact and must not be charged to the backend.
-		backendDeadlineHit := err != nil && ctx.Err() == nil &&
-			errors.Is(invokeCtx.Err(), context.DeadlineExceeded)
+		// The failure is attributed exactly once, here, from the cause the
+		// innermost context recorded at its first event (the cause survives
+		// cancelInvoke only until it runs, hence read before it). Which context
+		// happens to look done afterwards says nothing about which event came
+		// first: a parent expiring while this backend's own deadline already
+		// fired must still be charged to the backend.
+		var cause error
+		if err != nil {
+			cause = context.Cause(invokeCtx)
+		}
 		cancelInvoke()
 		latencyMS := time.Since(start).Milliseconds()
 
-		if err != nil && ctx.Err() != nil {
-			// Caller went away, or the request deadline the server derived
-			// from the write deadline expired, mid-Invoke. Neither is a backend
-			// fault: no health penalty, no further tiers, since delivery is
-			// impossible either way. The deadline case gets its own outcome so
-			// it is distinguishable from a client disconnect.
+		backendTimedOut := errors.Is(cause, ErrBackendTimeout) || errors.Is(cause, ErrChainBudget)
+		if err != nil && cause != nil && !backendTimedOut {
+			// The caller went away, or the request deadline (the operator's
+			// proxy.max_request_seconds, or a deadline set outside the router)
+			// expired mid-Invoke. Neither is a backend fault: no health
+			// penalty, no further tiers, since delivery is impossible either
+			// way. The deadline case gets its own outcome so it is
+			// distinguishable from a client disconnect.
 			outcome := "cancelled"
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			if errors.Is(cause, context.DeadlineExceeded) {
 				outcome = "request_deadline"
 			}
 			slog.Info("router: request context done during invoke, not penalizing backend",
-				"backend", bid, "chain_pos", i, "ctx_err", ctx.Err(), "outcome", outcome, "latency_ms", latencyMS, "request_id", reqID)
+				"backend", bid, "chain_pos", i, "cause", CauseLabel(cause), "outcome", outcome, "latency_ms", latencyMS, "request_id", reqID)
 			if r.store != nil {
 				r.store.LogCall(store.CallLogInput{
 					BackendID:     bid,
@@ -395,7 +402,7 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 					ToolsPresent:  req.HasTools,
 				})
 			}
-			return nil, nil, fmt.Errorf("router: request context done: %w", ctx.Err())
+			return nil, nil, fmt.Errorf("router: request context done (%s): %w", outcome, cause)
 		}
 
 		if err == nil {
@@ -449,12 +456,16 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 			errType = state.ErrorType(ie.Type)
 			errRaw = ie.Raw
 		}
-		if backendDeadlineHit {
+		if backendTimedOut {
 			// Adapters classify a deadline kill inconsistently (CLI adapters via
 			// IsContextDeadlineKill, SDK/HTTP adapters as unknown/network);
-			// when our own deadline fired the cause is known, so normalize.
+			// when a backend-charged deadline fired the cause is known, so
+			// normalize. An ErrChainBudget expiry is charged the same way even
+			// when the backend ran less than its own full timeout: it overran
+			// the budget the chain allotted it, including time an earlier tier
+			// spent after its own kill.
 			errType = state.ErrTypeTimeout
-			errRaw = fmt.Sprintf("backend timeout_seconds exceeded (%s)", r.backendTimeout(bid))
+			errRaw = fmt.Sprintf("%s (backend timeout %s)", CauseLabel(cause), r.backendTimeout(bid))
 		}
 
 		change := r.recordFailure(bid, errType, errRaw, backend.ParseResetTime(errRaw), latencyMS)
@@ -488,11 +499,23 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 		}
 
 		lastErr = err
+		if backendTimedOut {
+			// Carry the cause so the server-side chain-exhausted log names the
+			// deadline owner (backend vs chain budget), not just "killed".
+			lastErr = fmt.Errorf("%w: %w", cause, err)
+		}
 		lastErrType = errType
 		slog.Info("router: backend failed, advancing chain",
 			"backend", bid, "chain_pos", i, "error_type", errType, "latency_ms", latencyMS, "request_id", reqID)
 
-		// Don't try the same backend again in a later chain position
+		// A backend-charged timeout advances the chain only while the request
+		// itself is still live. This is a decision-time budget check, not
+		// attribution: the failure was already charged above. An exhausted
+		// chain budget (or a client that left after the backend's own deadline
+		// fired) leaves no tier a chance to run.
+		if backendTimedOut && ctx.Err() != nil {
+			break
+		}
 	}
 
 	if r.store != nil {
@@ -548,7 +571,12 @@ func (r *Router) backendTimeout(bid string) time.Duration {
 // across entries, plus deliveryMargin. The result is capped by
 // proxy.max_request_seconds, which wins when explicitly set below the sum.
 // The HTTP layer uses it as the per-request write deadline.
-func (r *Router) RequestDeadline(chain []string) time.Duration {
+//
+// capped reports whether max_request_seconds is what bounded the result, so the
+// caller can create the route context with the matching cause (ErrRequestCap
+// versus ErrChainBudget) and the router can attribute an expiry to the right
+// owner.
+func (r *Router) RequestDeadline(chain []string) (d time.Duration, capped bool) {
 	var total time.Duration
 	for _, entry := range chain {
 		var longest time.Duration
@@ -561,9 +589,9 @@ func (r *Router) RequestDeadline(chain []string) time.Duration {
 	}
 	total += deliveryMargin
 	if limit := r.cfg.Proxy.MaxRequest(); total > limit {
-		return limit
+		return limit, true
 	}
-	return total
+	return total, false
 }
 
 // MaxRequest returns the configured per-request ceiling used as the write

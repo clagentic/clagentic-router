@@ -1,8 +1,10 @@
-// internal/server/deadline_test.go — per-request write deadlines on the LLM
-// endpoints versus the server-wide backstop WriteTimeout.
-//
-// Each test drives a real net/http server whose backstop WriteTimeout is
-// far shorter than the work being done, using millisecond-scale durations.
+// The server-wide WriteTimeout is an absolute connection deadline that does not
+// cancel the handler, so a request outliving it completes its backend call and
+// then fails to deliver (the client sees an empty reply). LLM endpoints
+// therefore replace it per request. Each test drives a real net/http server
+// whose backstop is far shorter than the work being done, because only a real
+// connection reproduces the empty-reply failure; durations are millisecond
+// scale to keep that affordable.
 package server
 
 import (

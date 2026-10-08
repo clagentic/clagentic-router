@@ -363,7 +363,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	t0 := time.Now()
-	routeCtx, cancelRoute, reqDeadline := beginRoutedRequestAt(w, r, t0, h.router.RequestDeadline(chain))
+	budget, capped := h.router.RequestDeadline(chain)
+	routeCtx, cancelRoute, _ := beginRoutedRequestAt(w, r, t0, budget, capped)
 	defer cancelRoute()
 	resp, meta, err := h.router.Route(routeCtx, routerReq, chain)
 	if err != nil {
@@ -383,12 +384,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		// Log the raw error server-side; do not include it in the client response
 		// to avoid leaking internal backend error details to inference callers.
-		slog.Error("chat: backend error", "err", err, "request_id", RequestID(r.Context()))
+		logRouteFailure("chat", err, RequestID(r.Context()))
 		writeError(w, http.StatusBadGateway, "backend_error", "upstream backend failed")
 		return
 	}
 
-	dw := newDeliveryWriter(w, reqDeadline)
+	dw := newDeliveryWriter(w)
 	defer dw.reportDelivery(RequestID(r.Context()), meta.BackendID, t0)
 	w = dw
 

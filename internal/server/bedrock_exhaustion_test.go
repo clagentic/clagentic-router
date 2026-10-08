@@ -1,5 +1,6 @@
-// internal/server/bedrock_exhaustion_test.go — a routed Bedrock request whose
-// chain is exhausted must answer 503, like the chat/messages handlers.
+// Chain exhaustion is answered 503 by the chat and messages handlers; the
+// Bedrock invoke handler used to fall through to the generic 502, so one
+// failure mode produced different statuses per endpoint. This pins them equal.
 package server
 
 import (

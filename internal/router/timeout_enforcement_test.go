@@ -1,6 +1,8 @@
-// internal/router/timeout_enforcement_test.go — Route enforces the per-backend
-// timeout for every adapter, distinguishes it from client cancellation, and
-// derives the per-request HTTP deadline from the chain.
+// Only the HTTP adapters ever honored timeout_seconds; the CLI and bedrock
+// adapters ignored it, so a hung subprocess ran unbounded. Route is the one
+// place the bound is applied now, so these tests pin it there (independent of
+// adapter family), pin that a client leaving is not charged to the backend, and
+// pin the chain-derived request deadline the HTTP layer builds on.
 package router
 
 import (
@@ -144,13 +146,13 @@ func TestRequestDeadline_SumsMaxPerEntryPlusMarginAndHonorsCap(t *testing.T) {
 
 	// entry "a" -> 10s; tier "t" -> max(20,30)=30s; plus margin.
 	want := 10*time.Second + 30*time.Second + deliveryMargin
-	if got := r.RequestDeadline([]string{"a", "t"}); got != want {
-		t.Errorf("RequestDeadline = %s, want %s", got, want)
+	if got, capped := r.RequestDeadline([]string{"a", "t"}); got != want || capped {
+		t.Errorf("RequestDeadline = %s capped=%v, want %s uncapped", got, capped, want)
 	}
 
 	r.cfg.Proxy.MaxRequestSeconds = 50
-	if got := r.RequestDeadline([]string{"a", "t"}); got != 50*time.Second {
-		t.Errorf("explicit max_request_seconds must cap: got %s, want 50s", got)
+	if got, capped := r.RequestDeadline([]string{"a", "t"}); got != 50*time.Second || !capped {
+		t.Errorf("explicit max_request_seconds must cap: got %s capped=%v, want 50s capped", got, capped)
 	}
 }
 

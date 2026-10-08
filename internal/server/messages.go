@@ -359,7 +359,8 @@ func (h *Handler) messagesPassthrough(w http.ResponseWriter, r *http.Request, ra
 
 	upResp, err := http.DefaultClient.Do(upReq)
 	if err != nil {
-		slog.Error("messages: passthrough upstream error", "err", err, "request_id", RequestID(r.Context()))
+		slog.Error("messages: passthrough upstream error",
+			"err", err, "cause", pt.Cause(), "request_id", RequestID(r.Context()))
 		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed")
 		return
 	}
@@ -444,7 +445,8 @@ func (h *Handler) messagesRouted(w http.ResponseWriter, r *http.Request, req *an
 	}
 
 	t0 := time.Now()
-	routeCtx, cancelRoute, reqDeadline := beginRoutedRequestAt(w, r, t0, h.router.RequestDeadline(chain))
+	budget, capped := h.router.RequestDeadline(chain)
+	routeCtx, cancelRoute, _ := beginRoutedRequestAt(w, r, t0, budget, capped)
 	defer cancelRoute()
 	resp, meta, err := h.router.Route(routeCtx, routerReq, chain)
 	if err != nil {
@@ -460,12 +462,12 @@ func (h *Handler) messagesRouted(w http.ResponseWriter, r *http.Request, req *an
 			writeAnthropicChainExhaustedError(w, lastErrorType)
 			return
 		}
-		slog.Error("messages: routed backend error", "err", err, "request_id", RequestID(r.Context()))
+		logRouteFailure("messages", err, RequestID(r.Context()))
 		writeAnthropicError(w, http.StatusBadGateway, "upstream backend failed")
 		return
 	}
 
-	dw := newDeliveryWriter(w, reqDeadline)
+	dw := newDeliveryWriter(w)
 	defer dw.reportDelivery(RequestID(r.Context()), meta.BackendID, t0)
 	w = dw
 
