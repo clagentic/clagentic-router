@@ -355,8 +355,41 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 
 		tried = append(tried, bid)
 		start := time.Now()
-		resp, err := r.adapters[bid].Invoke(ctx, req)
+		// The per-backend timeout is enforced here, once, for every adapter
+		// family (CLI subprocess, bedrock_api, HTTP) instead of in each
+		// adapter: a deadline on the Invoke context kills exec.CommandContext
+		// subprocesses and aborts SDK/HTTP calls alike.
+		invokeCtx, cancelInvoke := context.WithTimeout(ctx, r.backendTimeout(bid))
+		resp, err := r.adapters[bid].Invoke(invokeCtx, req)
+		// backendDeadlineHit is true only when OUR deadline fired while the
+		// caller's context was still live; a parent cancel/deadline (client
+		// gone) is a different fact and must not be charged to the backend.
+		backendDeadlineHit := err != nil && ctx.Err() == nil &&
+			errors.Is(invokeCtx.Err(), context.DeadlineExceeded)
+		cancelInvoke()
 		latencyMS := time.Since(start).Milliseconds()
+
+		if err != nil && ctx.Err() != nil {
+			// Caller went away mid-Invoke. No health penalty, no further tiers:
+			// nobody is left to receive a fallback response.
+			slog.Info("router: request context done during invoke, not penalizing backend",
+				"backend", bid, "chain_pos", i, "ctx_err", ctx.Err(), "latency_ms", latencyMS, "request_id", reqID)
+			if r.store != nil {
+				r.store.LogCall(store.CallLogInput{
+					BackendID:     bid,
+					TierAlias:     entry,
+					ChainPosition: i,
+					Outcome:       "cancelled",
+					LatencyMS:     int(latencyMS),
+					Model:         r.cfg.Backends[bid].Model,
+					Score:         bidScore,
+					RequestID:     reqID,
+					FallbackCount: i,
+					ToolsPresent:  req.HasTools,
+				})
+			}
+			return nil, nil, fmt.Errorf("router: request context done: %w", ctx.Err())
+		}
 
 		if err == nil {
 			// Success
@@ -406,6 +439,13 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 		if errors.As(err, &ie) {
 			errType = state.ErrorType(ie.Type)
 			errRaw = ie.Raw
+		}
+		if backendDeadlineHit {
+			// Adapters classify a deadline kill inconsistently (CLI adapters via
+			// IsContextDeadlineKill, SDK/HTTP adapters as unknown/network);
+			// when our own deadline fired the cause is known, so normalize.
+			errType = state.ErrTypeTimeout
+			errRaw = fmt.Sprintf("backend timeout_seconds exceeded (%s)", r.backendTimeout(bid))
 		}
 
 		change := r.recordFailure(bid, errType, errRaw, backend.ParseResetTime(errRaw), latencyMS)
@@ -474,6 +514,48 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 		return nil, nil, fmt.Errorf("%w: last error: %w", &ChainExhaustedError{Type: lastErrType}, lastErr)
 	}
 	return nil, nil, ErrAllFailed
+}
+
+// deliveryMargin is added to a chain's summed backend timeouts when deriving
+// the HTTP write deadline, covering response serialization and flush.
+const deliveryMargin = 30 * time.Second
+
+// backendTimeout returns the effective per-call timeout for one backend.
+func (r *Router) backendTimeout(bid string) time.Duration {
+	if bc, ok := r.cfg.Backends[bid]; ok && bc != nil {
+		return bc.Timeout()
+	}
+	return (&config.BackendConfig{}).Timeout()
+}
+
+// RequestDeadline returns the longest wall-clock time a routed request over
+// chain can legitimately take: for each chain entry the largest backend
+// timeout among that entry's candidates (any of them may be selected), summed
+// across entries, plus deliveryMargin. The result is capped by
+// proxy.max_request_seconds, which wins when explicitly set below the sum.
+// The HTTP layer uses it as the per-request write deadline.
+func (r *Router) RequestDeadline(chain []string) time.Duration {
+	var total time.Duration
+	for _, entry := range chain {
+		var longest time.Duration
+		for _, bid := range r.resolveChainEntry(entry) {
+			if t := r.backendTimeout(bid); t > longest {
+				longest = t
+			}
+		}
+		total += longest
+	}
+	total += deliveryMargin
+	if limit := r.cfg.Proxy.MaxRequest(); total > limit {
+		return limit
+	}
+	return total
+}
+
+// MaxRequest returns the configured per-request ceiling used as the write
+// deadline for passthrough requests (see config.ProxyConfig.MaxRequest).
+func (r *Router) MaxRequest() time.Duration {
+	return r.cfg.Proxy.MaxRequest()
 }
 
 // ResolveModel parses the model field from a chat completion request into a chain.

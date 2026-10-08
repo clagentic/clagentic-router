@@ -315,6 +315,14 @@ proxy:
   host: 127.0.0.1        # 0.0.0.0 for network access from other hosts
   port: 8765
   token: env:CLAGENTIC_ROUTER_TOKEN
+  # max_request_seconds: 1800
+  # ^ wall-clock ceiling for one LLM request (/v1/chat/completions,
+  #   /v1/messages, /model/{id}/invoke[-with-response-stream]). Routed requests
+  #   get a write deadline of (sum over chain entries of the largest backend
+  #   timeout_seconds in that entry) + 30s, capped by this value; passthrough
+  #   requests have no chain and are bounded by this value alone. Default 1800.
+  #   An explicit value always wins, even below the chain's summed timeouts.
+  #   Non-LLM endpoints (health, admin, metrics) keep a fixed 300s write timeout.
 
 # --- Anthropic Messages API (POST /v1/messages) ---
 # See the "/v1/messages (Anthropic Messages API)" section in

@@ -207,6 +207,8 @@ func (h *Handler) bedrockRouted(w http.ResponseWriter, r *http.Request, modelID 
 		Tools:     toolDefs,
 	}
 
+	routeStart := time.Now()
+	extendWriteDeadline(w, h.router.RequestDeadline(chain), RequestID(r.Context()))
 	resp, meta, err := h.router.Route(r.Context(), routerReq, chain)
 	if err != nil {
 		if err == router.ErrAllFailed || err == router.ErrNoChain {
@@ -217,6 +219,10 @@ func (h *Handler) bedrockRouted(w http.ResponseWriter, r *http.Request, modelID 
 		writeBedrockError(w, http.StatusBadGateway, "upstream backend failed")
 		return
 	}
+
+	dw := &deliveryWriter{ResponseWriter: w}
+	defer dw.reportDelivery(RequestID(r.Context()), meta.BackendID, routeStart)
+	w = dw
 
 	w.Header().Set("X-Router-Mode", "routed")
 	w.Header().Set("X-Router-Backend", meta.BackendID)
@@ -252,9 +258,10 @@ func (h *Handler) bedrockRouted(w http.ResponseWriter, r *http.Request, modelID 
 // --- Passthrough mode ---
 
 // bedrockHTTPClient returns the HTTP client used for upstream Bedrock
-// passthrough calls, mirroring anthropicHTTPClient's long timeout rationale.
-func (h *Handler) bedrockHTTPClient() *http.Client {
-	return &http.Client{Timeout: 10 * time.Minute}
+// passthrough calls, bounded by the same proxy.max_request_seconds as
+// anthropicHTTPClient (see its doc).
+func (h *Handler) bedrockHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{Timeout: timeout}
 }
 
 // bedrockPassthrough forwards the request to the real AWS Bedrock Runtime
@@ -270,6 +277,10 @@ func (h *Handler) bedrockPassthrough(w http.ResponseWriter, r *http.Request, mod
 			"bedrock passthrough is not configured (bedrock.region is unset) — only role:/chain:/backend: model IDs are routable")
 		return
 	}
+
+	// No chain to derive a deadline from: bounded by proxy.max_request_seconds.
+	maxRequest := h.router.MaxRequest()
+	extendWriteDeadline(w, maxRequest, RequestID(r.Context()))
 
 	credsFn := h.bedrockCredentialsFn
 	if credsFn == nil {
@@ -314,7 +325,7 @@ func (h *Handler) bedrockPassthrough(w http.ResponseWriter, r *http.Request, mod
 		return
 	}
 
-	upResp, err := h.bedrockHTTPClient().Do(upReq)
+	upResp, err := h.bedrockHTTPClient(maxRequest).Do(upReq)
 	if err != nil {
 		slog.Error("bedrock invoke: passthrough upstream error", "err", err, "request_id", RequestID(r.Context()))
 		writeBedrockError(w, http.StatusBadGateway, "upstream request failed")

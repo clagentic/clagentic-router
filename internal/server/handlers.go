@@ -362,6 +362,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		Tools:      toolDefs,
 	}
 
+	routeStart := time.Now()
+	extendWriteDeadline(w, h.router.RequestDeadline(chain), RequestID(r.Context()))
 	resp, meta, err := h.router.Route(r.Context(), routerReq, chain)
 	if err != nil {
 		if errors.Is(err, router.ErrAllFailed) || errors.Is(err, router.ErrNoChain) {
@@ -384,6 +386,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "backend_error", "upstream backend failed")
 		return
 	}
+
+	dw := &deliveryWriter{ResponseWriter: w}
+	defer dw.reportDelivery(RequestID(r.Context()), meta.BackendID, routeStart)
+	w = dw
 
 	// Set routing metadata headers (present on both streaming and non-streaming responses).
 	w.Header().Set("X-Router-Backend", meta.BackendID)

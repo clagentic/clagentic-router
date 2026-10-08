@@ -50,7 +50,19 @@ type Server struct {
 // cmd/clagentic-router/main.go), surfaced on /version, /health, and /doctor
 // (lr-92ee18 B1). Passed through rather than read from a package-level var
 // here so this package has no dependency on cmd/clagentic-router.
-func New(addr, token, adminToken string, allowNoAuth bool, r *router.Router, st *store.Store, anthropicUpstreamURL, anthropicUpstreamAPIKey, bedrockRegion, bedrockProfile string, cacheMetricsEnabled bool, cacheMetricsPath string, version string) *Server {
+//
+// The http.Server WriteTimeout (defaultBackstopWriteTimeout) is a backstop
+// for non-LLM endpoints only; LLM handlers replace it per request with
+// Handler.extendWriteDeadline (see deadline.go).
+func New(addr, token, adminToken string, allowNoAuth bool, r *router.Router, st *store.Store, anthropicUpstreamURL, anthropicUpstreamAPIKey, bedrockRegion, bedrockProfile string, cacheMetricsEnabled bool, cacheMetricsPath string, version string, opts ...Option) *Server {
+	var so serverOptions
+	for _, opt := range opts {
+		opt(&so)
+	}
+	backstop := so.backstopWriteTimeout
+	if backstop <= 0 {
+		backstop = defaultBackstopWriteTimeout
+	}
 	h := &Handler{
 		router:                  r,
 		store:                   st,
@@ -129,7 +141,7 @@ func New(addr, token, adminToken string, allowNoAuth bool, r *router.Router, st 
 			Addr:         addr,
 			Handler:      logging(mux),
 			ReadTimeout:  10 * time.Second,
-			WriteTimeout: 300 * time.Second, // long — LLM calls can take minutes
+			WriteTimeout: backstop,
 			IdleTimeout:  120 * time.Second,
 		},
 	}
@@ -266,3 +278,7 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.status = code
 	rw.ResponseWriter.WriteHeader(code)
 }
+
+// Unwrap exposes the underlying ResponseWriter so http.NewResponseController
+// (write deadlines, flushing) reaches the real connection through this wrapper.
+func (rw *responseWriter) Unwrap() http.ResponseWriter { return rw.ResponseWriter }

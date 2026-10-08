@@ -136,6 +136,27 @@ graph LR
     State --> Webhook
 ```
 
+## Timeouts and deadlines
+
+- **Per-backend `timeout_seconds`** (default 180 s) is enforced by `Router.Route`
+  as a context deadline around every `Invoke`, for all adapters (`claude_cli`,
+  `codex_cli`, `codex_subagent`, `gemini_cli`, `bedrock_api`, `anthropic_api`,
+  `openai_api`, `ollama_http`). An expiry is recorded as a `timeout` failure and
+  the chain advances. A client disconnect mid-call is not charged to the backend.
+  Before this, only the three HTTP adapters honored it; a CLI or `bedrock_api`
+  backend with no `timeout_seconds` was unbounded and now gets the 180 s default,
+  so set `timeout_seconds` explicitly on any backend that legitimately runs longer.
+- **Per-request write deadline** on the LLM endpoints (`/v1/chat/completions`,
+  `/v1/messages`, `/model/{id}/invoke[-with-response-stream]`): routed requests get
+  the sum, over chain entries, of the largest backend timeout in each entry, plus
+  30 s, capped by `proxy.max_request_seconds` (default 1800). Passthrough requests
+  are bounded by `proxy.max_request_seconds` alone. The server-wide 300 s
+  `WriteTimeout` remains a backstop for health/admin/metrics endpoints only.
+- If the response write still fails after a successful route (client gone or
+  deadline hit), a `response delivery failed` warning is logged with
+  `request_id`, `backend` and `elapsed_ms`; `call_log` still records the backend
+  outcome.
+
 ## Import graph (no cycles allowed)
 
 ```

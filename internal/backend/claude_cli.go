@@ -593,10 +593,12 @@ type claudeOutput struct {
 // headroom for several such rounds without adopting a policy of "however
 // many turns the model wants." The router already bounds the cost and
 // duration of a runaway loop through mechanisms independent of this flag:
-// BackendConfig.TimeoutSeconds (per-call wall-clock timeout, default 3
-// minutes) caps how long any single Invoke can run regardless of how many
-// turns it consumes, and the wire request body itself is bounded by
-// MaxBytesReader at the HTTP boundary. So the marginal risk of raising this
+// Router.Route wraps every Invoke in a context deadline of
+// BackendConfig.Timeout() (TimeoutSeconds, default 3 minutes), which kills
+// this adapter's subprocess via exec.CommandContext, so no single Invoke runs
+// longer than that regardless of how many turns it consumes — the adapter
+// itself enforces nothing, the bound lives in Route. The wire request body is
+// separately bounded by MaxBytesReader at the HTTP boundary. So the marginal risk of raising this
 // ceiling is more API calls billed per invocation (bounded by the timeout
 // long before it becomes "unbounded"), not an unbounded loop — a materially
 // different, and much smaller, risk than the ceiling's absence implied.
