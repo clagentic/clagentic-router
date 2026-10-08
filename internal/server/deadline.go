@@ -16,19 +16,21 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/clagentic/clagentic-router/internal/router"
 )
 
 // defaultBackstopWriteTimeout bounds every endpoint that does not set its own
 // deadline (health, admin, metrics, version).
 const defaultBackstopWriteTimeout = 300 * time.Second
 
-// extendWriteDeadline moves this request's connection write deadline to
-// now+d. The deadline is absolute from now, so an actively-flowing stream is
-// cut only when d elapses, never by the 300 s backstop. A ResponseWriter that
-// cannot set deadlines (e.g. httptest.ResponseRecorder) is left as-is: there
-// is no deadline to extend.
-func extendWriteDeadline(w http.ResponseWriter, d time.Duration, requestID string) {
-	err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(d))
+// setWriteDeadline moves this request's connection write deadline to the
+// absolute instant at. An actively-flowing stream is therefore cut only when
+// at passes, never by the 300 s backstop. A ResponseWriter that cannot set
+// deadlines (e.g. httptest.ResponseRecorder) is left as-is: there is no
+// deadline to extend.
+func setWriteDeadline(w http.ResponseWriter, at time.Time, requestID string) {
+	err := http.NewResponseController(w).SetWriteDeadline(at)
 	if err != nil && !isNotSupported(err) {
 		slog.Warn("server: could not set per-request write deadline", "err", err, "request_id", requestID)
 	}
@@ -38,17 +40,54 @@ func isNotSupported(err error) bool {
 	return errors.Is(err, http.ErrNotSupported)
 }
 
+// routedDeadlines derives both deadlines of a routed request from one instant:
+// the write deadline is start+d, and Route must finish a delivery margin
+// earlier so a Route that succeeds always has time to write its response.
+// When d is not larger than the margin the margin cannot be reserved in full;
+// the Route deadline is then clamped to the midpoint of the request so it is
+// never at or before start (an immediately-expired Route) nor at the write
+// deadline.
+func routedDeadlines(start time.Time, d time.Duration) (route, write time.Time) {
+	write = start.Add(d)
+	if d > router.DeliveryMargin {
+		return write.Add(-router.DeliveryMargin), write
+	}
+	return start.Add(d / 2), write
+}
+
 // beginRoutedRequest arms the per-request write deadline and returns a context
-// for Router.Route that expires at the same instant, so work stops when
-// delivery becomes impossible instead of finishing a response that is thrown
-// away. The returned deadline is the shared instant; callers pass it to
+// for Router.Route that expires a delivery margin before it, so work stops
+// while a response can still be written instead of finishing one that is
+// thrown away. The returned deadline is the write deadline; callers pass it to
 // newDeliveryWriter so a late write failure is attributed correctly. The
 // caller must call cancel.
 func beginRoutedRequest(w http.ResponseWriter, r *http.Request, d time.Duration) (ctx context.Context, cancel context.CancelFunc, deadline time.Time) {
-	extendWriteDeadline(w, d, RequestID(r.Context()))
-	deadline = time.Now().Add(d)
-	ctx, cancel = context.WithDeadline(r.Context(), deadline)
-	return ctx, cancel, deadline
+	return beginRoutedRequestAt(w, r, time.Now(), d)
+}
+
+// beginRoutedRequestAt is beginRoutedRequest with the handler-entry instant
+// supplied, so every deadline derives from that one reading of the clock.
+func beginRoutedRequestAt(w http.ResponseWriter, r *http.Request, start time.Time, d time.Duration) (ctx context.Context, cancel context.CancelFunc, deadline time.Time) {
+	route, write := routedDeadlines(start, d)
+	setWriteDeadline(w, write, RequestID(r.Context()))
+	ctx, cancel = context.WithDeadline(r.Context(), route)
+	return ctx, cancel, write
+}
+
+// beginPassthroughRequest bounds a passthrough request by d measured from
+// handler entry. The write deadline and the returned context share that one
+// instant, so pre-Do work (credential resolution, signing) and the upstream
+// call are bounded together and the upstream cannot outlive the write
+// deadline. Use the returned context for everything upstream. The caller must
+// call cancel.
+func beginPassthroughRequest(w http.ResponseWriter, r *http.Request, d time.Duration) (ctx context.Context, cancel context.CancelFunc) {
+	return beginPassthroughRequestAt(w, r, time.Now(), d)
+}
+
+func beginPassthroughRequestAt(w http.ResponseWriter, r *http.Request, start time.Time, d time.Duration) (context.Context, context.CancelFunc) {
+	deadline := start.Add(d)
+	setWriteDeadline(w, deadline, RequestID(r.Context()))
+	return context.WithDeadline(r.Context(), deadline)
 }
 
 // deliveryWriter records the first error returned while writing the response

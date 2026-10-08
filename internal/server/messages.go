@@ -314,11 +314,12 @@ func (h *Handler) messages(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) messagesPassthrough(w http.ResponseWriter, r *http.Request, rawBody []byte) {
 	upstreamURL := h.anthropicUpstreamURL + "/v1/messages"
 
-	// No chain to derive a deadline from: bounded by proxy.max_request_seconds.
-	maxRequest := h.router.MaxRequest()
-	extendWriteDeadline(w, maxRequest, RequestID(r.Context()))
+	// No chain to derive a deadline from: bounded by proxy.max_request_seconds
+	// from handler entry (see beginPassthroughRequest).
+	ctx, cancel := beginPassthroughRequest(w, r, h.router.MaxRequest())
+	defer cancel()
 
-	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(rawBody))
+	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(rawBody))
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, fmt.Sprintf("build upstream request: %v", err))
 		return
@@ -355,7 +356,7 @@ func (h *Handler) messagesPassthrough(w http.ResponseWriter, r *http.Request, ra
 		}
 	}
 
-	upResp, err := h.anthropicHTTPClient(maxRequest).Do(upReq)
+	upResp, err := http.DefaultClient.Do(upReq)
 	if err != nil {
 		slog.Error("messages: passthrough upstream error", "err", err, "request_id", RequestID(r.Context()))
 		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed")
@@ -393,14 +394,6 @@ func (h *Handler) messagesPassthrough(w http.ResponseWriter, r *http.Request, ra
 			return
 		}
 	}
-}
-
-// anthropicHTTPClient returns the HTTP client used for upstream passthrough
-// calls. Passthrough has no per-backend timeout configuration, so the bound is
-// the same proxy.max_request_seconds that bounds the client-facing write
-// deadline — the two must agree or the smaller one silently wins.
-func (h *Handler) anthropicHTTPClient(timeout time.Duration) *http.Client {
-	return &http.Client{Timeout: timeout}
 }
 
 // --- Routed mode ---

@@ -53,7 +53,7 @@ type Server struct {
 //
 // The http.Server WriteTimeout (defaultBackstopWriteTimeout) is a backstop
 // for non-LLM endpoints only; LLM handlers replace it per request with
-// Handler.extendWriteDeadline (see deadline.go).
+// setWriteDeadline (see deadline.go).
 func New(addr, token, adminToken string, allowNoAuth bool, r *router.Router, st *store.Store, anthropicUpstreamURL, anthropicUpstreamAPIKey, bedrockRegion, bedrockProfile string, cacheMetricsEnabled bool, cacheMetricsPath string, version string) *Server {
 	h := &Handler{
 		router:                  r,

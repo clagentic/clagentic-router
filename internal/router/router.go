@@ -529,6 +529,11 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 // the HTTP write deadline, covering response serialization and flush.
 const deliveryMargin = 30 * time.Second
 
+// DeliveryMargin is deliveryMargin for the HTTP layer, which reserves the same
+// span at the end of a routed request so a Route that succeeds still has time
+// to write its response.
+const DeliveryMargin = deliveryMargin
+
 // backendTimeout returns the effective per-call timeout for one backend.
 func (r *Router) backendTimeout(bid string) time.Duration {
 	if bc, ok := r.cfg.Backends[bid]; ok && bc != nil {

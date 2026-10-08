@@ -259,13 +259,6 @@ func (h *Handler) bedrockRouted(w http.ResponseWriter, r *http.Request, modelID 
 
 // --- Passthrough mode ---
 
-// bedrockHTTPClient returns the HTTP client used for upstream Bedrock
-// passthrough calls, bounded by the same proxy.max_request_seconds as
-// anthropicHTTPClient (see its doc).
-func (h *Handler) bedrockHTTPClient(timeout time.Duration) *http.Client {
-	return &http.Client{Timeout: timeout}
-}
-
 // bedrockPassthrough forwards the request to the real AWS Bedrock Runtime
 // endpoint for the configured region, SigV4-signing it with credentials from
 // the standard AWS SDK credential chain (same chain backend.NewBedrockAPIAdapter
@@ -280,15 +273,17 @@ func (h *Handler) bedrockPassthrough(w http.ResponseWriter, r *http.Request, mod
 		return
 	}
 
-	// No chain to derive a deadline from: bounded by proxy.max_request_seconds.
-	maxRequest := h.router.MaxRequest()
-	extendWriteDeadline(w, maxRequest, RequestID(r.Context()))
+	// No chain to derive a deadline from: bounded by proxy.max_request_seconds
+	// from handler entry, covering credential resolution, signing and the
+	// upstream call alike (see beginPassthroughRequest).
+	ctx, cancel := beginPassthroughRequest(w, r, h.router.MaxRequest())
+	defer cancel()
 
 	credsFn := h.bedrockCredentialsFn
 	if credsFn == nil {
 		credsFn = h.resolveBedrockCredentials
 	}
-	creds, err := credsFn(r.Context())
+	creds, err := credsFn(ctx)
 	if err != nil {
 		slog.Error("bedrock invoke: credential resolution failed", "err", err, "request_id", RequestID(r.Context()))
 		writeBedrockError(w, http.StatusBadGateway, "failed to resolve AWS credentials for passthrough")
@@ -305,7 +300,7 @@ func (h *Handler) bedrockPassthrough(w http.ResponseWriter, r *http.Request, mod
 	}
 	upstreamURL := fmt.Sprintf("%s/model/%s/%s", base, modelID, action)
 
-	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(rawBody))
+	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(rawBody))
 	if err != nil {
 		writeBedrockError(w, http.StatusBadGateway, fmt.Sprintf("build upstream request: %v", err))
 		return
@@ -321,13 +316,13 @@ func (h *Handler) bedrockPassthrough(w http.ResponseWriter, r *http.Request, mod
 	sum := sha256.Sum256(rawBody)
 	payloadHash := hex.EncodeToString(sum[:])
 	signer := v4.NewSigner()
-	if err := signer.SignHTTP(r.Context(), creds, upReq, payloadHash, "bedrock", h.bedrockRegion, time.Now()); err != nil {
+	if err := signer.SignHTTP(ctx, creds, upReq, payloadHash, "bedrock", h.bedrockRegion, time.Now()); err != nil {
 		slog.Error("bedrock invoke: SigV4 signing failed", "err", err, "request_id", RequestID(r.Context()))
 		writeBedrockError(w, http.StatusBadGateway, "failed to sign upstream request")
 		return
 	}
 
-	upResp, err := h.bedrockHTTPClient(maxRequest).Do(upReq)
+	upResp, err := http.DefaultClient.Do(upReq)
 	if err != nil {
 		slog.Error("bedrock invoke: passthrough upstream error", "err", err, "request_id", RequestID(r.Context()))
 		writeBedrockError(w, http.StatusBadGateway, "upstream request failed")

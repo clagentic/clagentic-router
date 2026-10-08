@@ -150,8 +150,10 @@ func TestRoutedHandler_ExplicitMaxRequestWins(t *testing.T) {
 			t.Fatal("expected the 1s max_request_seconds deadline to prevent a 200 from a 1.5s backend")
 		}
 		elapsed := time.Since(start)
-		if elapsed < 900*time.Millisecond || elapsed >= delay {
-			t.Fatalf("stopped after %s, want about the 1s request deadline and before the backend's %s", elapsed, delay)
+		// A 1s bound is below the delivery margin, so Route is clamped to the
+		// midpoint (500ms) of the 1s write deadline.
+		if elapsed < 450*time.Millisecond || elapsed >= delay {
+			t.Fatalf("stopped after %s, want about the clamped 500ms Route deadline and before the backend's %s", elapsed, delay)
 		}
 	})
 
