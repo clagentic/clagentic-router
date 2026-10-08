@@ -129,10 +129,11 @@ func TestRoutedHandlers_OutliveBackstopWithinChainDeadline(t *testing.T) {
 }
 
 // An explicit proxy.max_request_seconds below the handler's runtime wins: the
-// per-request deadline is real, not just a removal of the backstop. The
-// chain-derived deadline would be ~10s, so only the explicit 1s bound can cut a
-// 1.5s response; a response inside 1s but past the backstop must still arrive,
-// which a leaked backstop would break.
+// per-request deadline is real, not just a removal of the backstop, and it
+// bounds the routed work as well as the write. The chain-derived deadline would
+// be ~10s, so only the explicit 1s bound can stop a 1.5s backend; a response
+// inside 1s but past the backstop must still arrive, which a leaked backstop
+// would break.
 func TestRoutedHandler_ExplicitMaxRequestWins(t *testing.T) {
 	const body = `{"model":"role:slow-chain","messages":[{"role":"user","content":"hi"}]}`
 
@@ -140,12 +141,17 @@ func TestRoutedHandler_ExplicitMaxRequestWins(t *testing.T) {
 		delay := 1500 * time.Millisecond
 		ts, _ := newDeadlineServer(t, delay, 1, "http://unused.invalid")
 		start := time.Now()
-		_, _, err := post(t, ts.URL+"/v1/chat/completions", body, bearer)
-		if err == nil {
-			t.Fatal("expected the 1s max_request_seconds deadline to cut a 1.5s response")
+		resp, _, err := post(t, ts.URL+"/v1/chat/completions", body, bearer)
+		// The request deadline also bounds Route, so the work stops at the
+		// bound instead of finishing a response nobody can receive. The client
+		// sees either a dead connection or an error status, never the
+		// backend's completion.
+		if err == nil && resp.StatusCode == http.StatusOK {
+			t.Fatal("expected the 1s max_request_seconds deadline to prevent a 200 from a 1.5s backend")
 		}
-		if elapsed := time.Since(start); elapsed < delay {
-			t.Fatalf("cut after %s, before the handler finished at %s: not the per-request write deadline", elapsed, delay)
+		elapsed := time.Since(start)
+		if elapsed < 900*time.Millisecond || elapsed >= delay {
+			t.Fatalf("stopped after %s, want about the 1s request deadline and before the backend's %s", elapsed, delay)
 		}
 	})
 

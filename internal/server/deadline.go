@@ -11,6 +11,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -37,11 +38,31 @@ func isNotSupported(err error) bool {
 	return errors.Is(err, http.ErrNotSupported)
 }
 
+// beginRoutedRequest arms the per-request write deadline and returns a context
+// for Router.Route that expires at the same instant, so work stops when
+// delivery becomes impossible instead of finishing a response that is thrown
+// away. The returned deadline is the shared instant; callers pass it to
+// newDeliveryWriter so a late write failure is attributed correctly. The
+// caller must call cancel.
+func beginRoutedRequest(w http.ResponseWriter, r *http.Request, d time.Duration) (ctx context.Context, cancel context.CancelFunc, deadline time.Time) {
+	extendWriteDeadline(w, d, RequestID(r.Context()))
+	deadline = time.Now().Add(d)
+	ctx, cancel = context.WithDeadline(r.Context(), deadline)
+	return ctx, cancel, deadline
+}
+
 // deliveryWriter records the first error returned while writing the response
 // so a handler can report a failed delivery after a successful Route.
 type deliveryWriter struct {
 	http.ResponseWriter
 	err error
+	// deadline is the request deadline shared with the write deadline; zero
+	// means unknown.
+	deadline time.Time
+}
+
+func newDeliveryWriter(w http.ResponseWriter, deadline time.Time) *deliveryWriter {
+	return &deliveryWriter{ResponseWriter: w, deadline: deadline}
 }
 
 func (d *deliveryWriter) Write(p []byte) (int, error) {
@@ -70,8 +91,15 @@ func (d *deliveryWriter) Unwrap() http.ResponseWriter { return d.ResponseWriter 
 func (d *deliveryWriter) reportDelivery(requestID, backendID string, start time.Time) {
 	d.Flush()
 	if d.err != nil {
+		// A failure at or past the request deadline is the router's own
+		// per-request bound firing (max_request_seconds below the work done),
+		// not a client disconnect or network fault.
+		cause := "write_failed"
+		if !d.deadline.IsZero() && !time.Now().Before(d.deadline) {
+			cause = "request_deadline"
+		}
 		slog.Warn("server: response delivery failed after successful route",
-			"err", d.err, "request_id", requestID, "backend", backendID,
+			"err", d.err, "cause", cause, "request_id", requestID, "backend", backendID,
 			"elapsed_ms", time.Since(start).Milliseconds())
 	}
 }

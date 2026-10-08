@@ -476,8 +476,9 @@ func (h *Handler) messagesRouted(w http.ResponseWriter, r *http.Request, req *an
 	}
 
 	routeStart := time.Now()
-	extendWriteDeadline(w, h.router.RequestDeadline(chain), RequestID(r.Context()))
-	resp, meta, err := h.router.Route(r.Context(), routerReq, chain)
+	routeCtx, cancelRoute, reqDeadline := beginRoutedRequest(w, r, h.router.RequestDeadline(chain))
+	defer cancelRoute()
+	resp, meta, err := h.router.Route(routeCtx, routerReq, chain)
 	if err != nil {
 		if errors.Is(err, router.ErrAllFailed) || errors.Is(err, router.ErrNoChain) {
 			// Log the raw error server-side only; lastErrorType (if present)
@@ -496,7 +497,7 @@ func (h *Handler) messagesRouted(w http.ResponseWriter, r *http.Request, req *an
 		return
 	}
 
-	dw := &deliveryWriter{ResponseWriter: w}
+	dw := newDeliveryWriter(w, reqDeadline)
 	defer dw.reportDelivery(RequestID(r.Context()), meta.BackendID, routeStart)
 	w = dw
 

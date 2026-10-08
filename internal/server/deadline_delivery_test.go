@@ -76,6 +76,29 @@ func TestDeliveryWriter_ReportDeliveryWarnsOnFailure(t *testing.T) {
 	}
 }
 
+func TestDeliveryWriter_WarnAttributesRequestDeadline(t *testing.T) {
+	cases := []struct {
+		name     string
+		deadline time.Time
+		want     string
+	}{
+		{"past deadline", time.Now().Add(-time.Second), "cause=request_deadline"},
+		{"deadline not reached", time.Now().Add(time.Hour), "cause=write_failed"},
+		{"unknown deadline", time.Time{}, "cause=write_failed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := captureWarnLog(t)
+			dw := newDeliveryWriter(&failingWriter{}, tc.deadline)
+			_, _ = dw.Write([]byte("x"))
+			dw.reportDelivery("req-1", "b", time.Now())
+			if !strings.Contains(buf.String(), tc.want) {
+				t.Errorf("warn log missing %q:\n%s", tc.want, buf.String())
+			}
+		})
+	}
+}
+
 func TestDeliveryWriter_ReportDeliverySilentOnSuccess(t *testing.T) {
 	buf := captureWarnLog(t)
 	rec := &okWriter{}

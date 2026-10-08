@@ -370,16 +370,23 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 		latencyMS := time.Since(start).Milliseconds()
 
 		if err != nil && ctx.Err() != nil {
-			// Caller went away mid-Invoke. No health penalty, no further tiers:
-			// nobody is left to receive a fallback response.
+			// Caller went away, or the request deadline the server derived
+			// from the write deadline expired, mid-Invoke. Neither is a backend
+			// fault: no health penalty, no further tiers, since delivery is
+			// impossible either way. The deadline case gets its own outcome so
+			// it is distinguishable from a client disconnect.
+			outcome := "cancelled"
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				outcome = "request_deadline"
+			}
 			slog.Info("router: request context done during invoke, not penalizing backend",
-				"backend", bid, "chain_pos", i, "ctx_err", ctx.Err(), "latency_ms", latencyMS, "request_id", reqID)
+				"backend", bid, "chain_pos", i, "ctx_err", ctx.Err(), "outcome", outcome, "latency_ms", latencyMS, "request_id", reqID)
 			if r.store != nil {
 				r.store.LogCall(store.CallLogInput{
 					BackendID:     bid,
 					TierAlias:     entry,
 					ChainPosition: i,
-					Outcome:       "cancelled",
+					Outcome:       outcome,
 					LatencyMS:     int(latencyMS),
 					Model:         r.cfg.Backends[bid].Model,
 					Score:         bidScore,

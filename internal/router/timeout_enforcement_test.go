@@ -12,6 +12,7 @@ import (
 	"github.com/clagentic/clagentic-router/internal/backend"
 	"github.com/clagentic/clagentic-router/internal/config"
 	"github.com/clagentic/clagentic-router/internal/state"
+	"github.com/clagentic/clagentic-router/internal/store"
 )
 
 // newMultiRouter builds a Router over several mock adapters. timeouts maps
@@ -96,6 +97,42 @@ func TestRoute_ClientCancel_NoBackendPenalty(t *testing.T) {
 	}
 	if fast := r.states["fast"].Snapshot(); fast.TotalCalls != 0 {
 		t.Errorf("chain advanced after client cancel: fast.TotalCalls=%d", fast.TotalCalls)
+	}
+}
+
+// A request deadline below the backend's own timeout (explicit
+// max_request_seconds under the chain sum) must stop Invoke at the request
+// deadline, charge nothing to the backend, and log a non-pass outcome.
+func TestRoute_RequestDeadline_NoBackendPenalty_LoggedNotPass(t *testing.T) {
+	var observedAt time.Duration
+	var begin time.Time
+	r, st := newStoreBackedTestRouter(t, "slow", func(ctx context.Context, req *backend.Request) (*backend.Response, error) {
+		<-ctx.Done()
+		observedAt = time.Since(begin)
+		return nil, ctx.Err()
+	})
+	r.cfg.Backends["slow"].TimeoutSeconds = 30
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	begin = time.Now()
+	_, _, err := r.Route(ctx, testReq(), []string{"slow"})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want error wrapping context.DeadlineExceeded, got %v", err)
+	}
+	if observedAt < 80*time.Millisecond || observedAt > 5*time.Second {
+		t.Errorf("adapter saw cancellation at %s, want about the 100ms request deadline", observedAt)
+	}
+	snap := r.states["slow"].Snapshot()
+	if snap.ConsecutiveFailures != 0 || snap.LastErrorType != "" {
+		t.Errorf("request deadline penalized backend: failures=%d last_error_type=%q", snap.ConsecutiveFailures, snap.LastErrorType)
+	}
+	rows, err := st.RecentCalls(store.CallLogFilter{Limit: 10})
+	if err != nil {
+		t.Fatalf("RecentCalls: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Outcome != "request_deadline" {
+		t.Fatalf("want one request_deadline row, got %+v", rows)
 	}
 }
 
