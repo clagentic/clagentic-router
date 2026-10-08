@@ -97,6 +97,13 @@
 // reproduce the zero-exit trigger condition; the parser does not assume
 // exit code and event outcome are correlated.
 //
+// Multi-message turns: codex emits one agent_message item per assistant
+// message, not one per turn, so a turn with tool use or reasoning can carry
+// intermediate commentary before the final answer. Response.Content is the
+// last non-empty agent_message only (see parseCodexJSONL). Capture 1 above is
+// the single-message case; the multi-message test fixture reuses the same
+// event shapes with several agent_message items.
+//
 // Whether the 2026-08-20 codex-sol production failures (lr-c1d353 artifact,
 // host ZCL3L6QW64) took the nonzero-exit path PR #60 already fixed, or a
 // zero-exit path only this change fixes, is STILL UNRESOLVED by this
@@ -507,7 +514,13 @@ func codexClassificationText(stdout []byte, stderrStr string) string {
 // terminal event and returns either a failure (in-band error/turn.failed —
 // see package doc for why this is checked unconditionally, not only on the
 // nonzero-exit path) or a successful Response carrying the agent_message
-// text and cache/token usage from turn.completed (lr-718af0). stderrLen is
+// text and cache/token usage from turn.completed (lr-718af0).
+//
+// Content is the text of the LAST non-empty agent_message only. codex emits
+// one item.completed/agent_message per assistant message in the turn, so a
+// turn that reads files or reasons before answering emits intermediate
+// commentary messages first; concatenating them would prepend narration to
+// the answer. Single-message turns are unaffected. stderrLen is
 // the byte length of the subprocess's stderr buffer at the call site —
 // passed through rather than re-derived here so the zero-exit in-band
 // failure log line below reports the same stderr_len field the nonzero-exit
@@ -533,8 +546,8 @@ func parseCodexJSONL(ctx context.Context, stdout []byte, stderrLen int, req *Req
 	}
 
 	var (
-		content strings.Builder
-		usage   *codexUsage
+		lastMessage string
+		usage       *codexUsage
 	)
 
 	scanner := bufio.NewScanner(bytes.NewReader(stdout))
@@ -549,18 +562,18 @@ func parseCodexJSONL(ctx context.Context, stdout []byte, stderrLen int, req *Req
 		}
 		switch ev.Type {
 		case "item.completed":
-			if ev.Item != nil && ev.Item.Type == "agent_message" && ev.Item.Text != "" {
-				if content.Len() > 0 {
-					content.WriteString("\n")
-				}
-				content.WriteString(ev.Item.Text)
+			if ev.Item != nil && ev.Item.Type == "agent_message" && strings.TrimSpace(ev.Item.Text) != "" {
+				// Overwrite, never accumulate: codex emits one agent_message
+				// per assistant message, so earlier ones are intermediate
+				// commentary, not part of the answer.
+				lastMessage = ev.Item.Text
 			}
 		case "turn.completed":
 			usage = ev.Usage
 		}
 	}
 
-	text := strings.TrimSpace(content.String())
+	text := strings.TrimSpace(lastMessage)
 	if text == "" {
 		// No agent_message content and no in-band error event either — fall
 		// back to raw stdout as plain text (pre-existing behavior for
