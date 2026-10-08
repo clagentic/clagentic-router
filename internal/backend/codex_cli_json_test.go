@@ -199,3 +199,73 @@ func TestCodexCLI_Invoke_TopLevelErrorEventIsAuthoritative(t *testing.T) {
 		t.Errorf("Content = %q, want %q", resp.Content, "final answer")
 	}
 }
+
+// codexMultiMessageJSONL reuses the live-captured event shapes (capture 1 in
+// codex_cli.go's package doc) with an intermediate commentary agent_message
+// before the final one. Synthetic: not a verbatim live capture, no new event
+// types or fields.
+const codexMultiMessageJSONL = `{"type":"thread.started","thread_id":"test"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I'm reading the staged diff before reporting."}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"{\"summary\":\"none\",\"findings\":[]}"}}
+{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0}}`
+
+// A turn with several agent_message items must yield only the last one.
+func TestCodexCLI_Invoke_MultiMessageReturnsLastOnly(t *testing.T) {
+	dir := t.TempDir()
+	bin := writeFakeCodexBinJSONL(t, dir, codexMultiMessageJSONL, 0)
+
+	adapter := NewCodexCLIAdapter("test", "", "", "", "", bin)
+	req := &Request{Messages: []Message{{Role: "user", Content: "ping"}}}
+
+	resp, err := adapter.Invoke(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	want := `{"summary":"none","findings":[]}`
+	if resp.Content != want {
+		t.Errorf("Content = %q, want only the final message %q", resp.Content, want)
+	}
+	if resp.CacheUsage == nil || resp.CacheUsage.InputTokens != 10 {
+		t.Errorf("CacheUsage = %+v, want usage from turn.completed", resp.CacheUsage)
+	}
+}
+
+// A trailing empty agent_message must not displace the last non-empty one.
+func TestCodexCLI_Invoke_TrailingEmptyMessageKeepsLastNonEmpty(t *testing.T) {
+	dir := t.TempDir()
+	stream := `{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"narration"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"answer"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":""}}
+{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}`
+	bin := writeFakeCodexBinJSONL(t, dir, stream, 0)
+
+	adapter := NewCodexCLIAdapter("test", "", "", "", "", bin)
+	req := &Request{Messages: []Message{{Role: "user", Content: "ping"}}}
+
+	resp, err := adapter.Invoke(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if resp.Content != "answer" {
+		t.Errorf("Content = %q, want %q", resp.Content, "answer")
+	}
+}
+
+// No agent_message at all: raw-stdout fallback is unchanged.
+func TestCodexCLI_Invoke_NoAgentMessageFallsBackToRawStdout(t *testing.T) {
+	dir := t.TempDir()
+	bin := writeFakeCodexBinJSONL(t, dir, "plain text output", 0)
+
+	adapter := NewCodexCLIAdapter("test", "", "", "", "", bin)
+	req := &Request{Messages: []Message{{Role: "user", Content: "ping"}}}
+
+	resp, err := adapter.Invoke(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if resp.Content != "plain text output" {
+		t.Errorf("Content = %q, want raw stdout fallback", resp.Content)
+	}
+}
