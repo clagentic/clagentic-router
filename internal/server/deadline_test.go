@@ -129,15 +129,41 @@ func TestRoutedHandlers_OutliveBackstopWithinChainDeadline(t *testing.T) {
 }
 
 // An explicit proxy.max_request_seconds below the handler's runtime wins: the
-// per-request deadline is real, not just a removal of the backstop.
+// per-request deadline is real, not just a removal of the backstop. The
+// chain-derived deadline would be ~10s, so only the explicit 1s bound can cut a
+// 1.5s response; a response inside 1s but past the backstop must still arrive,
+// which a leaked backstop would break.
 func TestRoutedHandler_ExplicitMaxRequestWins(t *testing.T) {
-	ts, _ := newDeadlineServer(t, 1500*time.Millisecond, 1, "http://unused.invalid")
+	const body = `{"model":"role:slow-chain","messages":[{"role":"user","content":"hi"}]}`
 
-	_, _, err := post(t, ts.URL+"/v1/chat/completions",
-		`{"model":"role:slow-chain","messages":[{"role":"user","content":"hi"}]}`, bearer)
-	if err == nil {
-		t.Fatal("expected the 1s max_request_seconds deadline to cut a 1.5s response")
-	}
+	t.Run("cut_after_bound", func(t *testing.T) {
+		delay := 1500 * time.Millisecond
+		ts, _ := newDeadlineServer(t, delay, 1, "http://unused.invalid")
+		start := time.Now()
+		_, _, err := post(t, ts.URL+"/v1/chat/completions", body, bearer)
+		if err == nil {
+			t.Fatal("expected the 1s max_request_seconds deadline to cut a 1.5s response")
+		}
+		if elapsed := time.Since(start); elapsed < delay {
+			t.Fatalf("cut after %s, before the handler finished at %s: not the per-request write deadline", elapsed, delay)
+		}
+	})
+
+	t.Run("delivered_within_bound_past_backstop", func(t *testing.T) {
+		delay := 3 * testBackstop
+		ts, _ := newDeadlineServer(t, delay, 1, "http://unused.invalid")
+		start := time.Now()
+		resp, b, err := post(t, ts.URL+"/v1/chat/completions", body, bearer)
+		if err != nil {
+			t.Fatalf("response within the 1s bound was cut (backstop leaked): %v", err)
+		}
+		if resp.StatusCode != http.StatusOK || !bytes.Contains(b, []byte("slow-ok")) {
+			t.Fatalf("status %d body %s", resp.StatusCode, b)
+		}
+		if elapsed := time.Since(start); elapsed <= testBackstop || elapsed >= time.Second {
+			t.Fatalf("elapsed %s, want between backstop %s and 1s bound", elapsed, testBackstop)
+		}
+	})
 }
 
 // slowStreamUpstream emits n SSE-ish chunks, one every gap, flushing each.
