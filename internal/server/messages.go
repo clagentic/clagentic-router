@@ -319,6 +319,7 @@ func (h *Handler) messagesPassthrough(w http.ResponseWriter, r *http.Request, ra
 	t0 := time.Now()
 	pt := beginPassthroughRequestAt(w, r, t0, h.router.MaxRequest())
 	defer pt.Close()
+	pt.beforeCommit = h.beforePassthroughCommit
 
 	upReq, err := http.NewRequestWithContext(pt.Context(), http.MethodPost, upstreamURL, bytes.NewReader(rawBody))
 	if err != nil {
@@ -369,7 +370,9 @@ func (h *Handler) messagesPassthrough(w http.ResponseWriter, r *http.Request, ra
 	// relay mirrors upstream headers (content-type, anthropic-*, rate-limit
 	// headers) so a client inspecting response headers sees the same thing it
 	// would from api.anthropic.com directly, then streams the body.
-	pt.relay(w, upResp, RequestID(r.Context()), "messages")
+	pt.relay(w, upResp, RequestID(r.Context()), "messages", func(status int, msg string) {
+		writeAnthropicError(w, status, msg)
+	})
 }
 
 // --- Routed mode ---

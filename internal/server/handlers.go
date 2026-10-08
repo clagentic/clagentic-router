@@ -78,6 +78,11 @@ type Handler struct {
 	// request-building/signing is verifiable without live AWS credentials,
 	// IMDS access, or network calls.
 	bedrockCredentialsFn func(ctx context.Context) (aws.Credentials, error)
+
+	// beforePassthroughCommit is a test seam, nil in production: it runs after
+	// the upstream call returns and before the passthrough response is
+	// committed, so a test can make the work deadline fire in that window.
+	beforePassthroughCommit func(*passthroughRequest)
 }
 
 // --- OpenAI-compatible types ---

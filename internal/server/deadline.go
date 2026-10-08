@@ -105,6 +105,10 @@ type passthroughRequest struct {
 	cancel context.CancelCauseFunc
 	write  time.Time
 	timer  *time.Timer
+
+	// beforeCommit is a test seam run between the upstream call returning and
+	// commit, the window in which C can fire.
+	beforeCommit func(*passthroughRequest)
 }
 
 // beginPassthroughRequestAt arms the write deadline W and returns the
@@ -137,17 +141,38 @@ func (p *passthroughRequest) Close() {
 }
 
 // commit moves the cancel from C to W; call it once the upstream response
-// headers are in hand and the status line is about to be written.
-func (p *passthroughRequest) commit() {
-	p.timer.Stop()
+// headers are in hand and the status line is about to be written. It reports
+// false when C already fired (the timer could not be stopped, or the context
+// carries ErrWorkDeadline): the response is then not committed and the caller
+// must write the error response instead, because the context is cancelled and
+// a relayed body would be cut right after its status line.
+func (p *passthroughRequest) commit() bool {
+	stopped := p.timer.Stop()
+	if !stopped || errors.Is(context.Cause(p.ctx), router.ErrWorkDeadline) {
+		return false
+	}
 	p.timer = time.AfterFunc(time.Until(p.write), func() { p.cancel(router.ErrWriteDeadline) })
+	return true
 }
 
 // relay writes the upstream status line and headers, then copies the body
 // until EOF, a write failure, or W. Shared by every passthrough handler so the
 // phase transition lives in one place. label names the endpoint in logs.
-func (p *passthroughRequest) relay(w http.ResponseWriter, up *http.Response, requestID, label string) {
-	p.commit()
+//
+// If the work deadline C fired between the upstream call returning and the
+// commit, nothing is relayed: the upstream body is closed and fail writes the
+// handler's error response, exactly as for a stalled upstream call.
+func (p *passthroughRequest) relay(w http.ResponseWriter, up *http.Response, requestID, label string, fail func(status int, msg string)) {
+	if p.beforeCommit != nil {
+		p.beforeCommit(p)
+	}
+	if !p.commit() {
+		up.Body.Close()
+		slog.Error(label+": work deadline fired before the response was committed",
+			"cause", p.Cause(), "request_id", requestID)
+		fail(http.StatusBadGateway, "upstream request failed")
+		return
+	}
 	for k, vals := range up.Header {
 		for _, v := range vals {
 			w.Header().Add(k, v)

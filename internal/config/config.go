@@ -235,10 +235,14 @@ type CapacityPollingConfig struct {
 	TotalVRAMBytes int64 `yaml:"total_vram_bytes"`
 }
 
-// Timeout returns the call timeout, defaulting to 3 minutes.
+// DefaultBackendTimeout is the per-call timeout applied when a backend sets no
+// timeout_seconds.
+const DefaultBackendTimeout = 3 * time.Minute
+
+// Timeout returns the call timeout, defaulting to DefaultBackendTimeout.
 func (b *BackendConfig) Timeout() time.Duration {
 	if b.TimeoutSeconds <= 0 {
-		return 3 * time.Minute
+		return DefaultBackendTimeout
 	}
 	return time.Duration(b.TimeoutSeconds) * time.Second
 }
@@ -800,7 +804,7 @@ func (c *Config) validate() error {
 		}
 		if b.TimeoutSeconds <= 0 && timeoutPreviouslyUnenforced(b.Adapter) {
 			slog.Warn("config: backend has no timeout_seconds; the "+string(b.Adapter)+
-				" adapter now enforces the 180s default (it was previously unbounded) — "+
+				" adapter now enforces the "+DefaultBackendTimeout.String()+" default (it was previously unbounded) — "+
 				"set timeout_seconds explicitly if this backend legitimately runs longer",
 				"backend", id)
 		}
@@ -847,10 +851,11 @@ func (c *Config) validate() error {
 // as an http.Client timeout).
 func timeoutPreviouslyUnenforced(a AdapterType) bool {
 	switch a {
-	case AdapterOllamaHTTP, AdapterAnthropicAPI, AdapterOpenAIAPI:
-		return false
+	case AdapterClaudeCLI, AdapterCodexCLI, AdapterCodexSubagent,
+		AdapterGeminiCLI, AdapterBedrockAPI:
+		return true
 	}
-	return true
+	return false
 }
 
 // ResolveEnvRef returns the value of an env: reference, or the literal string.

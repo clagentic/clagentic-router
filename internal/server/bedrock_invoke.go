@@ -283,6 +283,7 @@ func (h *Handler) bedrockPassthrough(w http.ResponseWriter, r *http.Request, mod
 	t0 := time.Now()
 	pt := beginPassthroughRequestAt(w, r, t0, h.router.MaxRequest())
 	defer pt.Close()
+	pt.beforeCommit = h.beforePassthroughCommit
 	ctx := pt.Context()
 
 	credsFn := h.bedrockCredentialsFn
@@ -339,7 +340,9 @@ func (h *Handler) bedrockPassthrough(w http.ResponseWriter, r *http.Request, mod
 	}
 	defer upResp.Body.Close()
 
-	pt.relay(w, upResp, RequestID(r.Context()), "bedrock invoke")
+	pt.relay(w, upResp, RequestID(r.Context()), "bedrock invoke", func(status int, msg string) {
+		writeBedrockError(w, status, msg)
+	})
 }
 
 // resolveBedrockCredentials loads AWS credentials via the standard SDK chain
