@@ -150,10 +150,15 @@ graph LR
   `/v1/messages`, `/model/{id}/invoke[-with-response-stream]`): routed requests get
   the sum, over chain entries, of the largest backend timeout in each entry, plus
   30 s, capped by `proxy.max_request_seconds` (default 1800). Passthrough requests
-  are bounded by `proxy.max_request_seconds` alone, measured from handler entry
-  so credential resolution and signing count against it. Routing itself stops 30 s
-  before the write deadline so a successful route can always be written (when the
-  bound is 30 s or less, routing stops at the midpoint instead). The server-wide 300 s
+  are bounded by `proxy.max_request_seconds` alone, as the total including the
+  30 s margin, measured from just after the request body is read. Work whose
+  failure is reported by writing an error (routing; for passthrough, credential
+  resolution, signing and the upstream call up to response headers) stops 30 s
+  before the write deadline so the error can always be written (when the bound is
+  30 s or less, it stops at the midpoint instead). Once a passthrough response has
+  started, the body relay runs until the write deadline, so a stream still flowing
+  at 30 s before the bound is delivered, and one still flowing at the bound is cut.
+  The server-wide 300 s
   `WriteTimeout` remains a backstop for health/admin/metrics endpoints only.
 - If the response write still fails after a successful route (client gone or
   deadline hit), a `response delivery failed` warning is logged with

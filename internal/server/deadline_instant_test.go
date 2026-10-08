@@ -98,19 +98,73 @@ func TestRoutedHandler_RouteJustBeforeDeadlineStillDelivers(t *testing.T) {
 	})
 }
 
-func TestBeginPassthroughRequestAt_BoundIsHandlerEntryRelative(t *testing.T) {
-	start := time.Now().Add(-400 * time.Millisecond)
+// The passthrough bound is two-phase: phase-1 work is cancelled at the work
+// deadline C (a margin before the write deadline W, so an error response can
+// still be written), and committing the response re-arms the cancel to W.
+func TestBeginPassthroughRequestAt_WorkEndsBeforeWriteDeadline(t *testing.T) {
+	t0 := time.Now().Add(-100 * time.Millisecond)
+	d := time.Second // below the margin, so C is the midpoint t0+500ms
 	w := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
 	r := httptest.NewRequest(http.MethodPost, "/x", nil)
-	ctx, cancel := beginPassthroughRequestAt(w, r, start, time.Second)
-	defer cancel()
+	pt := beginPassthroughRequestAt(w, r, t0, d)
+	defer pt.Close()
 
-	want := start.Add(time.Second)
-	if got, _ := ctx.Deadline(); !got.Equal(want) {
-		t.Fatalf("ctx deadline = %v, want entry+bound %v", got, want)
+	wantWork, wantWrite := requestDeadlines(t0, d)
+	if !w.writeDeadline.Equal(wantWrite) {
+		t.Fatalf("write deadline = %v, want %v", w.writeDeadline, wantWrite)
 	}
-	if !w.writeDeadline.Equal(want) {
-		t.Fatalf("write deadline = %v, want the same instant %v", w.writeDeadline, want)
+	if !wantWork.Before(wantWrite) {
+		t.Fatalf("work deadline %v must be before write deadline %v", wantWork, wantWrite)
+	}
+
+	select {
+	case <-pt.Context().Done():
+		t.Fatal("phase-1 context cancelled immediately")
+	case <-time.After(time.Until(wantWork) - 100*time.Millisecond):
+	}
+	select {
+	case <-pt.Context().Done():
+	case <-time.After(time.Until(wantWork) + 150*time.Millisecond):
+		t.Fatalf("phase-1 context not cancelled at the work deadline %v", wantWork)
+	}
+	if time.Now().After(wantWrite) {
+		t.Fatal("work deadline fired at or after the write deadline")
+	}
+}
+
+// requestDeadlines is the one derivation both the routed and the passthrough
+// helpers use; they must agree with it for the same (t0, d).
+func TestRequestDeadlines_SingleSourceForRoutedAndPassthrough(t *testing.T) {
+	t0 := time.Now().Add(-time.Hour)
+	r := httptest.NewRequest(http.MethodPost, "/x", nil)
+
+	for _, d := range []time.Duration{5 * time.Minute, router.DeliveryMargin, time.Second} {
+		work, write := requestDeadlines(t0, d)
+		if !write.Equal(t0.Add(d)) {
+			t.Errorf("d=%s: write = %v, want t0+d", d, write)
+		}
+		if d > router.DeliveryMargin {
+			if !work.Equal(write.Add(-router.DeliveryMargin)) {
+				t.Errorf("d=%s: work = %v, want write-margin", d, work)
+			}
+		} else if !work.Equal(t0.Add(d / 2)) {
+			t.Errorf("d=%s: work = %v, want clamped midpoint", d, work)
+		}
+
+		w := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+		ctx, cancel, got := beginRoutedRequestAt(w, r, t0, d)
+		routedWork, _ := ctx.Deadline()
+		cancel()
+		if !routedWork.Equal(work) || !got.Equal(write) || !w.writeDeadline.Equal(write) {
+			t.Errorf("d=%s: routed helper (%v, %v) disagrees with requestDeadlines (%v, %v)", d, routedWork, got, work, write)
+		}
+
+		pw := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+		pt := beginPassthroughRequestAt(pw, r, t0, d)
+		pt.Close()
+		if !pw.writeDeadline.Equal(write) {
+			t.Errorf("d=%s: passthrough write deadline %v, want %v", d, pw.writeDeadline, write)
+		}
 	}
 }
 
@@ -130,40 +184,53 @@ func blockingUpstream(t *testing.T) *httptest.Server {
 	return up
 }
 
-// Pre-Do work (credential resolution) counts against the bound: with a 1s
-// bound and 400ms spent resolving credentials the upstream is abandoned at
-// about 1s after handler entry, not 1.4s.
+// Pre-Do work (credential resolution) counts against the work deadline: with a
+// 1s bound (work deadline 500ms) and 200ms spent resolving credentials the
+// stalled upstream is abandoned at about 500ms and the client RECEIVES the
+// 502, not an empty reply.
 func TestBedrockPassthrough_PreDoWorkCountsAgainstBound(t *testing.T) {
 	up := blockingUpstream(t)
 	ts, srv := newDeadlineServer(t, 0, 1, "http://unused.invalid")
 	srv.handler.bedrockRegion = "us-east-1"
 	srv.handler.bedrockUpstreamBaseURL = up.URL
 	srv.handler.bedrockCredentialsFn = func(context.Context) (aws.Credentials, error) {
-		time.Sleep(400 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 		return aws.Credentials{AccessKeyID: "AKIAEXAMPLESTUBKEY", SecretAccessKey: "stub"}, nil
 	}
 
 	start := time.Now()
-	_, _, _ = post(t, ts.URL+"/model/anthropic.claude-x/invoke",
+	resp, body, err := post(t, ts.URL+"/model/anthropic.claude-x/invoke",
 		`{"anthropic_version":"bedrock-2023-05-31","max_tokens":1,"messages":[{"role":"user","content":"."}]}`, nil)
 	elapsed := time.Since(start)
-	if elapsed < 900*time.Millisecond || elapsed > 1250*time.Millisecond {
-		t.Fatalf("upstream abandoned after %s, want about 1s from handler entry (1.4s means the bound started at Do)", elapsed)
+	if err != nil {
+		t.Fatalf("empty reply after %s: the error response had no budget to be written: %v", elapsed, err)
+	}
+	if resp.StatusCode != http.StatusBadGateway || len(body) == 0 {
+		t.Fatalf("status %d body %q, want 502 with a body", resp.StatusCode, body)
+	}
+	if elapsed < 450*time.Millisecond || elapsed > 900*time.Millisecond {
+		t.Fatalf("upstream abandoned after %s, want about 500ms (work deadline), well before the 1s write deadline", elapsed)
 	}
 }
 
 // The messages passthrough shares the helper, so a stalled upstream is cut at
-// the same handler-entry bound.
+// the work deadline and the client receives the error response.
 func TestMessagesPassthrough_StalledUpstreamCutAtBound(t *testing.T) {
 	up := blockingUpstream(t)
 	ts, _ := newDeadlineServer(t, 0, 1, up.URL)
 
 	start := time.Now()
-	_, _, _ = post(t, ts.URL+"/v1/messages",
+	resp, body, err := post(t, ts.URL+"/v1/messages",
 		`{"model":"claude-sonnet-4-6","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`,
 		map[string]string{"x-api-key": "client-key"})
 	elapsed := time.Since(start)
-	if elapsed < 900*time.Millisecond || elapsed > 1250*time.Millisecond {
-		t.Fatalf("stalled upstream cut after %s, want about 1s", elapsed)
+	if err != nil {
+		t.Fatalf("empty reply after %s: the error response had no budget to be written: %v", elapsed, err)
+	}
+	if resp.StatusCode != http.StatusBadGateway || len(body) == 0 {
+		t.Fatalf("status %d body %q, want 502 with a body", resp.StatusCode, body)
+	}
+	if elapsed < 450*time.Millisecond || elapsed > 900*time.Millisecond {
+		t.Fatalf("stalled upstream cut after %s, want about 500ms", elapsed)
 	}
 }

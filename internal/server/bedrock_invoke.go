@@ -208,8 +208,8 @@ func (h *Handler) bedrockRouted(w http.ResponseWriter, r *http.Request, modelID 
 		Tools:     toolDefs,
 	}
 
-	routeStart := time.Now()
-	routeCtx, cancelRoute, reqDeadline := beginRoutedRequest(w, r, h.router.RequestDeadline(chain))
+	t0 := time.Now()
+	routeCtx, cancelRoute, reqDeadline := beginRoutedRequestAt(w, r, t0, h.router.RequestDeadline(chain))
 	defer cancelRoute()
 	resp, meta, err := h.router.Route(routeCtx, routerReq, chain)
 	if err != nil {
@@ -223,7 +223,7 @@ func (h *Handler) bedrockRouted(w http.ResponseWriter, r *http.Request, modelID 
 	}
 
 	dw := newDeliveryWriter(w, reqDeadline)
-	defer dw.reportDelivery(RequestID(r.Context()), meta.BackendID, routeStart)
+	defer dw.reportDelivery(RequestID(r.Context()), meta.BackendID, t0)
 	w = dw
 
 	w.Header().Set("X-Router-Mode", "routed")
@@ -274,10 +274,14 @@ func (h *Handler) bedrockPassthrough(w http.ResponseWriter, r *http.Request, mod
 	}
 
 	// No chain to derive a deadline from: bounded by proxy.max_request_seconds
-	// from handler entry, covering credential resolution, signing and the
-	// upstream call alike (see beginPassthroughRequest).
-	ctx, cancel := beginPassthroughRequest(w, r, h.router.MaxRequest())
-	defer cancel()
+	// as a two-phase bound. Credential resolution, signing and the upstream call
+	// up to response headers end at the work deadline so their error responses
+	// can still be written; the body relay then runs to the write deadline (see
+	// passthroughRequest).
+	t0 := time.Now()
+	pt := beginPassthroughRequestAt(w, r, t0, h.router.MaxRequest())
+	defer pt.Close()
+	ctx := pt.Context()
 
 	credsFn := h.bedrockCredentialsFn
 	if credsFn == nil {
@@ -330,33 +334,7 @@ func (h *Handler) bedrockPassthrough(w http.ResponseWriter, r *http.Request, mod
 	}
 	defer upResp.Body.Close()
 
-	for k, vals := range upResp.Header {
-		for _, v := range vals {
-			w.Header().Add(k, v)
-		}
-	}
-	w.Header().Set("X-Router-Mode", "passthrough")
-	w.WriteHeader(upResp.StatusCode)
-
-	flusher, canFlush := w.(http.Flusher)
-	buf := make([]byte, 4096)
-	for {
-		n, rerr := upResp.Body.Read(buf)
-		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
-				return
-			}
-			if canFlush {
-				flusher.Flush()
-			}
-		}
-		if rerr != nil {
-			if rerr != io.EOF {
-				slog.Warn("bedrock invoke: passthrough stream read error", "err", rerr, "request_id", RequestID(r.Context()))
-			}
-			return
-		}
-	}
+	pt.relay(w, upResp, RequestID(r.Context()), "bedrock invoke")
 }
 
 // resolveBedrockCredentials loads AWS credentials via the standard SDK chain

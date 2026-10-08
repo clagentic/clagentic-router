@@ -362,8 +362,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		Tools:      toolDefs,
 	}
 
-	routeStart := time.Now()
-	routeCtx, cancelRoute, reqDeadline := beginRoutedRequest(w, r, h.router.RequestDeadline(chain))
+	t0 := time.Now()
+	routeCtx, cancelRoute, reqDeadline := beginRoutedRequestAt(w, r, t0, h.router.RequestDeadline(chain))
 	defer cancelRoute()
 	resp, meta, err := h.router.Route(routeCtx, routerReq, chain)
 	if err != nil {
@@ -389,7 +389,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dw := newDeliveryWriter(w, reqDeadline)
-	defer dw.reportDelivery(RequestID(r.Context()), meta.BackendID, routeStart)
+	defer dw.reportDelivery(RequestID(r.Context()), meta.BackendID, t0)
 	w = dw
 
 	// Set routing metadata headers (present on both streaming and non-streaming responses).

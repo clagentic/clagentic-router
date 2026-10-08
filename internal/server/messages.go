@@ -315,11 +315,12 @@ func (h *Handler) messagesPassthrough(w http.ResponseWriter, r *http.Request, ra
 	upstreamURL := h.anthropicUpstreamURL + "/v1/messages"
 
 	// No chain to derive a deadline from: bounded by proxy.max_request_seconds
-	// from handler entry (see beginPassthroughRequest).
-	ctx, cancel := beginPassthroughRequest(w, r, h.router.MaxRequest())
-	defer cancel()
+	// as a two-phase bound (see passthroughRequest).
+	t0 := time.Now()
+	pt := beginPassthroughRequestAt(w, r, t0, h.router.MaxRequest())
+	defer pt.Close()
 
-	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(rawBody))
+	upReq, err := http.NewRequestWithContext(pt.Context(), http.MethodPost, upstreamURL, bytes.NewReader(rawBody))
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, fmt.Sprintf("build upstream request: %v", err))
 		return
@@ -364,36 +365,10 @@ func (h *Handler) messagesPassthrough(w http.ResponseWriter, r *http.Request, ra
 	}
 	defer upResp.Body.Close()
 
-	// Mirror upstream headers (content-type, anthropic-*, rate-limit headers) so
-	// a client inspecting response headers sees the same thing it would from
-	// api.anthropic.com directly.
-	for k, vals := range upResp.Header {
-		for _, v := range vals {
-			w.Header().Add(k, v)
-		}
-	}
-	w.Header().Set("X-Router-Mode", "passthrough")
-	w.WriteHeader(upResp.StatusCode)
-
-	flusher, canFlush := w.(http.Flusher)
-	buf := make([]byte, 4096)
-	for {
-		n, rerr := upResp.Body.Read(buf)
-		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
-				return
-			}
-			if canFlush {
-				flusher.Flush()
-			}
-		}
-		if rerr != nil {
-			if rerr != io.EOF {
-				slog.Warn("messages: passthrough stream read error", "err", rerr, "request_id", RequestID(r.Context()))
-			}
-			return
-		}
-	}
+	// relay mirrors upstream headers (content-type, anthropic-*, rate-limit
+	// headers) so a client inspecting response headers sees the same thing it
+	// would from api.anthropic.com directly, then streams the body.
+	pt.relay(w, upResp, RequestID(r.Context()), "messages")
 }
 
 // --- Routed mode ---
@@ -468,8 +443,8 @@ func (h *Handler) messagesRouted(w http.ResponseWriter, r *http.Request, req *an
 		Tools:      toolDefs,
 	}
 
-	routeStart := time.Now()
-	routeCtx, cancelRoute, reqDeadline := beginRoutedRequest(w, r, h.router.RequestDeadline(chain))
+	t0 := time.Now()
+	routeCtx, cancelRoute, reqDeadline := beginRoutedRequestAt(w, r, t0, h.router.RequestDeadline(chain))
 	defer cancelRoute()
 	resp, meta, err := h.router.Route(routeCtx, routerReq, chain)
 	if err != nil {
@@ -491,7 +466,7 @@ func (h *Handler) messagesRouted(w http.ResponseWriter, r *http.Request, req *an
 	}
 
 	dw := newDeliveryWriter(w, reqDeadline)
-	defer dw.reportDelivery(RequestID(r.Context()), meta.BackendID, routeStart)
+	defer dw.reportDelivery(RequestID(r.Context()), meta.BackendID, t0)
 	w = dw
 
 	w.Header().Set("X-Router-Mode", "routed")

@@ -274,3 +274,13 @@ func (rw *responseWriter) WriteHeader(code int) {
 // Unwrap exposes the underlying ResponseWriter so http.NewResponseController
 // (write deadlines, flushing) reaches the real connection through this wrapper.
 func (rw *responseWriter) Unwrap() http.ResponseWriter { return rw.ResponseWriter }
+
+// Flush satisfies http.Flusher. Without it the handlers' w.(http.Flusher)
+// assertions fail behind the logging middleware, so a passthrough stream is
+// buffered until the handler returns instead of reaching the client as it
+// flows.
+func (rw *responseWriter) Flush() {
+	// The error is ignored: a writer that cannot flush degrades to buffering,
+	// exactly the behavior before this method existed.
+	_ = http.NewResponseController(rw.ResponseWriter).Flush()
+}
