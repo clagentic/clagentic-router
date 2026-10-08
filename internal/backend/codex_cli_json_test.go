@@ -253,6 +253,32 @@ func TestCodexCLI_Invoke_TrailingEmptyMessageKeepsLastNonEmpty(t *testing.T) {
 	}
 }
 
+// A trailing whitespace-only agent_message must not displace the real answer,
+// nor trigger the raw-stdout fallback. Synthetic fixture, live event shapes.
+func TestCodexCLI_Invoke_TrailingWhitespaceMessageKeepsAnswer(t *testing.T) {
+	for name, ws := range map[string]string{"spaces": "   ", "newline": `\n`} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			stream := `{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"answer"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"` + ws + `"}}
+{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}`
+			bin := writeFakeCodexBinJSONL(t, dir, stream, 0)
+
+			adapter := NewCodexCLIAdapter("test", "", "", "", "", bin)
+			req := &Request{Messages: []Message{{Role: "user", Content: "ping"}}}
+
+			resp, err := adapter.Invoke(context.Background(), req)
+			if err != nil {
+				t.Fatalf("Invoke: %v", err)
+			}
+			if resp.Content != "answer" {
+				t.Errorf("Content = %q, want %q", resp.Content, "answer")
+			}
+		})
+	}
+}
+
 // No agent_message at all: raw-stdout fallback is unchanged.
 func TestCodexCLI_Invoke_NoAgentMessageFallsBackToRawStdout(t *testing.T) {
 	dir := t.TempDir()

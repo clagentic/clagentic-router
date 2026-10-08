@@ -562,7 +562,7 @@ func parseCodexJSONL(ctx context.Context, stdout []byte, stderrLen int, req *Req
 		}
 		switch ev.Type {
 		case "item.completed":
-			if ev.Item != nil && ev.Item.Type == "agent_message" && ev.Item.Text != "" {
+			if ev.Item != nil && ev.Item.Type == "agent_message" && strings.TrimSpace(ev.Item.Text) != "" {
 				// Overwrite, never accumulate: codex emits one agent_message
 				// per assistant message, so earlier ones are intermediate
 				// commentary, not part of the answer.
