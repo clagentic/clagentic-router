@@ -60,8 +60,8 @@ func newDeadlineServer(t *testing.T, delay time.Duration, maxRequestSeconds int,
 		Proxy: config.ProxyConfig{MaxRequestSeconds: maxRequestSeconds},
 	}
 	r := router.New(cfg, map[string]backend.Adapter{"slow": &sleepAdapter{id: "slow", delay: delay}}, nil, nil)
-	srv := New(":0", "secret", "secret", false, r, nil, upstreamURL, "", "", "", false, "", "test",
-		withBackstopWriteTimeout(testBackstop))
+	srv := New(":0", "secret", "secret", false, r, nil, upstreamURL, "", "", "", false, "", "test")
+	srv.httpServer.WriteTimeout = testBackstop
 
 	ts := httptest.NewUnstartedServer(srv.httpServer.Handler)
 	ts.Config.WriteTimeout = srv.httpServer.WriteTimeout
@@ -218,10 +218,5 @@ func TestNonLLMEndpoints_KeepBackstopWriteTimeout(t *testing.T) {
 	def := New(":0", "secret", "secret", false, r, nil, "https://api.anthropic.com", "", "", "", false, "", "test")
 	if got := def.httpServer.WriteTimeout; got != defaultBackstopWriteTimeout || got <= 0 {
 		t.Errorf("default server WriteTimeout = %s, want %s (non-zero backstop)", got, defaultBackstopWriteTimeout)
-	}
-	custom := New(":0", "secret", "secret", false, r, nil, "https://api.anthropic.com", "", "", "", false, "", "test",
-		withBackstopWriteTimeout(testBackstop))
-	if got := custom.httpServer.WriteTimeout; got != testBackstop {
-		t.Errorf("WriteTimeout = %s, want %s", got, testBackstop)
 	}
 }

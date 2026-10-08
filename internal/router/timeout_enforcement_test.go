@@ -116,3 +116,25 @@ func TestRequestDeadline_SumsMaxPerEntryPlusMarginAndHonorsCap(t *testing.T) {
 		t.Errorf("explicit max_request_seconds must cap: got %s, want 50s", got)
 	}
 }
+
+// FallbackReason must name why the chain advanced (the failed tier's error
+// type), not the winning backend's own state.
+func TestRoute_FallbackReasonIsFailedTierErrorType(t *testing.T) {
+	r := newMultiRouter(map[string]func(context.Context, *backend.Request) (*backend.Response, error){
+		"first": func(context.Context, *backend.Request) (*backend.Response, error) {
+			return nil, &backend.InvokeError{Type: backend.ErrTypeNetwork, Raw: "connection reset"}
+		},
+		"second": okFn,
+	}, nil)
+
+	_, meta, err := r.Route(context.Background(), testReq(), []string{"first", "second"})
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	if meta.BackendID != "second" {
+		t.Fatalf("winner = %q, want second", meta.BackendID)
+	}
+	if meta.FallbackReason != string(state.ErrTypeNetwork) {
+		t.Errorf("FallbackReason = %q, want %q", meta.FallbackReason, state.ErrTypeNetwork)
+	}
+}

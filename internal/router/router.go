@@ -402,7 +402,9 @@ func (r *Router) Route(ctx context.Context, req *backend.Request, chain []string
 				LatencyMS:     latencyMS,
 			}
 			if i > 0 {
-				meta.FallbackReason = string(r.getState(bid).Snapshot().LastErrorType)
+				// The winner's own state says nothing about why the chain
+				// advanced; report the last failed attempt before it.
+				meta.FallbackReason = string(lastErrType)
 				if meta.FallbackReason == "" {
 					meta.FallbackReason = "chain_advance"
 				}

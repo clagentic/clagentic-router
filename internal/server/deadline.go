@@ -21,20 +21,6 @@ import (
 // deadline (health, admin, metrics, version).
 const defaultBackstopWriteTimeout = 300 * time.Second
 
-// Option customizes New.
-type Option func(*serverOptions)
-
-type serverOptions struct {
-	backstopWriteTimeout time.Duration
-}
-
-// withBackstopWriteTimeout overrides the http.Server WriteTimeout. Unexported:
-// it exists so tests can use millisecond-scale backstops, not as an operator
-// knob (the operator knob is proxy.max_request_seconds).
-func withBackstopWriteTimeout(d time.Duration) Option {
-	return func(o *serverOptions) { o.backstopWriteTimeout = d }
-}
-
 // extendWriteDeadline moves this request's connection write deadline to
 // now+d. The deadline is absolute from now, so an actively-flowing stream is
 // cut only when d elapses, never by the 300 s backstop. A ResponseWriter that

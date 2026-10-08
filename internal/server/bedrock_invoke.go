@@ -39,6 +39,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -211,7 +212,7 @@ func (h *Handler) bedrockRouted(w http.ResponseWriter, r *http.Request, modelID 
 	extendWriteDeadline(w, h.router.RequestDeadline(chain), RequestID(r.Context()))
 	resp, meta, err := h.router.Route(r.Context(), routerReq, chain)
 	if err != nil {
-		if err == router.ErrAllFailed || err == router.ErrNoChain {
+		if errors.Is(err, router.ErrAllFailed) || errors.Is(err, router.ErrNoChain) {
 			writeBedrockError(w, http.StatusServiceUnavailable, "no available backends in chain")
 			return
 		}
