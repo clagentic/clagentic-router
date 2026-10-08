@@ -593,10 +593,14 @@ type claudeOutput struct {
 // headroom for several such rounds without adopting a policy of "however
 // many turns the model wants." The router already bounds the cost and
 // duration of a runaway loop through mechanisms independent of this flag:
-// BackendConfig.TimeoutSeconds (per-call wall-clock timeout, default 3
-// minutes) caps how long any single Invoke can run regardless of how many
-// turns it consumes, and the wire request body itself is bounded by
-// MaxBytesReader at the HTTP boundary. So the marginal risk of raising this
+// Router.Route wraps every Invoke in a context deadline of
+// BackendConfig.Timeout() (TimeoutSeconds, default 3 minutes), which kills
+// this adapter's subprocess via exec.CommandContext (built by
+// newBoundedCommand, whose SubprocessWaitDelay keeps a grandchild that holds
+// the output pipes from blocking Invoke's return), so no single Invoke runs
+// longer than that plus SubprocessWaitDelay regardless of how many turns it
+// consumes — the adapter itself enforces nothing, the bound lives in Route. The wire request body is
+// separately bounded by MaxBytesReader at the HTTP boundary. So the marginal risk of raising this
 // ceiling is more API calls billed per invocation (bounded by the timeout
 // long before it becomes "unbounded"), not an unbounded loop — a materially
 // different, and much smaller, risk than the ceiling's absence implied.
@@ -826,7 +830,7 @@ func (a *ClaudeCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 	}
 	env := buildCLIEnv(extra)
 
-	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd := newBoundedCommand(ctx, bin, args...)
 	cmd.Stdin = strings.NewReader(prompt)
 	cmd.Env = env
 	// Working directory: the HOME override above is the first of two hook-

@@ -180,7 +180,10 @@ type BackendConfig struct {
 	// soft score penalty kicks in. Set to the known platform limit.
 	RateWindowMaxMessages int `yaml:"rate_window_max_messages"`
 
-	// TimeoutSeconds is the per-call timeout. Default 180 (3 min).
+	// TimeoutSeconds is the per-call timeout. Default 180 (3 min). Enforced
+	// uniformly by Router.Route as a context deadline around every Invoke, so
+	// it applies to all adapter types (CLI subprocess, bedrock_api, and the
+	// HTTP adapters alike).
 	TimeoutSeconds int `yaml:"timeout_seconds"`
 
 	// BinPath is the explicit binary path override (e.g. /usr/local/bin/claude).
@@ -232,10 +235,14 @@ type CapacityPollingConfig struct {
 	TotalVRAMBytes int64 `yaml:"total_vram_bytes"`
 }
 
-// Timeout returns the call timeout, defaulting to 3 minutes.
+// DefaultBackendTimeout is the per-call timeout applied when a backend sets no
+// timeout_seconds.
+const DefaultBackendTimeout = 3 * time.Minute
+
+// Timeout returns the call timeout, defaulting to DefaultBackendTimeout.
 func (b *BackendConfig) Timeout() time.Duration {
 	if b.TimeoutSeconds <= 0 {
-		return 3 * time.Minute
+		return DefaultBackendTimeout
 	}
 	return time.Duration(b.TimeoutSeconds) * time.Second
 }
@@ -386,6 +393,28 @@ type ProxyConfig struct {
 	// If empty, falls back to Token. Use "env:VAR_NAME" to read from env.
 	// Env override: CLAGENTIC_ROUTER_ADMIN_TOKEN.
 	AdminToken string `yaml:"admin_token"`
+
+	// MaxRequestSeconds is the wall-clock ceiling for one LLM request
+	// (/v1/chat/completions, /v1/messages, /model/{id}/invoke[-with-response-stream]).
+	// It caps the chain-derived write deadline for routed requests and is the
+	// write-deadline bound for passthrough requests, which have no chain to
+	// derive one from. Unset or <= 0 defaults to 1800 (30 min). An explicit
+	// value is honored byte-identically, even when smaller than the chain's
+	// summed backend timeouts.
+	MaxRequestSeconds int `yaml:"max_request_seconds"`
+}
+
+// DefaultMaxRequest is the MaxRequest default: comfortably above a default
+// chain (several tiers at the 180 s default backend timeout).
+const DefaultMaxRequest = 30 * time.Minute
+
+// MaxRequest returns the per-request wall-clock ceiling, defaulting to
+// DefaultMaxRequest.
+func (p *ProxyConfig) MaxRequest() time.Duration {
+	if p.MaxRequestSeconds <= 0 {
+		return DefaultMaxRequest
+	}
+	return time.Duration(p.MaxRequestSeconds) * time.Second
 }
 
 // AnthropicConfig controls the inbound POST /v1/messages endpoint — an
@@ -773,6 +802,12 @@ func (c *Config) validate() error {
 		if b.Adapter == AdapterBedrockAPI && b.Region == "" {
 			return fmt.Errorf("backend %q: bedrock_api requires region (no SDK default region exists for Bedrock)", id)
 		}
+		if b.TimeoutSeconds <= 0 && timeoutPreviouslyUnenforced(b.Adapter) {
+			slog.Warn("config: backend has no timeout_seconds; the "+string(b.Adapter)+
+				" adapter now enforces the "+DefaultBackendTimeout.String()+" default (it was previously unbounded) — "+
+				"set timeout_seconds explicitly if this backend legitimately runs longer",
+				"backend", id)
+		}
 	}
 	// Fill routing defaults
 	if c.Routing.DegradedFailureThreshold <= 0 {
@@ -808,6 +843,19 @@ func (c *Config) validate() error {
 		c.Routing.OfflineRecoveryProbeIntervalSeconds = &v
 	}
 	return nil
+}
+
+// timeoutPreviouslyUnenforced reports whether an adapter type ignored
+// timeout_seconds before Router.Route began enforcing it centrally: every
+// adapter except ollama_http, anthropic_api and openai_api (which applied it
+// as an http.Client timeout).
+func timeoutPreviouslyUnenforced(a AdapterType) bool {
+	switch a {
+	case AdapterClaudeCLI, AdapterCodexCLI, AdapterCodexSubagent,
+		AdapterGeminiCLI, AdapterBedrockAPI:
+		return true
+	}
+	return false
 }
 
 // ResolveEnvRef returns the value of an env: reference, or the literal string.

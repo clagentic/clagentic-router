@@ -429,6 +429,11 @@ func truncate(s string, n int) string {
 // context.Canceled for an explicit cancellation) — independent of whatever
 // shape cmd.Run()'s own returned error takes on a given OS/Go version.
 //
+// This is the adapter-local answer to "did a deadline kill me", not who owns
+// the deadline: the backend's own timeout, the chain budget and the operator's
+// request cap all report true. Charging the failure to a party is Route's job,
+// from context.Cause of the invoke context, which overrides this type.
+//
 // err == nil (the call actually succeeded) always returns false — a
 // deadline that fired after the subprocess had already exited successfully
 // is not this function's concern; ctx.Err() can still be non-nil in a

@@ -189,7 +189,7 @@ func (a *GeminiCLIAdapter) Invoke(ctx context.Context, req *Request) (*Response,
 	// and API keys are not passed to the subprocess. (lr-c7ac)
 	env := buildCLIEnv([]string{"NO_COLOR=1"})
 
-	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd := newBoundedCommand(ctx, bin, args...)
 	cmd.Env = env
 	// Neutral working directory so the subprocess does not inherit the
 	// daemon's cwd. Defaults to DefaultWorkingDir ("/") when the caller does

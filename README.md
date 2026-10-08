@@ -136,6 +136,53 @@ graph LR
     State --> Webhook
 ```
 
+## Timeouts and deadlines
+
+- **Per-backend `timeout_seconds`** (default 180 s) is enforced by `Router.Route`
+  as a context deadline around every `Invoke`, for all adapters (`claude_cli`,
+  `codex_cli`, `codex_subagent`, `gemini_cli`, `bedrock_api`, `anthropic_api`,
+  `openai_api`, `ollama_http`). An expiry is recorded as a `timeout` failure and
+  the chain advances while the request is still live. A client disconnect
+  mid-call is not charged to the backend. CLI adapters also bound how long they
+  wait for a killed subprocess's output pipes (`backend.SubprocessWaitDelay`, 3 s),
+  so a grandchild process holding stdout open cannot hold a request past its
+  deadline. Before this, only the three HTTP adapters honored it; a CLI or `bedrock_api`
+  backend with no `timeout_seconds` was unbounded and now gets the 180 s default,
+  so set `timeout_seconds` explicitly on any backend that legitimately runs longer.
+- **Per-request write deadline** on the LLM endpoints (`/v1/chat/completions`,
+  `/v1/messages`, `/model/{id}/invoke[-with-response-stream]`): routed requests get
+  the sum, over chain entries, of the largest backend timeout in each entry, plus
+  30 s, capped by `proxy.max_request_seconds` (default 1800). Passthrough requests
+  are bounded by `proxy.max_request_seconds` alone, as the total including the
+  30 s margin, measured from just after the request body is read. Work whose
+  failure is reported by writing an error (routing; for passthrough, credential
+  resolution, signing and the upstream call up to response headers) stops 30 s
+  before the write deadline so the error can always be written (when the bound is
+  30 s or less, it stops at the midpoint instead). Once a passthrough response has
+  started, the body relay runs until the write deadline, so a stream still flowing
+  at 30 s before the bound is delivered, and one still flowing at the bound is cut.
+  The server-wide 300 s
+  `WriteTimeout` remains a backstop for health/admin/metrics endpoints only.
+- **Attribution.** Every deadline is created with a cause, and an outcome is read
+  once from `context.Cause` at the moment it fires, never from which context looks
+  done afterwards or from the clock at report time. Per routed attempt:
+  the backend's own `timeout_seconds` (health penalty; the chain advances if the
+  request is live), the chain budget running out (charged as a `timeout` to the
+  backend running at that moment, even if it ran less than its own full timeout,
+  because it overran the budget the chain allotted it; no further tier), the
+  operator's `proxy.max_request_seconds` cap (`request_deadline`, no penalty), or
+  a client disconnect (`cancelled`, no penalty). The first event wins: a client
+  that leaves after the backend's own deadline already fired does not turn the
+  timeout into a cancel.
+- If the response write still fails after a successful route, a
+  `response delivery failed` warning is logged with `request_id`, `backend`,
+  `elapsed_ms`, `failed_after_ms` and a `cause` taken from the write error itself:
+  `write_deadline` (the connection's write deadline, `os.ErrDeadlineExceeded`) or
+  `write_failed` (anything else, e.g. the client left). Passthrough relay and
+  upstream failures log the `cause` as well (`work_deadline`, `write_deadline`,
+  `client_cancelled`, `none` for an upstream fault). `call_log` still records the
+  backend outcome.
+
 ## Import graph (no cycles allowed)
 
 ```

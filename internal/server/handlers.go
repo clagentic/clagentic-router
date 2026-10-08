@@ -78,6 +78,11 @@ type Handler struct {
 	// request-building/signing is verifiable without live AWS credentials,
 	// IMDS access, or network calls.
 	bedrockCredentialsFn func(ctx context.Context) (aws.Credentials, error)
+
+	// beforePassthroughCommit is a test seam, nil in production: it runs after
+	// the upstream call returns and before the passthrough response is
+	// committed, so a test can make the work deadline fire in that window.
+	beforePassthroughCommit func(*passthroughRequest)
 }
 
 // --- OpenAI-compatible types ---
@@ -362,7 +367,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		Tools:      toolDefs,
 	}
 
-	resp, meta, err := h.router.Route(r.Context(), routerReq, chain)
+	t0 := time.Now()
+	budget, capped := h.router.RequestDeadline(chain)
+	routeCtx, cancelRoute, _ := beginRoutedRequestAt(w, r, t0, budget, capped)
+	defer cancelRoute()
+	resp, meta, err := h.router.Route(routeCtx, routerReq, chain)
 	if err != nil {
 		if errors.Is(err, router.ErrAllFailed) || errors.Is(err, router.ErrNoChain) {
 			// Log the raw error server-side; do not include it in the client
@@ -380,10 +389,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		// Log the raw error server-side; do not include it in the client response
 		// to avoid leaking internal backend error details to inference callers.
-		slog.Error("chat: backend error", "err", err, "request_id", RequestID(r.Context()))
+		logRouteFailure("chat", err, RequestID(r.Context()))
 		writeError(w, http.StatusBadGateway, "backend_error", "upstream backend failed")
 		return
 	}
+
+	dw := newDeliveryWriter(w)
+	defer dw.reportDelivery(RequestID(r.Context()), meta.BackendID, t0)
+	w = dw
 
 	// Set routing metadata headers (present on both streaming and non-streaming responses).
 	w.Header().Set("X-Router-Backend", meta.BackendID)

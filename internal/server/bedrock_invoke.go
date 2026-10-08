@@ -39,6 +39,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -207,16 +208,24 @@ func (h *Handler) bedrockRouted(w http.ResponseWriter, r *http.Request, modelID 
 		Tools:     toolDefs,
 	}
 
-	resp, meta, err := h.router.Route(r.Context(), routerReq, chain)
+	t0 := time.Now()
+	budget, capped := h.router.RequestDeadline(chain)
+	routeCtx, cancelRoute, _ := beginRoutedRequestAt(w, r, t0, budget, capped)
+	defer cancelRoute()
+	resp, meta, err := h.router.Route(routeCtx, routerReq, chain)
 	if err != nil {
-		if err == router.ErrAllFailed || err == router.ErrNoChain {
+		if errors.Is(err, router.ErrAllFailed) || errors.Is(err, router.ErrNoChain) {
 			writeBedrockError(w, http.StatusServiceUnavailable, "no available backends in chain")
 			return
 		}
-		slog.Error("bedrock invoke: routed backend error", "err", err, "request_id", RequestID(r.Context()))
+		logRouteFailure("bedrock invoke", err, RequestID(r.Context()))
 		writeBedrockError(w, http.StatusBadGateway, "upstream backend failed")
 		return
 	}
+
+	dw := newDeliveryWriter(w)
+	defer dw.reportDelivery(RequestID(r.Context()), meta.BackendID, t0)
+	w = dw
 
 	w.Header().Set("X-Router-Mode", "routed")
 	w.Header().Set("X-Router-Backend", meta.BackendID)
@@ -226,7 +235,8 @@ func (h *Handler) bedrockRouted(w http.ResponseWriter, r *http.Request, modelID 
 
 	if stream {
 		if err := writeBedrockEventStream(w, modelID, resp); err != nil {
-			slog.Error("bedrock invoke: eventstream write failed", "err", err, "request_id", RequestID(r.Context()))
+			slog.Error("bedrock invoke: eventstream write failed",
+				"err", err, "cause", writeFailureCause(err), "request_id", RequestID(r.Context()))
 		}
 		return
 	}
@@ -251,12 +261,6 @@ func (h *Handler) bedrockRouted(w http.ResponseWriter, r *http.Request, modelID 
 
 // --- Passthrough mode ---
 
-// bedrockHTTPClient returns the HTTP client used for upstream Bedrock
-// passthrough calls, mirroring anthropicHTTPClient's long timeout rationale.
-func (h *Handler) bedrockHTTPClient() *http.Client {
-	return &http.Client{Timeout: 10 * time.Minute}
-}
-
 // bedrockPassthrough forwards the request to the real AWS Bedrock Runtime
 // endpoint for the configured region, SigV4-signing it with credentials from
 // the standard AWS SDK credential chain (same chain backend.NewBedrockAPIAdapter
@@ -271,13 +275,25 @@ func (h *Handler) bedrockPassthrough(w http.ResponseWriter, r *http.Request, mod
 		return
 	}
 
+	// No chain to derive a deadline from: bounded by proxy.max_request_seconds
+	// as a two-phase bound. Credential resolution, signing and the upstream call
+	// up to response headers end at the work deadline so their error responses
+	// can still be written; the body relay then runs to the write deadline (see
+	// passthroughRequest).
+	t0 := time.Now()
+	pt := beginPassthroughRequestAt(w, r, t0, h.router.MaxRequest())
+	defer pt.Close()
+	pt.beforeCommit = h.beforePassthroughCommit
+	ctx := pt.Context()
+
 	credsFn := h.bedrockCredentialsFn
 	if credsFn == nil {
 		credsFn = h.resolveBedrockCredentials
 	}
-	creds, err := credsFn(r.Context())
+	creds, err := credsFn(ctx)
 	if err != nil {
-		slog.Error("bedrock invoke: credential resolution failed", "err", err, "request_id", RequestID(r.Context()))
+		slog.Error("bedrock invoke: credential resolution failed",
+			"err", err, "cause", pt.Cause(), "request_id", RequestID(r.Context()))
 		writeBedrockError(w, http.StatusBadGateway, "failed to resolve AWS credentials for passthrough")
 		return
 	}
@@ -292,7 +308,7 @@ func (h *Handler) bedrockPassthrough(w http.ResponseWriter, r *http.Request, mod
 	}
 	upstreamURL := fmt.Sprintf("%s/model/%s/%s", base, modelID, action)
 
-	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(rawBody))
+	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(rawBody))
 	if err != nil {
 		writeBedrockError(w, http.StatusBadGateway, fmt.Sprintf("build upstream request: %v", err))
 		return
@@ -308,47 +324,25 @@ func (h *Handler) bedrockPassthrough(w http.ResponseWriter, r *http.Request, mod
 	sum := sha256.Sum256(rawBody)
 	payloadHash := hex.EncodeToString(sum[:])
 	signer := v4.NewSigner()
-	if err := signer.SignHTTP(r.Context(), creds, upReq, payloadHash, "bedrock", h.bedrockRegion, time.Now()); err != nil {
-		slog.Error("bedrock invoke: SigV4 signing failed", "err", err, "request_id", RequestID(r.Context()))
+	if err := signer.SignHTTP(ctx, creds, upReq, payloadHash, "bedrock", h.bedrockRegion, time.Now()); err != nil {
+		slog.Error("bedrock invoke: SigV4 signing failed",
+			"err", err, "cause", pt.Cause(), "request_id", RequestID(r.Context()))
 		writeBedrockError(w, http.StatusBadGateway, "failed to sign upstream request")
 		return
 	}
 
-	upResp, err := h.bedrockHTTPClient().Do(upReq)
+	upResp, err := http.DefaultClient.Do(upReq)
 	if err != nil {
-		slog.Error("bedrock invoke: passthrough upstream error", "err", err, "request_id", RequestID(r.Context()))
+		slog.Error("bedrock invoke: passthrough upstream error",
+			"err", err, "cause", pt.Cause(), "request_id", RequestID(r.Context()))
 		writeBedrockError(w, http.StatusBadGateway, "upstream request failed")
 		return
 	}
 	defer upResp.Body.Close()
 
-	for k, vals := range upResp.Header {
-		for _, v := range vals {
-			w.Header().Add(k, v)
-		}
-	}
-	w.Header().Set("X-Router-Mode", "passthrough")
-	w.WriteHeader(upResp.StatusCode)
-
-	flusher, canFlush := w.(http.Flusher)
-	buf := make([]byte, 4096)
-	for {
-		n, rerr := upResp.Body.Read(buf)
-		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
-				return
-			}
-			if canFlush {
-				flusher.Flush()
-			}
-		}
-		if rerr != nil {
-			if rerr != io.EOF {
-				slog.Warn("bedrock invoke: passthrough stream read error", "err", rerr, "request_id", RequestID(r.Context()))
-			}
-			return
-		}
-	}
+	pt.relay(w, upResp, RequestID(r.Context()), "bedrock invoke", func(status int, msg string) {
+		writeBedrockError(w, status, msg)
+	})
 }
 
 // resolveBedrockCredentials loads AWS credentials via the standard SDK chain

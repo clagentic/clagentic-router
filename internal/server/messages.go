@@ -314,7 +314,14 @@ func (h *Handler) messages(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) messagesPassthrough(w http.ResponseWriter, r *http.Request, rawBody []byte) {
 	upstreamURL := h.anthropicUpstreamURL + "/v1/messages"
 
-	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(rawBody))
+	// No chain to derive a deadline from: bounded by proxy.max_request_seconds
+	// as a two-phase bound (see passthroughRequest).
+	t0 := time.Now()
+	pt := beginPassthroughRequestAt(w, r, t0, h.router.MaxRequest())
+	defer pt.Close()
+	pt.beforeCommit = h.beforePassthroughCommit
+
+	upReq, err := http.NewRequestWithContext(pt.Context(), http.MethodPost, upstreamURL, bytes.NewReader(rawBody))
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, fmt.Sprintf("build upstream request: %v", err))
 		return
@@ -351,51 +358,21 @@ func (h *Handler) messagesPassthrough(w http.ResponseWriter, r *http.Request, ra
 		}
 	}
 
-	upResp, err := h.anthropicHTTPClient().Do(upReq)
+	upResp, err := http.DefaultClient.Do(upReq)
 	if err != nil {
-		slog.Error("messages: passthrough upstream error", "err", err, "request_id", RequestID(r.Context()))
+		slog.Error("messages: passthrough upstream error",
+			"err", err, "cause", pt.Cause(), "request_id", RequestID(r.Context()))
 		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed")
 		return
 	}
 	defer upResp.Body.Close()
 
-	// Mirror upstream headers (content-type, anthropic-*, rate-limit headers) so
-	// a client inspecting response headers sees the same thing it would from
-	// api.anthropic.com directly.
-	for k, vals := range upResp.Header {
-		for _, v := range vals {
-			w.Header().Add(k, v)
-		}
-	}
-	w.Header().Set("X-Router-Mode", "passthrough")
-	w.WriteHeader(upResp.StatusCode)
-
-	flusher, canFlush := w.(http.Flusher)
-	buf := make([]byte, 4096)
-	for {
-		n, rerr := upResp.Body.Read(buf)
-		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
-				return
-			}
-			if canFlush {
-				flusher.Flush()
-			}
-		}
-		if rerr != nil {
-			if rerr != io.EOF {
-				slog.Warn("messages: passthrough stream read error", "err", rerr, "request_id", RequestID(r.Context()))
-			}
-			return
-		}
-	}
-}
-
-// anthropicHTTPClient returns the HTTP client used for upstream passthrough
-// calls. A package-level default is used since passthrough has no per-backend
-// timeout configuration — long streaming responses are expected.
-func (h *Handler) anthropicHTTPClient() *http.Client {
-	return &http.Client{Timeout: 10 * time.Minute}
+	// relay mirrors upstream headers (content-type, anthropic-*, rate-limit
+	// headers) so a client inspecting response headers sees the same thing it
+	// would from api.anthropic.com directly, then streams the body.
+	pt.relay(w, upResp, RequestID(r.Context()), "messages", func(status int, msg string) {
+		writeAnthropicError(w, status, msg)
+	})
 }
 
 // --- Routed mode ---
@@ -470,7 +447,11 @@ func (h *Handler) messagesRouted(w http.ResponseWriter, r *http.Request, req *an
 		Tools:      toolDefs,
 	}
 
-	resp, meta, err := h.router.Route(r.Context(), routerReq, chain)
+	t0 := time.Now()
+	budget, capped := h.router.RequestDeadline(chain)
+	routeCtx, cancelRoute, _ := beginRoutedRequestAt(w, r, t0, budget, capped)
+	defer cancelRoute()
+	resp, meta, err := h.router.Route(routeCtx, routerReq, chain)
 	if err != nil {
 		if errors.Is(err, router.ErrAllFailed) || errors.Is(err, router.ErrNoChain) {
 			// Log the raw error server-side only; lastErrorType (if present)
@@ -484,10 +465,14 @@ func (h *Handler) messagesRouted(w http.ResponseWriter, r *http.Request, req *an
 			writeAnthropicChainExhaustedError(w, lastErrorType)
 			return
 		}
-		slog.Error("messages: routed backend error", "err", err, "request_id", RequestID(r.Context()))
+		logRouteFailure("messages", err, RequestID(r.Context()))
 		writeAnthropicError(w, http.StatusBadGateway, "upstream backend failed")
 		return
 	}
+
+	dw := newDeliveryWriter(w)
+	defer dw.reportDelivery(RequestID(r.Context()), meta.BackendID, t0)
+	w = dw
 
 	w.Header().Set("X-Router-Mode", "routed")
 	w.Header().Set("X-Router-Backend", meta.BackendID)
